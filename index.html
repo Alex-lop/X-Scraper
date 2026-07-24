@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Twitter Scraper Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <div class="scroll-squiggle" aria-hidden="true">
+      <svg viewBox="0 0 1180 1500" preserveAspectRatio="none">
+        <path
+          class="scroll-squiggle-echo echo-one"
+          d="M54 78 C255 2, 348 182, 565 112 S1008 86, 1090 238 C1175 396, 882 452, 718 378 S248 278, 188 472 C128 666, 510 664, 740 608 S1126 682, 1030 846 C932 1016, 596 898, 402 1052 S176 1320, 406 1398"
+        ></path>
+        <path
+          class="scroll-squiggle-echo echo-two"
+          d="M74 118 C270 46, 360 222, 548 158 S962 136, 1048 276 C1132 414, 846 498, 684 424 S276 348, 222 510 C164 688, 528 720, 750 652 S1084 732, 996 874 C900 1032, 610 972, 438 1104 S224 1328, 426 1424"
+        ></path>
+        <path
+          class="scroll-squiggle-track"
+          d="M54 78 C255 2, 348 182, 565 112 S1008 86, 1090 238 C1175 396, 882 452, 718 378 S248 278, 188 472 C128 666, 510 664, 740 608 S1126 682, 1030 846 C932 1016, 596 898, 402 1052 S176 1320, 406 1398"
+        ></path>
+        <path
+          id="scroll-squiggle-progress"
+          class="scroll-squiggle-progress"
+          d="M54 78 C255 2, 348 182, 565 112 S1008 86, 1090 238 C1175 396, 882 452, 718 378 S248 278, 188 472 C128 666, 510 664, 740 608 S1126 682, 1030 846 C932 1016, 596 898, 402 1052 S176 1320, 406 1398"
+        ></path>
+        <circle id="scroll-squiggle-dot" class="scroll-squiggle-dot" r="13"></circle>
+      </svg>
+    </div>
+
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Twitter/X Scraper</p>
+        <h1>Collect tweet data from a profile, URL, or search term.</h1>
+        <p class="hero-copy">
+          Enter the source you want to scrape, choose a few basic options, then preview the data in a table and download it.
+        </p>
+      </div>
+      <div class="hero-card">
+        <span class="hero-card-label">Current status</span>
+        <strong>Live backend connected</strong>
+        <p>Submit scrapes X, runs NLP sentiment analysis, and returns real results.</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Step 1</p>
+          <h2>Scrape Request</h2>
+        </div>
+        <span class="pill">Simple setup</span>
+      </div>
+
+      <form id="scrape-form" class="scrape-form">
+        <label>
+          Source Type
+          <select id="source-type" name="sourceType">
+            <option value="username">@ Username</option>
+            <option value="url">Tweet or Profile URL</option>
+            <option value="search">Search Term</option>
+          </select>
+        </label>
+
+        <label class="span-2">
+          URL, @ Username, or Search Term
+          <input id="source-value" name="sourceValue" type="text" placeholder="@OpenAI or https://x.com/OpenAI" required>
+        </label>
+
+        <label>
+          Max Tweets
+          <input id="max-tweets" name="maxTweets" type="number" min="1" max="500" value="25">
+        </label>
+
+        <label>
+          Start Date
+          <input id="start-date" name="startDate" type="date">
+        </label>
+
+        <label>
+          End Date
+          <input id="end-date" name="endDate" type="date">
+        </label>
+
+        <label>
+          Include
+          <select id="include-type" name="includeType">
+            <option value="all">All tweets</option>
+            <option value="original">Original tweets only</option>
+            <option value="replies">Replies included</option>
+            <option value="media">Tweets with media</option>
+          </select>
+        </label>
+
+        <div class="form-actions span-3">
+          <button type="submit">Preview Results</button>
+          <button type="reset" class="secondary-button">Clear</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Step 2</p>
+          <h2 id="results-panel-heading">Results</h2>
+        </div>
+        <div class="download-actions">
+          <button id="download-csv" class="secondary-button" type="button" disabled>Download CSV</button>
+          <button id="download-json" class="secondary-button" type="button" disabled>Download JSON</button>
+        </div>
+      </div>
+
+      <div id="error-banner" hidden style="background:var(--color-error,#ff6b6b);color:#fff;padding:0.75rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:0.9rem;"></div>
+
+      <div class="summary-grid" aria-live="polite">
+        <article>
+          <span>Total Tweets</span>
+          <strong id="tweet-count">0</strong>
+        </article>
+        <article>
+          <span>Total Likes</span>
+          <strong id="like-count">0</strong>
+        </article>
+        <article>
+          <span>Total Replies</span>
+          <strong id="reply-count">0</strong>
+        </article>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Text</th>
+              <th>Created At</th>
+              <th>Likes</th>
+              <th>Replies</th>
+              <th>Retweets</th>
+              <th>URL</th>
+            </tr>
+          </thead>
+          <tbody id="results-body">
+            <tr class="empty-row">
+              <td colspan="7">Enter a source above to preview scraped tweet data.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

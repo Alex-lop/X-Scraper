@@ -1,0 +1,19 @@
+# Web scraping
+playwright>=1.44.0
+
+# Data handling
+pandas>=2.2.0
+
+# Rule-based sentiment (Layer 1 & 2)
+textblob>=0.18.0
+vaderSentiment>=3.3.2
+
+# Deep-learning sentiment (Layer 3)
+# Install ONE of the two frameworks below (PyTorch is preferred):
+#   pip install torch                  # PyTorch backend
+#   pip install tensorflow             # TensorFlow backend
+transformers>=4.41.0          # HuggingFace – works with either framework
+
+# Web API server
+flask>=3.0.0
+flask-cors>=4.0.0
