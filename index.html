@@ -1,159 +1,110 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Twitter Scraper Dashboard</title>
-  <link rel="stylesheet" href="styles.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X Collection Workbench</title>
+  <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main class="app-shell">
-    <div class="scroll-squiggle" aria-hidden="true">
-      <svg viewBox="0 0 1180 1500" preserveAspectRatio="none">
-        <path
-          class="scroll-squiggle-echo echo-one"
-          d="M54 78 C255 2, 348 182, 565 112 S1008 86, 1090 238 C1175 396, 882 452, 718 378 S248 278, 188 472 C128 666, 510 664, 740 608 S1126 682, 1030 846 C932 1016, 596 898, 402 1052 S176 1320, 406 1398"
-        ></path>
-        <path
-          class="scroll-squiggle-echo echo-two"
-          d="M74 118 C270 46, 360 222, 548 158 S962 136, 1048 276 C1132 414, 846 498, 684 424 S276 348, 222 510 C164 688, 528 720, 750 652 S1084 732, 996 874 C900 1032, 610 972, 438 1104 S224 1328, 426 1424"
-        ></path>
-        <path
-          class="scroll-squiggle-track"
-          d="M54 78 C255 2, 348 182, 565 112 S1008 86, 1090 238 C1175 396, 882 452, 718 378 S248 278, 188 472 C128 666, 510 664, 740 608 S1126 682, 1030 846 C932 1016, 596 898, 402 1052 S176 1320, 406 1398"
-        ></path>
-        <path
-          id="scroll-squiggle-progress"
-          class="scroll-squiggle-progress"
-          d="M54 78 C255 2, 348 182, 565 112 S1008 86, 1090 238 C1175 396, 882 452, 718 378 S248 278, 188 472 C128 666, 510 664, 740 608 S1126 682, 1030 846 C932 1016, 596 898, 402 1052 S176 1320, 406 1398"
-        ></path>
-        <circle id="scroll-squiggle-dot" class="scroll-squiggle-dot" r="13"></circle>
-      </svg>
-    </div>
-
-    <section class="hero">
+  <main class="shell">
+    <header class="hero">
       <div>
-        <p class="eyebrow">Twitter/X Scraper</p>
-        <h1>Collect tweet data from a profile, URL, or search term.</h1>
-        <p class="hero-copy">
-          Enter the source you want to scrape, choose a few basic options, then preview the data in a table and download it.
-        </p>
+        <p class="eyebrow">Local analyst tool</p>
+        <h1>X Collection Workbench</h1>
+        <p>Collect structured posts from profiles or searches, preserve each run, and export exactly what you reviewed.</p>
       </div>
-      <div class="hero-card">
-        <span class="hero-card-label">Current status</span>
-        <strong>Live backend connected</strong>
-        <p>Submit scrapes X, runs NLP sentiment analysis, and returns real results.</p>
+      <div class="session-card">
+        <span>Saved X session</span>
+        <strong id="session-status">Checking…</strong>
+        <small id="session-message">Run <code>python -m xscraper auth</code> if setup is required.</small>
       </div>
-    </section>
+    </header>
 
     <section class="panel">
       <div class="panel-heading">
-        <div>
-          <p class="eyebrow">Step 1</p>
-          <h2>Scrape Request</h2>
-        </div>
-        <span class="pill">Simple setup</span>
+        <div><p class="eyebrow">New collection</p><h2>Choose a source</h2></div>
+        <span class="privacy-note">Session secrets stay on this computer</span>
       </div>
-
-      <form id="scrape-form" class="scrape-form">
-        <label>
-          Source Type
+      <form id="job-form" class="job-form">
+        <label>Source type
           <select id="source-type" name="sourceType">
-            <option value="username">@ Username</option>
-            <option value="url">Tweet or Profile URL</option>
-            <option value="search">Search Term</option>
+            <option value="profile">Profile</option>
+            <option value="search">Search query</option>
           </select>
         </label>
-
-        <label class="span-2">
-          URL, @ Username, or Search Term
-          <input id="source-value" name="sourceValue" type="text" placeholder="@OpenAI or https://x.com/OpenAI" required>
+        <label class="wide"><span id="source-label">Username or profile URL</span>
+          <input id="source-value" name="sourceValue" required placeholder="@OpenAI or https://x.com/OpenAI">
         </label>
-
-        <label>
-          Max Tweets
-          <input id="max-tweets" name="maxTweets" type="number" min="1" max="500" value="25">
+        <label>Maximum posts
+          <input name="maxTweets" type="number" min="1" max="500" value="25" required>
         </label>
-
-        <label>
-          Start Date
-          <input id="start-date" name="startDate" type="date">
+        <label>Start date
+          <input name="startDate" type="date">
         </label>
-
-        <label>
-          End Date
-          <input id="end-date" name="endDate" type="date">
+        <label>End date
+          <input name="endDate" type="date">
         </label>
-
-        <label>
-          Include
-          <select id="include-type" name="includeType">
-            <option value="all">All tweets</option>
-            <option value="original">Original tweets only</option>
-            <option value="replies">Replies included</option>
-            <option value="media">Tweets with media</option>
-          </select>
-        </label>
-
-        <div class="form-actions span-3">
-          <button type="submit">Preview Results</button>
-          <button type="reset" class="secondary-button">Clear</button>
+        <fieldset class="options wide">
+          <legend>Filters and enrichment</legend>
+          <label><input name="includeReplies" type="checkbox"> Include replies</label>
+          <label><input name="mediaOnly" type="checkbox"> Media posts only</label>
+          <label><input name="analyzeSentiment" type="checkbox"> Add VADER sentiment</label>
+        </fieldset>
+        <div class="actions full">
+          <button id="submit-button" type="submit">Start collection</button>
+          <button type="reset" class="secondary">Reset</button>
         </div>
       </form>
     </section>
 
+    <section id="active-panel" class="panel" hidden>
+      <div class="panel-heading">
+        <div><p class="eyebrow">Active job</p><h2 id="job-title">Collection</h2></div>
+        <span id="job-status" class="status">Queued</span>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+        <div id="progress-bar"></div>
+      </div>
+      <p id="progress-copy" class="muted">Waiting for the collector…</p>
+      <div id="error-banner" class="banner error" hidden></div>
+      <div id="warning-banner" class="banner warning" hidden></div>
+      <div class="actions">
+        <button id="cancel-button" class="danger" type="button">Cancel</button>
+        <button id="resume-button" type="button" hidden>Resume</button>
+        <a id="json-export" class="button-link secondary" href="#">Export JSON</a>
+        <a id="csv-export" class="button-link secondary" href="#">Export CSV</a>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="panel-heading">
-        <div>
-          <p class="eyebrow">Step 2</p>
-          <h2 id="results-panel-heading">Results</h2>
-        </div>
-        <div class="download-actions">
-          <button id="download-csv" class="secondary-button" type="button" disabled>Download CSV</button>
-          <button id="download-json" class="secondary-button" type="button" disabled>Download JSON</button>
-        </div>
+        <div><p class="eyebrow">Dataset</p><h2>Collected posts</h2></div>
+        <span id="result-count" class="status neutral">0 posts</span>
       </div>
-
-      <div id="error-banner" hidden style="background:var(--color-error,#ff6b6b);color:#fff;padding:0.75rem 1rem;border-radius:6px;margin-bottom:1rem;font-size:0.9rem;"></div>
-
-      <div class="summary-grid" aria-live="polite">
-        <article>
-          <span>Total Tweets</span>
-          <strong id="tweet-count">0</strong>
-        </article>
-        <article>
-          <span>Total Likes</span>
-          <strong id="like-count">0</strong>
-        </article>
-        <article>
-          <span>Total Replies</span>
-          <strong id="reply-count">0</strong>
-        </article>
+      <div class="summary-grid">
+        <article><span>Posts</span><strong id="tweet-count">0</strong></article>
+        <article><span>Likes</span><strong id="like-count">0</strong></article>
+        <article><span>Replies</span><strong id="reply-count">0</strong></article>
+        <article><span>Reposts</span><strong id="retweet-count">0</strong></article>
+        <article><span>Quotes</span><strong id="quote-count">0</strong></article>
       </div>
-
       <div class="table-wrap">
         <table>
-          <thead>
-            <tr>
-              <th>Username</th>
-              <th>Text</th>
-              <th>Created At</th>
-              <th>Likes</th>
-              <th>Replies</th>
-              <th>Retweets</th>
-              <th>URL</th>
-            </tr>
-          </thead>
-          <tbody id="results-body">
-            <tr class="empty-row">
-              <td colspan="7">Enter a source above to preview scraped tweet data.</td>
-            </tr>
-          </tbody>
+          <thead><tr><th>Author</th><th>Post</th><th>Created</th><th>Likes</th><th>Replies</th><th>Reposts</th><th>Type</th><th>Sentiment</th><th>Link</th></tr></thead>
+          <tbody id="results-body"><tr class="empty"><td colspan="9">Start or reopen a collection to see posts.</td></tr></tbody>
         </table>
       </div>
     </section>
-  </main>
 
-  <script src="app.js"></script>
+    <section class="panel">
+      <div class="panel-heading">
+        <div><p class="eyebrow">Persistent history</p><h2>Recent jobs</h2></div>
+        <button id="refresh-history" class="secondary compact" type="button">Refresh</button>
+      </div>
+      <div id="history-list" class="history-list"><p class="muted">Loading history…</p></div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
 </body>
 </html>

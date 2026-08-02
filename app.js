@@ -1,238 +1,219 @@
-const form = document.querySelector("#scrape-form");
-const resultsBody = document.querySelector("#results-body");
-const downloadCsvButton = document.querySelector("#download-csv");
-const downloadJsonButton = document.querySelector("#download-json");
-const tweetCount = document.querySelector("#tweet-count");
-const likeCount = document.querySelector("#like-count");
-const replyCount = document.querySelector("#reply-count");
-const scrollSquigglePath = document.querySelector("#scroll-squiggle-progress");
-const scrollSquiggleDot = document.querySelector("#scroll-squiggle-dot");
+const form = document.querySelector("#job-form");
+const sourceType = document.querySelector("#source-type");
+const sourceLabel = document.querySelector("#source-label");
+const sourceValue = document.querySelector("#source-value");
+const submitButton = document.querySelector("#submit-button");
+const activePanel = document.querySelector("#active-panel");
+const jobTitle = document.querySelector("#job-title");
+const jobStatus = document.querySelector("#job-status");
+const progressBar = document.querySelector("#progress-bar");
+const progressTrack = document.querySelector(".progress-track");
+const progressCopy = document.querySelector("#progress-copy");
 const errorBanner = document.querySelector("#error-banner");
-const submitButton = form.querySelector('button[type="submit"]');
-const resultsPanelHeading = document.querySelector("#results-panel-heading");
+const warningBanner = document.querySelector("#warning-banner");
+const cancelButton = document.querySelector("#cancel-button");
+const resumeButton = document.querySelector("#resume-button");
+const resultsBody = document.querySelector("#results-body");
+const historyList = document.querySelector("#history-list");
 
-const API_BASE = "http://localhost:5000";
+let activeJobId = null;
+let pollTimer = null;
 
-let currentResults = [];
-
-function mixColor(startColor, endColor, amount) {
-  const start = startColor.match(/\w\w/g).map((channel) => parseInt(channel, 16));
-  const end = endColor.match(/\w\w/g).map((channel) => parseInt(channel, 16));
-  const mixed = start.map((channel, index) => Math.round(channel + (end[index] - channel) * amount));
-
-  return `#${mixed.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function getScrollProgress() {
-  const scrollableHeight = document.documentElement.scrollHeight - window.innerHeight;
-
-  if (scrollableHeight <= 0) {
-    return 1;
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
+  const data = await response.json();
+  if (!response.ok) {
+    const error = new Error(data.error?.message || `Request failed (${response.status})`);
+    error.code = data.error?.code;
+    throw error;
   }
-
-  return Math.min(window.scrollY / scrollableHeight, 1);
+  return data;
 }
 
-function updateScrollSquiggle() {
-  if (!scrollSquigglePath || !scrollSquiggleDot) {
-    return;
-  }
-
-  const pathLength = scrollSquigglePath.getTotalLength();
-  const progress = getScrollProgress();
-  const currentPoint = scrollSquigglePath.getPointAtLength(pathLength * progress);
-  const activeColor = mixColor("8fd3ff", "c7a0ff", progress);
-
-  scrollSquigglePath.style.strokeDasharray = pathLength;
-  scrollSquigglePath.style.strokeDashoffset = pathLength * (1 - progress);
-  scrollSquiggleDot.setAttribute("cx", currentPoint.x);
-  scrollSquiggleDot.setAttribute("cy", currentPoint.y);
-  scrollSquiggleDot.classList.toggle("is-visible", progress > 0.02);
-  scrollSquiggleDot.classList.toggle("is-complete", progress >= 0.99);
-  document.documentElement.style.setProperty("--scroll-color", activeColor);
+function formatNumber(value) {
+  return new Intl.NumberFormat().format(Number(value || 0));
 }
 
-function showError(message) {
-  if (!errorBanner) return;
-  errorBanner.textContent = message;
-  errorBanner.hidden = false;
+function updateSourceForm() {
+  const search = sourceType.value === "search";
+  sourceLabel.textContent = search ? "Search query" : "Username or profile URL";
+  sourceValue.placeholder = search ? "AI agents lang:en" : "@OpenAI or https://x.com/OpenAI";
 }
 
-function clearError() {
-  if (!errorBanner) return;
-  errorBanner.textContent = "";
-  errorBanner.hidden = true;
-}
-
-function setCacheHitBadge(cacheHit, cacheAge) {
-  const existingBadge = document.querySelector("#cache-badge");
-  if (existingBadge) existingBadge.remove();
-
-  if (cacheHit && resultsPanelHeading) {
-    const badge = document.createElement("span");
-    badge.id = "cache-badge";
-    badge.className = "pill";
-    badge.style.marginLeft = "0.5rem";
-    badge.style.fontSize = "0.75rem";
-    badge.textContent = cacheAge ? `Served from cache (${cacheAge} old)` : "Served from cache";
-    resultsPanelHeading.insertAdjacentElement("afterend", badge);
+async function loadSession() {
+  const status = document.querySelector("#session-status");
+  const message = document.querySelector("#session-message");
+  try {
+    const data = await api("/api/session");
+    status.textContent = data.status;
+    status.className = data.valid ? "good" : "bad";
+    message.textContent = data.message;
+    submitButton.disabled = !data.valid;
+  } catch (error) {
+    status.textContent = "unavailable";
+    status.className = "bad";
+    message.textContent = error.message;
+    submitButton.disabled = true;
   }
 }
 
-function renderResults(results) {
+function showBanner(element, message) {
+  element.textContent = message || "";
+  element.hidden = !message;
+}
+
+function renderTweets(tweets) {
   resultsBody.replaceChildren();
-
-  if (results.length === 0) {
-    const row = document.createElement("tr");
-    const cell = document.createElement("td");
-
-    row.className = "empty-row";
-    cell.colSpan = 7;
-    cell.textContent = "No preview data yet.";
-    row.append(cell);
-    resultsBody.append(row);
-    return;
+  if (!tweets.length) {
+    resultsBody.innerHTML = '<tr class="empty"><td colspan="9">No collected posts yet.</td></tr>';
   }
-
-  results.forEach((tweet) => {
+  for (const tweet of tweets) {
     const row = document.createElement("tr");
+    const type = [tweet.is_reply && "reply", tweet.is_retweet && "repost", tweet.is_quote && "quote", tweet.has_media && "media"].filter(Boolean).join(", ") || "post";
+    const sentiment = tweet.sentiment_label ? `${tweet.sentiment_label} (${Number(tweet.sentiment_score).toFixed(2)})` : "—";
     const values = [
-      `@${tweet.username}`,
-      tweet.text,
-      tweet.createdAt,
-      tweet.likeCount,
-      tweet.replyCount,
-      tweet.retweetCount,
+      `@${tweet.author_username}`, tweet.text,
+      tweet.created_at ? new Date(tweet.created_at).toLocaleString() : "—",
+      formatNumber(tweet.like_count), formatNumber(tweet.reply_count),
+      formatNumber(tweet.retweet_count), type, sentiment,
     ];
-
     values.forEach((value, index) => {
       const cell = document.createElement("td");
-
-      if (index === 1) {
-        cell.className = "tweet-text";
-      }
-
       cell.textContent = value;
+      if (index === 1) cell.className = "post-text";
       row.append(cell);
     });
-
     const linkCell = document.createElement("td");
     const link = document.createElement("a");
-
     link.href = tweet.url;
     link.target = "_blank";
     link.rel = "noreferrer";
-    link.textContent = tweet.url ? "View" : "—";
-    if (!tweet.url) link.removeAttribute("href");
+    link.textContent = "View";
     linkCell.append(link);
     row.append(linkCell);
     resultsBody.append(row);
-  });
+  }
+  document.querySelector("#result-count").textContent = `${tweets.length} posts`;
+  document.querySelector("#tweet-count").textContent = formatNumber(tweets.length);
+  for (const metric of ["like", "reply", "retweet", "quote"]) {
+    const total = tweets.reduce((sum, item) => sum + Number(item[`${metric}_count`] || 0), 0);
+    document.querySelector(`#${metric}-count`).textContent = formatNumber(total);
+  }
 }
 
-function updateSummary(results) {
-  tweetCount.textContent = results.length;
-  likeCount.textContent = results.reduce((total, tweet) => total + (tweet.likeCount || 0), 0);
-  replyCount.textContent = results.reduce((total, tweet) => total + (tweet.replyCount || 0), 0);
+async function loadTweets(jobId) {
+  const data = await api(`/api/jobs/${jobId}/tweets?limit=500`);
+  renderTweets(data.tweets || []);
 }
 
-function setDownloadState(enabled) {
-  downloadCsvButton.disabled = !enabled;
-  downloadJsonButton.disabled = !enabled;
+function setActiveJob(job) {
+  activePanel.hidden = false;
+  activeJobId = job.id;
+  jobTitle.textContent = `${job.request.sourceType}: ${job.request.sourceValue}`;
+  jobStatus.textContent = job.status;
+  jobStatus.className = `status ${job.status}`;
+  const percent = job.targetCount ? Math.min((job.collectedCount / job.targetCount) * 100, 100) : 0;
+  progressBar.style.width = `${percent}%`;
+  progressTrack.setAttribute("aria-valuenow", String(Math.round(percent)));
+  progressCopy.textContent = `${formatNumber(job.collectedCount)} of ${formatNumber(job.targetCount)} requested posts collected`;
+  showBanner(errorBanner, job.error?.message);
+  showBanner(warningBanner, job.warnings?.join(" "));
+  const active = ["queued", "running"].includes(job.status);
+  cancelButton.hidden = !active;
+  resumeButton.hidden = !["failed", "cancelled", "interrupted"].includes(job.status);
+  document.querySelector("#json-export").href = `/api/jobs/${job.id}/export?format=json`;
+  document.querySelector("#csv-export").href = `/api/jobs/${job.id}/export?format=csv`;
 }
 
-function downloadFile(filename, content, type) {
-  const blob = new Blob([content], { type });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
+async function pollJob() {
+  if (!activeJobId) return;
+  try {
+    const job = await api(`/api/jobs/${activeJobId}`);
+    setActiveJob(job);
+    await loadTweets(activeJobId);
+    if (["queued", "running"].includes(job.status)) {
+      pollTimer = window.setTimeout(pollJob, 1500);
+    } else {
+      submitButton.disabled = false;
+      await loadHistory();
+    }
+  } catch (error) {
+    showBanner(errorBanner, error.message);
+  }
 }
 
-function escapeCsvValue(value) {
-  const stringValue = String(value ?? "");
-  return `"${stringValue.replaceAll('"', '""')}"`;
+async function openJob(jobId) {
+  window.clearTimeout(pollTimer);
+  activeJobId = jobId;
+  await pollJob();
+  activePanel.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function convertToCsv(results) {
-  const headers = ["username", "text", "createdAt", "likeCount", "replyCount", "retweetCount", "url", "finalLabel", "finalConfidence"];
-  const rows = results.map((tweet) => headers.map((header) => escapeCsvValue(tweet[header])).join(","));
+async function loadHistory() {
+  try {
+    const data = await api("/api/jobs?limit=25");
+    historyList.replaceChildren();
+    if (!data.jobs.length) {
+      historyList.innerHTML = '<p class="muted">No collections have been run yet.</p>';
+      return;
+    }
+    for (const job of data.jobs) {
+      const button = document.createElement("button");
+      button.className = "history-item";
+      button.type = "button";
+      button.innerHTML = `<span><strong>${job.request.sourceType}: ${escapeHtml(job.request.sourceValue)}</strong><small>${new Date(job.createdAt).toLocaleString()}</small></span><span><b class="status ${job.status}">${job.status}</b><small>${job.collectedCount}/${job.targetCount}</small></span>`;
+      button.addEventListener("click", () => openJob(job.id));
+      historyList.append(button);
+    }
+  } catch (error) {
+    historyList.textContent = error.message;
+  }
+}
 
-  return [headers.join(","), ...rows].join("\n");
+function escapeHtml(value) {
+  const element = document.createElement("span");
+  element.textContent = value;
+  return element.innerHTML;
 }
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  clearError();
-  setCacheHitBadge(false);
-
-  const formData = new FormData(form);
-  const payload = {
-    sourceValue: formData.get("sourceValue"),
-    maxTweets: Number(formData.get("maxTweets")) || 25,
-    includeType: formData.get("includeType"),
-    startDate: formData.get("startDate") || null,
-    endDate: formData.get("endDate") || null,
-  };
-
-  submitButton.textContent = "Scraping…";
   submitButton.disabled = true;
-
+  showBanner(errorBanner, "");
+  const values = new FormData(form);
+  const payload = {
+    sourceType: values.get("sourceType"), sourceValue: values.get("sourceValue"),
+    maxTweets: Number(values.get("maxTweets")), startDate: values.get("startDate") || null,
+    endDate: values.get("endDate") || null, includeReplies: values.has("includeReplies"),
+    mediaOnly: values.has("mediaOnly"), analyzeSentiment: values.has("analyzeSentiment"),
+  };
   try {
-    const response = await fetch(`${API_BASE}/api/scrape`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+    const data = await api("/api/jobs", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      showError(data.error || `Request failed with status ${response.status}.`);
-      renderResults([]);
-      updateSummary([]);
-      setDownloadState(false);
-      return;
-    }
-
-    currentResults = data.tweets || [];
-    renderResults(currentResults);
-    updateSummary(currentResults);
-    setDownloadState(currentResults.length > 0);
-    setCacheHitBadge(data.cacheHit, data.cacheAge);
-  } catch (err) {
-    showError(
-      "Could not reach the scraper server. Make sure server.py is running on localhost:5000."
-    );
-    renderResults([]);
-    updateSummary([]);
-    setDownloadState(false);
-  } finally {
-    submitButton.textContent = "Preview Results";
+    activeJobId = data.jobId;
+    await pollJob();
+  } catch (error) {
+    activePanel.hidden = false;
+    showBanner(errorBanner, error.message);
     submitButton.disabled = false;
   }
 });
 
-form.addEventListener("reset", () => {
-  currentResults = [];
-  renderResults(currentResults);
-  updateSummary(currentResults);
-  setDownloadState(false);
-  clearError();
-  setCacheHitBadge(false);
+cancelButton.addEventListener("click", async () => {
+  if (!activeJobId) return;
+  await api(`/api/jobs/${activeJobId}`, { method: "DELETE" });
+  cancelButton.disabled = true;
 });
 
-downloadCsvButton.addEventListener("click", () => {
-  downloadFile("tweet-results.csv", convertToCsv(currentResults), "text/csv");
+resumeButton.addEventListener("click", async () => {
+  if (!activeJobId) return;
+  await api(`/api/jobs/${activeJobId}/resume`, { method: "POST" });
+  await pollJob();
 });
 
-downloadJsonButton.addEventListener("click", () => {
-  downloadFile("tweet-results.json", JSON.stringify(currentResults, null, 2), "application/json");
-});
-
-window.addEventListener("scroll", updateScrollSquiggle, { passive: true });
-window.addEventListener("resize", updateScrollSquiggle);
-updateScrollSquiggle();
+sourceType.addEventListener("change", updateSourceForm);
+document.querySelector("#refresh-history").addEventListener("click", loadHistory);
+updateSourceForm();
+loadSession();
+loadHistory();

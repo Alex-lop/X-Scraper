@@ -1,0 +1,94 @@
+{
+  "data": {
+    "user": {
+      "result": {
+        "timeline": {
+          "timeline": {
+            "instructions": [
+              {
+                "type": "TimelineAddEntries",
+                "entries": [
+                  {
+                    "entryId": "tweet-123",
+                    "content": {
+                      "itemContent": {
+                        "tweet_results": {
+                          "result": {
+                            "__typename": "Tweet",
+                            "rest_id": "123",
+                            "core": {
+                              "user_results": {
+                                "result": {
+                                  "legacy": {"screen_name": "example"}
+                                }
+                              }
+                            },
+                            "legacy": {
+                              "full_text": "A reliable collection post",
+                              "created_at": "Tue Jun 02 14:29:55 +0000 2026",
+                              "lang": "en",
+                              "conversation_id_str": "123",
+                              "favorite_count": 11,
+                              "reply_count": 2,
+                              "retweet_count": 3,
+                              "quote_count": 4,
+                              "bookmark_count": 5,
+                              "extended_entities": {
+                                "media": [
+                                  {
+                                    "id_str": "m1",
+                                    "type": "photo",
+                                    "media_url_https": "https://pbs.twimg.com/media/example.jpg",
+                                    "expanded_url": "https://x.com/example/status/123/photo/1"
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "entryId": "tweet-456",
+                    "content": {
+                      "itemContent": {
+                        "tweet_results": {
+                          "result": {
+                            "__typename": "TweetWithVisibilityResults",
+                            "tweet": {
+                              "__typename": "Tweet",
+                              "rest_id": "456",
+                              "core": {
+                                "user_results": {
+                                  "result": {"core": {"screen_name": "reply_author"}}
+                                }
+                              },
+                              "note_tweet": {
+                                "note_tweet_results": {"result": {"text": "A long reply from a note tweet"}}
+                              },
+                              "legacy": {
+                                "full_text": "truncated",
+                                "created_at": "Mon Jun 01 10:00:00 +0000 2026",
+                                "in_reply_to_status_id_str": "123",
+                                "favorite_count": 1
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "entryId": "cursor-bottom",
+                    "content": {"cursorType": "Bottom", "value": "cursor-next"}
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
