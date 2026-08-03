@@ -1,7 +1,7 @@
 # X API Analyst
 
 <p align="center">
-  <img src="images/logo.png" alt="X API Analyst logo" width="280" />
+  <img src="images/X_cool.png" alt="X API Analyst logo" width="280" />
 </p>
 
 A local, bring-your-own-token workbench for collecting public Posts through the official X API recent-search endpoint. It keeps immutable SQLite snapshots, resumable single-worker jobs, exact 15-minute cache reuse, JSON/CSV exports, and an optional MCP bridge.
@@ -73,5 +73,5 @@ node --check xscraper/static/app.js
 Deferred: full-archive search, deep timelines, OAuth user accounts, hosted SaaS, recurring monitoring, alerts, query ASTs, desktop bundles, proxy/stealth/CAPTCHA features, and write actions.
 
 <p align="center">
-  <img src="images/logo.png" alt="X API Analyst logo" width="180" />
+  <img src="images/X_cool.png" alt="X API Analyst logo" width="180" />
 </p>
