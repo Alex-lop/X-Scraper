@@ -61,14 +61,14 @@
     <section id="active-panel" class="panel" hidden>
       <div class="panel-heading">
         <div><p class="eyebrow">Active job</p><h2 id="job-title">Collection</h2></div>
-        <span id="job-status" class="status">Queued</span>
+        <span id="job-status" class="status" aria-live="polite">Queued</span>
       </div>
       <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
         <div id="progress-bar"></div>
       </div>
-      <p id="progress-copy" class="muted">Waiting for the collector…</p>
-      <div id="error-banner" class="banner error" hidden></div>
-      <div id="warning-banner" class="banner warning" hidden></div>
+      <p id="progress-copy" class="muted" aria-live="polite">Waiting for the collector…</p>
+      <div id="error-banner" class="banner error" role="alert" hidden></div>
+      <div id="warning-banner" class="banner warning" role="status" aria-live="polite" hidden></div>
       <div class="actions">
         <button id="cancel-button" class="danger" type="button">Cancel</button>
         <button id="resume-button" type="button" hidden>Resume</button>

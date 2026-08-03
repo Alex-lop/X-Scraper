@@ -30,3 +30,41 @@ def test_rejects_reversed_dates():
                 "endDate": "2026-05-01",
             }
         )
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
+def test_rejects_non_boolean_filter_values(value):
+    with pytest.raises(InvalidRequestError):
+        CollectionRequest.from_dict(
+            {"sourceType": "search", "sourceValue": "python", "mediaOnly": value}
+        )
+
+
+def test_rejects_non_object_request():
+    with pytest.raises(InvalidRequestError):
+        CollectionRequest.from_dict(["not", "an", "object"])
+
+
+def test_cursor_fingerprint_ignores_limit_and_sentiment():
+    first = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "OpenAI", "maxTweets": 10}
+    )
+    second = CollectionRequest.from_dict(
+        {
+            "sourceType": "profile",
+            "sourceValue": "openai",
+            "maxTweets": 50,
+            "analyzeSentiment": True,
+        }
+    )
+    assert first.fingerprint() != second.fingerprint()
+    assert first.fingerprint(include_limit=False, include_sentiment=False) == second.fingerprint(
+        include_limit=False, include_sentiment=False
+    )
+
+
+def test_search_expression_only_trims_edges_and_normalizes_unicode():
+    request = CollectionRequest.from_dict(
+        {"sourceType": "search", "sourceValue": "  cafe\u0301   OR  Tea  "}
+    )
+    assert request.source_value == "café   OR  Tea"

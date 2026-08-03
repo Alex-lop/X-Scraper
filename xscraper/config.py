@@ -18,6 +18,7 @@ class Settings:
     page_timeout_ms: int = 60_000
     no_new_page_limit: int = 3
     max_retries: int = 3
+    enable_tracing: bool = False
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -46,6 +47,7 @@ class Settings:
             .resolve(),
             headless=os.environ.get("XSCRAPER_HEADLESS", "1") != "0",
             job_timeout_seconds=int(os.environ.get("XSCRAPER_JOB_TIMEOUT", "600")),
+            enable_tracing=os.environ.get("XSCRAPER_ENABLE_TRACING", "0") == "1",
         )
 
     def ensure_runtime_dirs(self) -> None:

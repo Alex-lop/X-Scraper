@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 from ..models import CollectionRequest, CollectionSummary, Tweet
 
-BatchCallback = Callable[[list[Tweet], str | None], None]
+BatchCallback = Callable[[list[Tweet], str | None, dict[str, Any], int], int]
 CancelCallback = Callable[[], bool]
 
 
@@ -15,6 +15,7 @@ class CollectionProvider(Protocol):
         request: CollectionRequest,
         *,
         cursor: str | None,
+        cursor_context: dict[str, Any] | None,
         on_batch: BatchCallback,
         should_cancel: CancelCallback,
     ) -> CollectionSummary: ...

@@ -21,7 +21,10 @@ let pollTimer = null;
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
-  const data = await response.json();
+  const contentType = response.headers.get("content-type") || "";
+  const data = contentType.includes("application/json")
+    ? await response.json()
+    : { error: { message: await response.text() || `Request failed (${response.status})` } };
   if (!response.ok) {
     const error = new Error(data.error?.message || `Request failed (${response.status})`);
     error.code = data.error?.code;
@@ -115,12 +118,18 @@ function setActiveJob(job) {
   const percent = job.targetCount ? Math.min((job.collectedCount / job.targetCount) * 100, 100) : 0;
   progressBar.style.width = `${percent}%`;
   progressTrack.setAttribute("aria-valuenow", String(Math.round(percent)));
-  progressCopy.textContent = `${formatNumber(job.collectedCount)} of ${formatNumber(job.targetCount)} requested posts collected`;
+  const completion = job.completionReason ? ` · ${job.completionReason.replaceAll("_", " ")}` : "";
+  progressCopy.textContent = `${formatNumber(job.collectedCount)} of ${formatNumber(job.targetCount)} maximum posts collected${completion}`;
   showBanner(errorBanner, job.error?.message);
-  showBanner(warningBanner, job.warnings?.join(" "));
+  const warnings = [...(job.warnings || [])];
+  if (job.isPartial) warnings.unshift("This job contains partial results.");
+  showBanner(warningBanner, warnings.join(" "));
   const active = ["queued", "running"].includes(job.status);
   cancelButton.hidden = !active;
-  resumeButton.hidden = !["failed", "cancelled", "interrupted"].includes(job.status);
+  cancelButton.disabled = Boolean(job.cancelRequested);
+  const resumable = ["cancelled", "interrupted", "partial"].includes(job.status)
+    || (job.status === "failed" && job.error?.retryable);
+  resumeButton.hidden = !resumable;
   document.querySelector("#json-export").href = `/api/jobs/${job.id}/export?format=json`;
   document.querySelector("#csv-export").href = `/api/jobs/${job.id}/export?format=csv`;
 }
@@ -139,6 +148,7 @@ async function pollJob() {
     }
   } catch (error) {
     showBanner(errorBanner, error.message);
+    pollTimer = window.setTimeout(pollJob, 3000);
   }
 }
 
@@ -202,17 +212,32 @@ form.addEventListener("submit", async (event) => {
 
 cancelButton.addEventListener("click", async () => {
   if (!activeJobId) return;
-  await api(`/api/jobs/${activeJobId}`, { method: "DELETE" });
-  cancelButton.disabled = true;
+  try {
+    window.clearTimeout(pollTimer);
+    await api(`/api/jobs/${activeJobId}`, { method: "DELETE" });
+    cancelButton.disabled = true;
+    await pollJob();
+  } catch (error) {
+    showBanner(errorBanner, error.message);
+  }
 });
 
 resumeButton.addEventListener("click", async () => {
   if (!activeJobId) return;
-  await api(`/api/jobs/${activeJobId}/resume`, { method: "POST" });
-  await pollJob();
+  try {
+    window.clearTimeout(pollTimer);
+    resumeButton.disabled = true;
+    await api(`/api/jobs/${activeJobId}/resume`, { method: "POST" });
+    await pollJob();
+  } catch (error) {
+    showBanner(errorBanner, error.message);
+  } finally {
+    resumeButton.disabled = false;
+  }
 });
 
 sourceType.addEventListener("change", updateSourceForm);
+form.addEventListener("reset", () => window.setTimeout(updateSourceForm));
 document.querySelector("#refresh-history").addEventListener("click", loadHistory);
 updateSourceForm();
 loadSession();

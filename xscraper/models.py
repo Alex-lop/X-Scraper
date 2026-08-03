@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -24,6 +27,7 @@ class JobStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
+    PARTIAL = "partial"
 
 
 def utc_now() -> str:
@@ -68,12 +72,32 @@ class CollectionRequest:
 
     @classmethod
     def from_dict(cls, body: dict[str, Any]) -> CollectionRequest:
+        if not isinstance(body, dict):
+            raise InvalidRequestError("Request body must be a JSON object.")
+        allowed_fields = {
+            "sourceType",
+            "sourceValue",
+            "maxTweets",
+            "startDate",
+            "endDate",
+            "includeReplies",
+            "mediaOnly",
+            "analyzeSentiment",
+        }
+        unknown_fields = sorted(set(body) - allowed_fields)
+        if unknown_fields:
+            raise InvalidRequestError(
+                f"Unknown request field(s): {', '.join(unknown_fields)}."
+            )
         try:
             source_type = SourceType(str(body.get("sourceType", "")))
         except ValueError as exc:
             raise InvalidRequestError("sourceType must be 'profile' or 'search'.") from exc
 
-        source_value = str(body.get("sourceValue") or "").strip()
+        raw_source_value = body.get("sourceValue")
+        if not isinstance(raw_source_value, str):
+            raise InvalidRequestError("sourceValue must be a string.")
+        source_value = unicodedata.normalize("NFC", raw_source_value.strip())
         if not source_value:
             raise InvalidRequestError("sourceValue is required.")
         if source_type is SourceType.PROFILE:
@@ -81,10 +105,9 @@ class CollectionRequest:
         elif len(source_value) > 500:
             raise InvalidRequestError("Search query cannot exceed 500 characters.")
 
-        try:
-            max_tweets = int(body.get("maxTweets", 25))
-        except (TypeError, ValueError) as exc:
-            raise InvalidRequestError("maxTweets must be an integer.") from exc
+        max_tweets = body.get("maxTweets", 25)
+        if isinstance(max_tweets, bool) or not isinstance(max_tweets, int):
+            raise InvalidRequestError("maxTweets must be an integer.")
         if not 1 <= max_tweets <= 500:
             raise InvalidRequestError("maxTweets must be between 1 and 500.")
 
@@ -93,15 +116,24 @@ class CollectionRequest:
         if start_date and end_date and start_date > end_date:
             raise InvalidRequestError("startDate cannot be after endDate.")
 
+        boolean_fields = {
+            "includeReplies": body.get("includeReplies", False),
+            "mediaOnly": body.get("mediaOnly", False),
+            "analyzeSentiment": body.get("analyzeSentiment", False),
+        }
+        for field_name, value in boolean_fields.items():
+            if not isinstance(value, bool):
+                raise InvalidRequestError(f"{field_name} must be a boolean.")
+
         return cls(
             source_type=source_type,
             source_value=source_value,
             max_tweets=max_tweets,
             start_date=start_date,
             end_date=end_date,
-            include_replies=bool(body.get("includeReplies", False)),
-            media_only=bool(body.get("mediaOnly", False)),
-            analyze_sentiment=bool(body.get("analyzeSentiment", False)),
+            include_replies=boolean_fields["includeReplies"],
+            media_only=boolean_fields["mediaOnly"],
+            analyze_sentiment=boolean_fields["analyzeSentiment"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -115,6 +147,30 @@ class CollectionRequest:
             "mediaOnly": self.media_only,
             "analyzeSentiment": self.analyze_sentiment,
         }
+
+    def fingerprint(
+        self, *, include_limit: bool = True, include_sentiment: bool = True
+    ) -> str:
+        canonical = {
+            "version": 1,
+            "provider": "x_web_playwright",
+            "sourceType": self.source_type.value,
+            "sourceValue": (
+                self.source_value.casefold()
+                if self.source_type is SourceType.PROFILE
+                else self.source_value
+            ),
+            "startDate": self.start_date,
+            "endDate": self.end_date,
+            "includeReplies": self.include_replies,
+            "mediaOnly": self.media_only,
+        }
+        if include_limit:
+            canonical["maxTweets"] = self.max_tweets
+        if include_sentiment:
+            canonical["analyzeSentiment"] = self.analyze_sentiment
+        serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 @dataclass(slots=True)
@@ -151,3 +207,5 @@ class Tweet:
 class CollectionSummary:
     warnings: list[str] = field(default_factory=list)
     last_cursor: str | None = None
+    completion_reason: str = "timeline_exhausted"
+    partial: bool = False

@@ -42,6 +42,11 @@ class SchemaDriftError(ScraperError):
     retryable = True
 
 
+class ResumeIncompatibleError(ScraperError):
+    code = "resume_incompatible"
+    retryable = False
+
+
 class CollectionCancelled(ScraperError):
     code = "cancelled"
     retryable = True
