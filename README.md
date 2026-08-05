@@ -25,11 +25,32 @@ xscraper configure
 xscraper serve
 ```
 
-The dashboard opens automatically at <http://127.0.0.1:5000>; use `--no-open` to suppress that. The server refuses non-loopback hosts and a second worker for the same database.
+The dashboard opens automatically at <http://127.0.0.1:5000>; use `--no-open` to suppress that. Use `--port 0` to select a free port automatically. The server refuses non-loopback hosts and a second worker for the same database.
 
 Every new collection requires a preview and explicit paid-read confirmation. Profile input compiles to `from:<handle>`; search input is passed through after edge trimming and NFC normalization. Reply and media filters compile to `-is:reply` and `has:media`. Dates use the API `start_time` and `end_time` parameters and must overlap the recent-search seven-day window.
 
-X currently requires 10–100 results per recent-search request, so jobs allow 10–500 Posts. A final page can read up to nine more Posts than the requested collection limit. The UI estimates that ceiling at $0.005/Post, marked pricing as of August 2026; actual billing and X deduplication may differ. See [X pricing](https://docs.x.com/x-api/getting-started/pricing).
+X currently requires 10–100 results per recent-search request, so jobs allow 10–500 Posts. A final page can read up to nine more Posts than the requested collection limit. The UI shows a Posts-only estimate at $0.005/Post, marked pricing as of August 2026. Author and media expansions may be billed separately, and actual billing and deduplication may differ. Use an X Developer Console spending limit as the hard cap; see [X pricing](https://docs.x.com/x-api/getting-started/pricing).
+
+## Demo runbook
+
+Set a low spending limit and verify credits in the X Developer Console before a live rehearsal. Then run:
+
+```bash
+xscraper configure
+xscraper doctor --live
+xscraper smoke api --profile OpenAI --confirm-paid-x
+xscraper demo --live
+```
+
+`doctor` performs no paid read. A live demo uses a temporary database, selects a free loopback port, allows exactly one 10-Post page, and disables force refresh. The dashboard still requires its explicit paid-read confirmation.
+
+If credentials, credits, X, or the network are unavailable, stop the live process and run:
+
+```bash
+xscraper demo
+```
+
+The fallback uses clearly labeled synthetic data, makes no X request, and deletes its temporary database when stopped. Use `--no-open` when presenting the URL manually.
 
 ## API
 
@@ -42,7 +63,7 @@ X currently requires 10–100 results per recent-search request, so jobs allow 1
 - `POST /api/jobs/:id/resume`
 - `GET /api/jobs/:id/export?format=json|csv`
 
-HTTP 429 jobs enter `waiting` and requeue automatically after the persisted rate-limit reset, including after restart. Completed pages remain available after any later failure. Legacy browser jobs remain readable but cannot resume.
+HTTP 429 jobs enter `waiting` and requeue automatically after the persisted rate-limit reset, including after restart. Completed pages remain available after any later failure. Pre-official-API databases are intentionally unsupported; use a new `XSCRAPER_DB_PATH` rather than overwriting one.
 
 ## MCP and paid smoke
 
@@ -54,7 +75,7 @@ xscraper mcp
 
 The stdio MCP server proxies only the loopback REST API and exposes preview, start, status, Post pagination, and history tools. It does not read the token or offer posting, engagement, arbitrary URLs, or upstream payloads.
 
-An opt-in live check reads at most 10 Posts (maximum documented estimate $0.05):
+An opt-in live check reads at most 10 Posts (Posts-only estimate $0.05; expansions may be billed separately):
 
 ```bash
 xscraper smoke api --profile OpenAI --confirm-paid-x
@@ -71,7 +92,3 @@ node --check xscraper/static/app.js
 ```
 
 Deferred: full-archive search, deep timelines, OAuth user accounts, hosted SaaS, recurring monitoring, alerts, query ASTs, desktop bundles, proxy/stealth/CAPTCHA features, and write actions.
-
-<p align="center">
-  <img src="images/X_cool.png" alt="X API Analyst logo" width="180" />
-</p>

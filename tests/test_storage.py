@@ -1,187 +1,91 @@
-import json
+from datetime import UTC, datetime, timedelta
 
-from xscraper.models import CollectionRequest, JobStatus, Tweet
+import pytest
+
+from xscraper.models import CollectionRequest, JobStatus, Post
 from xscraper.storage import Storage
+from xscraper.x_api import compile_request
 
 
-def make_tweet(tweet_id="1"):
-    return Tweet(
-        tweet_id=tweet_id,
-        text="hello",
-        author_username="tester",
-        url=f"https://x.com/tester/status/{tweet_id}",
-        created_at="2026-06-02T14:29:55+00:00",
-        like_count=7,
+def request():
+    return CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
     )
 
 
-def test_job_storage_deduplicates_and_checkpoints(tmp_path):
+def compiled(scope_token="token"):
+    return compile_request(request(), scope_token)
+
+
+def post(post_id="1"):
+    return Post(post_id, "hello", "tester", f"https://x.com/tester/status/{post_id}", None)
+
+
+def test_snapshots_deduplicate_checkpoint_and_store_context(tmp_path):
     storage = Storage(tmp_path / "test.db")
-    storage.initialize()
-    request = CollectionRequest.from_dict(
-        {"sourceType": "profile", "sourceValue": "tester", "maxTweets": 25}
-    )
-    job_id = storage.create_job(request)
-    storage.set_running(job_id)
-    assert storage.add_tweets(job_id, [make_tweet(), make_tweet()], "cursor-1") == 1
-    job = storage.get_job(job_id)
-    assert job["collected_count"] == 1
-    assert job["cursor"] == "cursor-1"
-    assert storage.get_job_tweets(job_id)[0]["like_count"] == 7
-
-
-def test_recovery_and_resume(tmp_path):
-    storage = Storage(tmp_path / "test.db")
-    storage.initialize()
-    request = CollectionRequest.from_dict(
-        {"sourceType": "search", "sourceValue": "python", "maxTweets": 5}
-    )
-    job_id = storage.create_job(request)
-    storage.set_running(job_id)
-    assert storage.recover_jobs() == [job_id]
-    assert storage.get_job(job_id)["status"] == JobStatus.QUEUED.value
-    storage.fail_job(job_id, JobStatus.FAILED, "rate_limited", "later", True)
-    assert storage.resume_job(job_id)
-    assert storage.get_job(job_id)["status"] == JobStatus.QUEUED.value
-
-
-def test_job_observations_and_enrichments_are_immutable(tmp_path):
-    storage = Storage(tmp_path / "test.db")
-    storage.initialize()
-    plain_request = CollectionRequest.from_dict(
-        {"sourceType": "search", "sourceValue": "python", "maxTweets": 5}
-    )
-    sentiment_request = CollectionRequest.from_dict(
-        {
-            "sourceType": "search",
-            "sourceValue": "python",
-            "maxTweets": 5,
-            "analyzeSentiment": True,
-        }
-    )
-    first_job = storage.create_job(plain_request)
-    second_job = storage.create_job(sentiment_request)
-    storage.add_tweets(first_job, [make_tweet()], "first")
-    newer = make_tweet()
-    newer.like_count = 99
-    storage.add_tweets(
-        second_job,
-        [newer],
-        "second",
-        enrichments={"1": ("positive", 0.8, "vader", "3.3.2")},
-    )
-
-    first = storage.get_job_tweets(first_job)[0]
-    second = storage.get_job_tweets(second_job)[0]
-    assert first["like_count"] == 7
-    assert first["sentiment_label"] is None
-    assert second["like_count"] == 99
-    assert second["sentiment_label"] == "positive"
-
-
-def test_claim_and_cancel_transitions_are_atomic(tmp_path):
-    storage = Storage(tmp_path / "test.db")
-    storage.initialize()
-    request = CollectionRequest.from_dict(
-        {"sourceType": "profile", "sourceValue": "tester", "maxTweets": 5}
-    )
-    queued = storage.create_job(request)
-    assert storage.request_cancel(queued)
-    assert storage.claim_job(queued, "worker") is None
-    assert storage.get_job(queued)["status"] == JobStatus.CANCELLED.value
-
-    running = storage.create_job(request)
-    assert storage.claim_job(running, "worker") is not None
-    assert storage.claim_job(running, "other-worker") is None
-    assert storage.request_cancel(running)
-    final_status = storage.finish_job(
-        running, [], completion_reason="target_reached"
-    )
-    assert final_status == JobStatus.CANCELLED.value
-    assert storage.get_job(running)["status"] == JobStatus.CANCELLED.value
-
-    restarting = storage.create_job(request)
-    assert storage.claim_job(restarting, "worker") is not None
-    assert storage.request_cancel(restarting)
-    recovered = storage.recover_jobs()
-    assert restarting not in recovered
-    assert storage.get_job(restarting)["status"] == JobStatus.CANCELLED.value
-
-
-def test_migrates_an_empty_version_one_database(tmp_path):
-    storage = Storage(tmp_path / "test.db")
-    with storage.connect() as connection:
-        connection.execute(
-            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        storage._migration_1(connection)
-        storage._set_schema_version(connection, 1)
-
     storage.initialize()
     with storage.connect() as connection:
-        version = connection.execute(
-            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0]
-        observation_table = connection.execute(
-            "SELECT name FROM sqlite_master WHERE name = 'tweet_observations'"
-        ).fetchone()
-    assert version == "2"
-    assert observation_table is not None
-    assert (tmp_path / "test.db.pre-v1-to-v2.bak").exists()
-
-
-def test_migrates_version_one_rows_into_job_snapshots(tmp_path):
-    storage = Storage(tmp_path / "test.db")
-    request = CollectionRequest.from_dict(
-        {
-            "sourceType": "profile",
-            "sourceValue": "tester",
-            "maxTweets": 1,
-            "analyzeSentiment": True,
-        }
-    )
-    with storage.connect() as connection:
-        connection.execute(
-            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        storage._migration_1(connection)
-        storage._set_schema_version(connection, 1)
-        connection.execute(
-            """
-            INSERT INTO jobs (
-                id, request_json, source_type, source_value, status, target_count,
-                collected_count, cursor, created_at, updated_at
-            ) VALUES ('legacy', ?, 'profile', 'tester', 'succeeded', 1, 1,
-                      'legacy-cursor', ?, ?)
-            """,
-            (
-                json.dumps(request.to_dict()),
-                "2026-06-02T00:00:00+00:00",
-                "2026-06-02T00:00:00+00:00",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO tweets (
-                tweet_id, text, author_username, url, scraped_at, like_count
-            ) VALUES ('1', 'legacy post', 'tester', 'https://x.com/tester/status/1', ?, 7)
-            """,
-            ("2026-06-02T00:00:00+00:00",),
-        )
-        connection.execute("INSERT INTO job_tweets VALUES ('legacy', '1', 0)")
-        connection.execute(
-            """
-            INSERT INTO tweet_enrichments VALUES (
-                '1', 'positive', 0.8, 'vader', '3.3.2', '2026-06-02T00:00:00+00:00'
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
-            """
+        }
+    assert tables == {"schema_meta", "jobs", "post_observations"}
+    job_id = storage.create_job(request(), compiled())
+    storage.claim_job(job_id)
+    assert (
+        storage.add_posts(
+            job_id,
+            [post(), post()],
+            "opaque",
+            {"billableReads": 2, "rateLimitRemaining": 99, "rateLimitReset": 123},
         )
+        == 1
+    )
+    job = storage.get_job(job_id)
+    assert job["collected_count"] == 1 and job["cursor"] == "opaque"
+    assert job["compiled_request"]["query"] == "from:tester -is:reply"
+    assert job["billable_read_count"] == 2 and job["rate_limit_remaining"] == 99
+    assert storage.get_job_posts(job_id)[0]["tweet_id"] == "1"
 
+
+def test_waiting_jobs_requeue_after_persisted_reset(tmp_path):
+    storage = Storage(tmp_path / "test.db")
     storage.initialize()
-    row = storage.get_job_tweets("legacy")[0]
-    assert row["text"] == "legacy post"
-    assert row["like_count"] == 7
-    assert row["sentiment_label"] == "positive"
-    migrated_job = storage.get_job("legacy")
-    assert migrated_job["request_fingerprint"] == request.fingerprint()
-    assert migrated_job["cursor_context"]["operation"] == "UserTweets"
+    job_id = storage.create_job(request(), compiled())
+    storage.claim_job(job_id)
+    storage.wait_job(job_id, (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), 0, 123, "wait")
+    assert storage.get_job(job_id)["status"] == JobStatus.WAITING
+    assert storage.requeue_due_jobs() == [job_id]
+    assert storage.get_job(job_id)["status"] == JobStatus.QUEUED
+
+
+def test_cache_requires_exact_complete_same_account_and_recent_finish(tmp_path):
+    storage = Storage(tmp_path / "test.db")
+    storage.initialize()
+    context = compiled()
+    job_id = storage.create_job(request(), context)
+    storage.claim_job(job_id)
+    storage.finish_job(job_id, [], completion_reason="recent_search_exhausted")
+    cutoff = (datetime.now(UTC) - timedelta(minutes=15)).isoformat()
+    assert (
+        storage.find_cached_job(
+            context["requestFingerprint"], context["accountScope"], cutoff=cutoff
+        )["id"]
+        == job_id
+    )
+    assert storage.find_cached_job(context["requestFingerprint"], "other", cutoff=cutoff) is None
+
+
+def test_retired_scraper_database_is_rejected_without_modification(tmp_path):
+    storage = Storage(tmp_path / "test.db")
+    with storage.connect() as connection:
+        connection.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')")
+    before = storage.path.read_bytes()
+    with pytest.raises(RuntimeError, match="retired scraper schema"):
+        storage.initialize()
+    assert storage.path.read_bytes() == before
+    with storage.connect() as connection:
+        assert connection.execute("SELECT value FROM schema_meta").fetchone()[0] == "2"

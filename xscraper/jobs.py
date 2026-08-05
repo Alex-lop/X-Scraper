@@ -5,23 +5,19 @@ import logging
 import os
 import queue
 import threading
-import time
 import uuid
-from dataclasses import replace
+from typing import Any
 
-from .errors import CollectionCancelled, ScraperError
+from .errors import CollectionCancelled, CollectionError, RateLimitWaiting
 from .models import CollectionRequest, JobStatus
-from .providers.base import CollectionProvider
-from .sentiment import analyze
 from .storage import Storage
+from .x_api import XApiProvider
 
 logger = logging.getLogger(__name__)
 
 
 class JobService:
-    def __init__(
-        self, storage: Storage, provider: CollectionProvider, *, start_worker: bool = True
-    ):
+    def __init__(self, storage: Storage, provider: XApiProvider, *, start_worker: bool = True):
         self.storage = storage
         self.provider = provider
         self._queue: queue.Queue[str | None] = queue.Queue()
@@ -37,36 +33,16 @@ class JobService:
     def _acquire_process_lock(self) -> None:
         for _ in range(2):
             try:
-                descriptor = os.open(
-                    self._lock_path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
+                descriptor = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
                 try:
-                    owner = self._lock_path.read_text().strip().split(" ", 1)[0]
-                    owner_pid = int(owner)
-                except (OSError, ValueError):
-                    try:
-                        age = time.time() - self._lock_path.stat().st_mtime
-                    except OSError:
-                        age = 0
-                    if age < 5:
-                        raise RuntimeError(
-                            "Another xscraper worker is acquiring the process lock."
-                        ) from None
-                    self._lock_path.unlink(missing_ok=True)
-                    continue
-                try:
+                    owner_pid = int(self._lock_path.read_text().strip().split(" ", 1)[0])
                     os.kill(owner_pid, 0)
-                except ProcessLookupError:
+                except (OSError, ValueError, ProcessLookupError):
                     self._lock_path.unlink(missing_ok=True)
                     continue
-                except PermissionError:
-                    pass
                 raise RuntimeError(
-                    "Another xscraper worker process is already using this database. "
-                    "The local MVP supports one server process."
+                    "Another xscraper worker process is already using this database."
                 ) from None
             with os.fdopen(descriptor, "w") as lock_file:
                 lock_file.write(f"{os.getpid()} {self.worker_id}\n")
@@ -79,8 +55,7 @@ class JobService:
         if not self._lock_owned:
             return
         try:
-            contents = self._lock_path.read_text()
-            if self.worker_id in contents:
+            if self.worker_id in self._lock_path.read_text():
                 self._lock_path.unlink(missing_ok=True)
         except OSError:
             pass
@@ -89,16 +64,15 @@ class JobService:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        if not self._lock_owned:
-            self._acquire_process_lock()
+        self._acquire_process_lock()
         try:
-            recovered_jobs = self.storage.recover_jobs()
+            recovered = self.storage.recover_jobs()
         except Exception:
             self._release_process_lock()
             raise
         self._thread = threading.Thread(target=self._worker, name="xscraper-worker", daemon=True)
         self._thread.start()
-        for job_id in recovered_jobs:
+        for job_id in recovered:
             self.enqueue(job_id)
 
     def shutdown(self) -> None:
@@ -106,22 +80,16 @@ class JobService:
             return
         self._shutdown = True
         self._stop_event.set()
-        while True:
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-            except queue.Empty:
-                break
         self._queue.put(None)
         if self._thread:
             self._thread.join(timeout=5)
         if not self._thread or not self._thread.is_alive():
             self._release_process_lock()
 
-    def submit(self, request: CollectionRequest) -> str:
+    def submit(self, request: CollectionRequest, compiled_request: dict[str, Any]) -> str:
         if self._shutdown:
             raise RuntimeError("Job service is shutting down.")
-        job_id = self.storage.create_job(request)
+        job_id = self.storage.create_job(request, compiled_request)
         self.enqueue(job_id)
         return job_id
 
@@ -138,99 +106,61 @@ class JobService:
         return True
 
     def run_once(self, job_id: str) -> None:
-        job = self.storage.claim_job(job_id, self.worker_id)
+        job = self.storage.claim_job(job_id)
         if not job:
             return
-
         request = CollectionRequest.from_dict(job["request"])
-        remaining = request.max_tweets - int(job["collected_count"])
-        if remaining <= 0:
-            self.storage.finish_job(
-                job_id,
-                job["warnings"],
-                completion_reason="target_reached",
-            )
+        if job["collected_count"] >= request.max_posts:
+            self.storage.finish_job(job_id, job["warnings"], completion_reason="target_reached")
             return
-        active_request = replace(request, max_tweets=remaining)
 
-        def on_batch(tweets, cursor, cursor_context, raw_posts_seen):
-            enrichments = None
-            if request.analyze_sentiment:
-                enrichments = {}
-                for tweet in tweets:
-                    label, score, analyzer_version = analyze(tweet.text)
-                    enrichments[tweet.tweet_id] = (label, score, "vader", analyzer_version)
-            return self.storage.add_tweets(
-                job_id,
-                tweets,
-                cursor,
-                cursor_context=cursor_context,
-                raw_posts_seen=raw_posts_seen,
-                enrichments=enrichments,
-            )
+        def on_batch(posts, cursor, page_stats):
+            return self.storage.add_posts(job_id, posts, cursor, page_stats)
 
         try:
             summary = self.provider.collect(
-                active_request,
+                request,
+                compiled_request=job["compiled_request"],
                 cursor=job["cursor"],
-                cursor_context=job["cursor_context"],
+                collected_count=int(job["collected_count"]),
                 on_batch=on_batch,
-                should_cancel=lambda: self._stop_event.is_set()
-                or self.storage.cancel_requested(job_id),
+                should_cancel=lambda: (
+                    self._stop_event.is_set() or self.storage.cancel_requested(job_id)
+                ),
             )
             current = self.storage.get_job(job_id)
-            if current and current["collected_count"] >= request.max_tweets:
+            if current and current["collected_count"] >= request.max_posts:
                 summary.completion_reason = "target_reached"
                 summary.partial = False
-            elif summary.completion_reason == "target_reached":
-                summary.completion_reason = "target_not_reached"
-                summary.partial = True
-                summary.warnings.append(
-                    "Provider stopped before the requested number of unique posts was stored."
-                )
             self.storage.finish_job(
                 job_id,
                 list(dict.fromkeys([*job["warnings"], *summary.warnings])),
                 completion_reason=summary.completion_reason,
                 partial=summary.partial,
             )
+        except RateLimitWaiting as exc:
+            self.storage.wait_job(job_id, exc.retry_at, exc.remaining, exc.reset, str(exc))
         except CollectionCancelled as exc:
-            if self._stop_event.is_set() and not self.storage.cancel_requested(job_id):
-                self.storage.fail_job(
-                    job_id,
-                    JobStatus.INTERRUPTED,
-                    "interrupted",
-                    "Worker stopped; resume the job to continue.",
-                    True,
-                )
-            else:
-                self.storage.fail_job(
-                    job_id, JobStatus.CANCELLED, exc.code, str(exc), exc.retryable
-                )
-        except ScraperError as exc:
+            status = (
+                JobStatus.INTERRUPTED
+                if self._stop_event.is_set() and not self.storage.cancel_requested(job_id)
+                else JobStatus.CANCELLED
+            )
+            self.storage.fail_job(job_id, status, status.value, str(exc), True)
+        except CollectionError as exc:
             self.storage.fail_job(job_id, JobStatus.FAILED, exc.code, str(exc), exc.retryable)
         except Exception as exc:
             logger.exception("Unexpected collection failure for job %s", job_id)
-            if self._stop_event.is_set() and not self.storage.cancel_requested(job_id):
-                self.storage.fail_job(
-                    job_id,
-                    JobStatus.INTERRUPTED,
-                    "interrupted",
-                    "Worker stopped unexpectedly; resume the job to continue.",
-                    True,
-                )
-            elif self.storage.cancel_requested(job_id):
-                self.storage.fail_job(
-                    job_id, JobStatus.CANCELLED, "cancelled", "Collection cancelled.", True
-                )
-            else:
-                self.storage.fail_job(
-                    job_id, JobStatus.FAILED, "unexpected_error", str(exc), True
-                )
+            self.storage.fail_job(job_id, JobStatus.FAILED, "unexpected_error", str(exc), True)
 
     def _worker(self) -> None:
-        while True:
-            job_id = self._queue.get()
+        while not self._stop_event.is_set():
+            try:
+                job_id = self._queue.get(timeout=1)
+            except queue.Empty:
+                for due_id in self.storage.requeue_due_jobs():
+                    self.enqueue(due_id)
+                continue
             if job_id is None:
                 self._queue.task_done()
                 return

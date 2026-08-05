@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 
-class ScraperError(Exception):
-    code = "scraper_error"
+class CollectionError(Exception):
+    code = "provider_error"
     retryable = False
 
     def __init__(self, message: str, *, retryable: bool | None = None):
@@ -11,42 +11,42 @@ class ScraperError(Exception):
             self.retryable = retryable
 
 
-class InvalidRequestError(ScraperError):
+class InvalidRequestError(CollectionError):
     code = "invalid_request"
 
 
-class SessionMissingError(ScraperError):
-    code = "session_missing"
+class CredentialError(CollectionError):
+    code = "credential_or_access_failure"
 
 
-class SessionExpiredError(ScraperError):
-    code = "session_expired"
+class BillingError(CollectionError):
+    code = "billing_failure"
 
 
-class ProfileUnavailableError(ScraperError):
-    code = "profile_unavailable"
-
-
-class RateLimitedError(ScraperError):
+class RateLimitWaiting(CollectionError):
     code = "rate_limited"
     retryable = True
 
+    def __init__(self, message: str, retry_at: str, remaining: int | None, reset: int | None):
+        super().__init__(message)
+        self.retry_at = retry_at
+        self.remaining = remaining
+        self.reset = reset
 
-class CollectionTimeoutError(ScraperError):
-    code = "collection_timeout"
+
+class NetworkError(CollectionError):
+    code = "network_failure"
     retryable = True
 
 
-class SchemaDriftError(ScraperError):
-    code = "schema_drift"
-    retryable = True
+class SchemaDriftError(CollectionError):
+    code = "schema_mismatch"
 
 
-class ResumeIncompatibleError(ScraperError):
+class ResumeIncompatibleError(CollectionError):
     code = "resume_incompatible"
-    retryable = False
 
 
-class CollectionCancelled(ScraperError):
+class CollectionCancelled(CollectionError):
     code = "cancelled"
     retryable = True

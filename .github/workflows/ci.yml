@@ -24,4 +24,4 @@ jobs:
       - run: pip install -e . --no-deps
       - run: ruff check .
       - run: pytest
-      - run: node --check app.js
+      - run: node --check xscraper/static/app.js

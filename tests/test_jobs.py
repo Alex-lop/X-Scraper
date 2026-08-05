@@ -1,69 +1,54 @@
-import pytest
+from datetime import UTC, datetime, timedelta
 
+from xscraper.errors import RateLimitWaiting, SchemaDriftError
 from xscraper.jobs import JobService
-from xscraper.models import CollectionRequest, CollectionSummary, JobStatus, Tweet
+from xscraper.models import CollectionRequest, CollectionSummary, Post
 from xscraper.storage import Storage
+from xscraper.x_api import compile_request
 
 
-def make_tweet():
-    return Tweet(
-        tweet_id="1",
-        text="same post",
-        author_username="tester",
-        url="https://x.com/tester/status/1",
-        created_at="2026-06-02T14:29:55+00:00",
-    )
+class Provider:
+    mode = "ok"
 
-
-class DuplicateResumeProvider:
-    def session_status(self):
-        return {"status": "valid", "valid": True, "message": "ready"}
-
-    def collect(self, request, *, cursor, cursor_context, on_batch, should_cancel):
-        accepted = on_batch(
-            [make_tweet()],
+    def collect(
+        self, request, *, compiled_request, cursor, collected_count, on_batch, should_cancel
+    ):
+        if self.mode == "wait":
+            raise RateLimitWaiting(
+                "later", (datetime.now(UTC) + timedelta(minutes=1)).isoformat(), 0, 123
+            )
+        on_batch(
+            [Post("1", "hello", "tester", "https://x.com/tester/status/1", None)],
             "next",
-            {
-                "provider": "fake",
-                "version": 1,
-                "operation": "fake",
-                "requestFingerprint": "fake",
-                "sort": "live",
-            },
-            1,
+            {"billableReads": 1},
         )
-        assert accepted == 0
-        return CollectionSummary(completion_reason="target_reached")
+        if self.mode == "schema":
+            raise SchemaDriftError("changed")
+        return CollectionSummary(completion_reason="recent_search_exhausted")
 
 
-def test_resume_does_not_report_target_reached_for_duplicate_rows(tmp_path):
+def setup(tmp_path, mode):
     storage = Storage(tmp_path / "test.db")
     storage.initialize()
     request = CollectionRequest.from_dict(
-        {"sourceType": "search", "sourceValue": "python", "maxTweets": 2}
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
     )
-    job_id = storage.create_job(request)
-    storage.add_tweets(job_id, [make_tweet()], "saved")
-    storage.fail_job(job_id, JobStatus.FAILED, "temporary", "retry", True)
-    assert storage.resume_job(job_id)
+    context = compile_request(request, "token")
+    job_id = storage.create_job(request, context)
+    provider = Provider()
+    provider.mode = mode
+    JobService(storage, provider, start_worker=False).run_once(job_id)
+    return storage, job_id
 
-    service = JobService(storage, DuplicateResumeProvider(), start_worker=False)
-    service.run_once(job_id)
 
+def test_rate_limit_enters_waiting_without_losing_job(tmp_path):
+    storage, job_id = setup(tmp_path, "wait")
     job = storage.get_job(job_id)
-    assert job["status"] == JobStatus.PARTIAL.value
-    assert job["completion_reason"] == "target_not_reached"
-    assert job["collected_count"] == 1
-    assert job["target_count"] == 2
+    assert job["status"] == "waiting" and job["retry_at"]
 
 
-def test_only_one_worker_process_lock_can_use_a_database(tmp_path):
-    storage = Storage(tmp_path / "test.db")
-    storage.initialize()
-    first = JobService(storage, DuplicateResumeProvider())
-    try:
-        with pytest.raises(RuntimeError, match="one server process"):
-            JobService(storage, DuplicateResumeProvider())
-    finally:
-        first.shutdown()
-    assert not (tmp_path / "test.db.worker.lock").exists()
+def test_schema_failure_preserves_completed_page(tmp_path):
+    storage, job_id = setup(tmp_path, "schema")
+    job = storage.get_job(job_id)
+    assert job["status"] == "failed" and job["collected_count"] == 1
+    assert storage.get_job_posts(job_id)[0]["text"] == "hello"

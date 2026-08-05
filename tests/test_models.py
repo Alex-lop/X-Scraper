@@ -1,70 +1,62 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from xscraper.errors import InvalidRequestError
 from xscraper.models import CollectionRequest
+from xscraper.x_api import compile_request, maximum_billable_reads
 
 
-def test_profile_request_normalizes_url():
+def test_request_normalization_and_official_query_compilation():
     request = CollectionRequest.from_dict(
-        {"sourceType": "profile", "sourceValue": "https://x.com/OpenAI/status/1", "maxTweets": 50}
-    )
-    assert request.source_value == "OpenAI"
-    assert request.max_tweets == 50
-
-
-@pytest.mark.parametrize("value", [0, 501, "not-a-number"])
-def test_rejects_invalid_maximum(value):
-    with pytest.raises(InvalidRequestError):
-        CollectionRequest.from_dict(
-            {"sourceType": "search", "sourceValue": "python", "maxTweets": value}
-        )
-
-
-def test_rejects_reversed_dates():
-    with pytest.raises(InvalidRequestError):
-        CollectionRequest.from_dict(
-            {
-                "sourceType": "search",
-                "sourceValue": "python",
-                "startDate": "2026-05-02",
-                "endDate": "2026-05-01",
-            }
-        )
-
-
-@pytest.mark.parametrize("value", ["false", "true", 0, 1, None])
-def test_rejects_non_boolean_filter_values(value):
-    with pytest.raises(InvalidRequestError):
-        CollectionRequest.from_dict(
-            {"sourceType": "search", "sourceValue": "python", "mediaOnly": value}
-        )
-
-
-def test_rejects_non_object_request():
-    with pytest.raises(InvalidRequestError):
-        CollectionRequest.from_dict(["not", "an", "object"])
-
-
-def test_cursor_fingerprint_ignores_limit_and_sentiment():
-    first = CollectionRequest.from_dict(
-        {"sourceType": "profile", "sourceValue": "OpenAI", "maxTweets": 10}
-    )
-    second = CollectionRequest.from_dict(
         {
             "sourceType": "profile",
-            "sourceValue": "openai",
-            "maxTweets": 50,
-            "analyzeSentiment": True,
+            "sourceValue": "https://x.com/OpenAI/status/1",
+            "maxPosts": 105,
+            "mediaOnly": True,
         }
     )
-    assert first.fingerprint() != second.fingerprint()
-    assert first.fingerprint(include_limit=False, include_sentiment=False) == second.fingerprint(
-        include_limit=False, include_sentiment=False
-    )
+    compiled = compile_request(request, "token", now=datetime(2026, 8, 3, 16, 7, tzinfo=UTC))
+    assert request.source_value == "OpenAI"
+    assert compiled["query"] == "from:OpenAI -is:reply has:media"
+    assert compiled["maxBillableReads"] == 110
+    assert compiled["estimatedPostReadUsd"] == 0.55
 
 
-def test_search_expression_only_trims_edges_and_normalizes_unicode():
+def test_search_is_only_trimmed_and_nfc_normalized():
     request = CollectionRequest.from_dict(
-        {"sourceType": "search", "sourceValue": "  cafe\u0301   OR  Tea  "}
+        {"sourceType": "search", "sourceValue": "  cafe\u0301   OR  Tea  ", "maxPosts": 10}
     )
     assert request.source_value == "café   OR  Tea"
+    assert (
+        compile_request(request, "token", now=datetime(2026, 8, 3, 16, 7, tzinfo=UTC))["query"]
+        == "café   OR  Tea -is:reply"
+    )
+
+
+@pytest.mark.parametrize("value", [9, 501, "10", True])
+def test_max_posts_is_10_to_500(value):
+    with pytest.raises(InvalidRequestError):
+        CollectionRequest.from_dict(
+            {"sourceType": "search", "sourceValue": "python", "maxPosts": value}
+        )
+
+
+def test_recent_window_and_overfetch_math():
+    request = CollectionRequest.from_dict(
+        {
+            "sourceType": "search",
+            "sourceValue": "python",
+            "maxPosts": 10,
+            "startDate": "2026-07-01",
+        }
+    )
+    with pytest.raises(InvalidRequestError, match="seven-day"):
+        compile_request(request, "token", now=datetime(2026, 8, 3, 16, tzinfo=UTC))
+    assert [maximum_billable_reads(value) for value in (10, 100, 101, 109, 110)] == [
+        10,
+        100,
+        110,
+        110,
+        110,
+    ]
