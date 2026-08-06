@@ -13,5 +13,14 @@ var/
 *.db
 *.db-shm
 *.db-wal
+*.db.pre-v*-to-v*.bak
 exports/
 .env
+playwright-report/
+test-results/
+playwright/.auth/
+**/storage_state*.json
+**/playwright_state*.json
+*.auth-status
+browser-artifacts/
+*.trace.zip

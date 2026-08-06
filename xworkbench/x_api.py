@@ -21,9 +21,17 @@ from .errors import (
     ResumeIncompatibleError,
     SchemaDriftError,
 )
-from .models import CollectionRequest, CollectionSummary, Post, SearchMode, SourceType
+from .models import (
+    CollectionRequest,
+    CollectionSummary,
+    Post,
+    ProviderType,
+    SearchMode,
+    SourceType,
+)
 
-PROVIDER_ID = "x_api_search"
+PROVIDER_ID = ProviderType.OFFICIAL_X_API.value
+LEGACY_PROVIDER_ID = "x_api_search"
 PROVIDER_VERSION = 2
 COMPILER_VERSION = 2
 RECENT_ENDPOINT = "https://api.x.com/2/tweets/search/recent"
@@ -103,6 +111,12 @@ def compile_request(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    if (
+        request.provider is not ProviderType.OFFICIAL_X_API
+        or request.source_type not in {SourceType.PROFILE, SourceType.SEARCH}
+        or request.search_mode is None
+    ):
+        raise InvalidRequestError("official_x_api supports only profile or search requests.")
     now = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
     latest_end = now - END_TIME_SAFETY
     if request.search_mode is SearchMode.FULL_ARCHIVE:
@@ -212,6 +226,11 @@ def validate_compiled_request(
         expected = compile_request(request, now=compiled_at)
     except (TypeError, ValueError) as exc:
         raise InvalidRequestError("Collection preview is invalid.") from exc
+    plan_provider = compiled.get("provider")
+    if plan_provider == LEGACY_PROVIDER_ID:
+        expected["provider"] = LEGACY_PROVIDER_ID
+    elif plan_provider is None:
+        expected.pop("provider")
     if compiled != expected:
         raise InvalidRequestError("Collection preview does not match this request.")
 
@@ -385,10 +404,44 @@ def _header_int(headers: Any, name: str) -> int | None:
 
 
 class XApiProvider:
+    provider_id = ProviderType.OFFICIAL_X_API
+    provider_version = PROVIDER_VERSION
+
     def __init__(self, settings: Settings, *, opener=urlopen, sleeper=time.sleep):
         self.settings = settings
         self._opener = opener
         self._sleep = sleeper
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider_id.value,
+            "providerVersion": self.provider_version,
+            "sources": [SourceType.PROFILE.value, SourceType.SEARCH.value],
+            "limits": {"minimum": 10, "default": 25, "maximum": 500},
+            "searchModes": [SearchMode.RECENT.value, SearchMode.FULL_ARCHIVE.value],
+            "paidReads": True,
+            "confirmation": {"field": "confirmPaidRead", "kind": "paid_read"},
+        }
+
+    def connection_status(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider_id.value,
+            "providerVersion": self.provider_version,
+            **self.settings.connection_status(),
+        }
+
+    def prepare(
+        self,
+        request: CollectionRequest,
+        supplied_plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        token = self.settings.bearer_token()
+        if not token:
+            raise CredentialError("No X API Bearer Token. Run: xworkbench configure")
+        if supplied_plan is None:
+            return compile_request(request, token)
+        validate_compiled_request(request, supplied_plan, token)
+        return supplied_plan
 
     def _request(
         self, params: dict[str, str], *, endpoint: str = RECENT_ENDPOINT
@@ -458,10 +511,8 @@ class XApiProvider:
         self,
         request: CollectionRequest,
         *,
-        compiled_request: dict[str, Any],
-        cursor: str | None,
-        collected_count: int,
-        returned_post_count: int = 0,
+        execution_plan: dict[str, Any],
+        checkpoint: dict[str, Any],
         on_batch,
         should_cancel,
     ) -> CollectionSummary:
@@ -469,11 +520,21 @@ class XApiProvider:
         if not token:
             raise CredentialError("No X API Bearer Token. Run: xworkbench configure")
         try:
-            validate_compiled_request(request, compiled_request, token, require_fresh=False)
+            validate_compiled_request(request, execution_plan, token, require_fresh=False)
         except InvalidRequestError as exc:
             raise ResumeIncompatibleError(str(exc)) from exc
+        try:
+            collected_count = int(checkpoint["storedCount"])
+            current_token = checkpoint.get("providerState")
+            metadata = checkpoint.get("metadata") or {}
+            resources_returned = metadata.get("resourcesReturned") or {}
+            returned_post_count = int(resources_returned.get("posts") or 0)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ResumeIncompatibleError("Saved official X API checkpoint is invalid.") from exc
+        if current_token is not None and not isinstance(current_token, str):
+            raise ResumeIncompatibleError("Saved official X API checkpoint is invalid.")
         stored_remaining = request.max_posts - collected_count
-        resource_remaining = int(compiled_request["maximumPostResources"]) - returned_post_count
+        resource_remaining = int(execution_plan["maximumPostResources"]) - returned_post_count
         if stored_remaining <= 0:
             return CollectionSummary(completion_reason="target_reached")
         if resource_remaining <= 0:
@@ -482,8 +543,7 @@ class XApiProvider:
                 completion_reason="post_resource_limit_reached",
                 partial=True,
             )
-        current_token = cursor
-        seen_tokens = {cursor} if cursor else set()
+        seen_tokens = {current_token} if current_token else set()
         warnings: list[str] = []
         exhausted_reason = (
             "recent_search_exhausted"
@@ -503,20 +563,20 @@ class XApiProvider:
                     partial=True,
                 )
             params = {
-                "query": compiled_request["query"],
-                "start_time": compiled_request["startTime"],
-                "end_time": compiled_request["endTime"],
-                "sort_order": compiled_request["sortOrder"],
+                "query": execution_plan["query"],
+                "start_time": execution_plan["startTime"],
+                "end_time": execution_plan["endTime"],
+                "sort_order": execution_plan["sortOrder"],
                 "max_results": str(page_size),
-                "tweet.fields": compiled_request["tweetFields"],
-                "expansions": compiled_request["expansions"],
-                "media.fields": compiled_request["mediaFields"],
+                "tweet.fields": execution_plan["tweetFields"],
+                "expansions": execution_plan["expansions"],
+                "media.fields": execution_plan["mediaFields"],
             }
-            if compiled_request["userFields"]:
-                params["user.fields"] = compiled_request["userFields"]
+            if execution_plan["userFields"]:
+                params["user.fields"] = execution_plan["userFields"]
             if current_token:
                 params["next_token"] = current_token
-            payload, rate = self._request(params, endpoint=compiled_request["endpoint"])
+            payload, rate = self._request(params, endpoint=execution_plan["endpoint"])
             posts, next_token, page_warnings, resources = map_response(
                 payload,
                 fallback_username=(

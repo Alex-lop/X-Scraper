@@ -1,0 +1,38 @@
+<section id="synthetic-home-feed">
+  <article data-testid="tweet">
+    <div data-testid="quoteTweet">
+      <a href="https://x.com/quoted/status/999">
+        <time datetime="2026-08-05T11:59:00Z">11:59 AM</time>
+      </a>
+      <div data-testid="tweetText">Nested quote text</div>
+    </div>
+    <div data-testid="User-Name"><span>Alice</span><span>@alice</span></div>
+    <div class="outer-metadata">
+      <a href="https://x.com/alice/status/111">
+        <time datetime="2026-08-05T12:00:00Z">12:00 PM</time>
+      </a>
+    </div>
+    <div data-testid="tweetText">  exact visible text
+with spacing  </div>
+    <button data-testid="reply" aria-label="2 Replies" />
+    <button data-testid="retweet" aria-label="3 reposts" />
+    <button data-testid="like" aria-label="1,234 Likes" />
+    <button data-testid="bookmark" aria-label="1K Bookmarks" />
+    <div data-testid="tweetPhoto">
+      <img src="https://images.invalid/photo.jpg" alt="Synthetic landscape" />
+    </div>
+  </article>
+  <article data-testid="tweet">
+    <a href="https://x.com/i/web/status/222">Open post</a>
+  </article>
+  <article data-testid="tweet">
+    <a href="https://example.invalid/not-x/status/333">Not an X post</a>
+  </article>
+  <article data-testid="tweet">
+    <div data-testid="quoteTweet">
+      <a href="https://x.com/quoted/status/444">
+        <time datetime="2026-08-05T11:58:00Z">11:58 AM</time>
+      </a>
+    </div>
+  </article>
+</section>

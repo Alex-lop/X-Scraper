@@ -5,9 +5,15 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from xworkbench.config import Settings
-from xworkbench.errors import SchemaDriftError
-from xworkbench.models import CollectionRequest
-from xworkbench.x_api import ARCHIVE_ENDPOINT, XApiProvider, compile_request, map_response
+from xworkbench.errors import InvalidRequestError, SchemaDriftError
+from xworkbench.models import CollectionRequest, ProviderType
+from xworkbench.x_api import (
+    ARCHIVE_ENDPOINT,
+    XApiProvider,
+    compile_request,
+    map_response,
+    validate_compiled_request,
+)
 
 
 def payload(*, next_token="next"):
@@ -49,6 +55,16 @@ def settings(tmp_path):
     token.parent.mkdir()
     token.write_text("secret")
     return Settings(tmp_path / "db.sqlite", token)
+
+
+def checkpoint(*, state=None, stored=0, posts=0):
+    return {
+        "providerState": state,
+        "storedCount": stored,
+        "metadata": {
+            "resourcesReturned": {"posts": posts, "users": 0, "media": 0}
+        },
+    }
 
 
 class Response:
@@ -153,9 +169,8 @@ def test_profile_collection_uses_fallback_and_reports_page_resources(tmp_path):
     stored = []
     summary = XApiProvider(settings(tmp_path), opener=opener).collect(
         collection,
-        compiled_request=compile_request(collection, now=datetime.now(UTC)),
-        cursor=None,
-        collected_count=0,
+        execution_plan=compile_request(collection, now=datetime.now(UTC)),
+        checkpoint=checkpoint(),
         on_batch=lambda batch, cursor, stats: (
             stored.extend(batch) or page_stats.append(stats) or len(batch)
         ),
@@ -190,9 +205,8 @@ def test_full_archive_uses_archive_endpoint_and_single_large_page(tmp_path):
     )
     XApiProvider(settings(tmp_path), opener=opener).collect(
         collection,
-        compiled_request=compile_request(collection),
-        cursor=None,
-        collected_count=0,
+        execution_plan=compile_request(collection),
+        checkpoint=checkpoint(),
         on_batch=lambda batch, *_args: len(batch),
         should_cancel=lambda: False,
     )
@@ -200,3 +214,49 @@ def test_full_archive_uses_archive_endpoint_and_single_large_page(tmp_path):
     parsed = urlsplit(requested[0])
     assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == ARCHIVE_ENDPOINT
     assert parse_qs(parsed.query)["max_results"] == ["105"]
+
+
+def test_official_provider_contract_prepares_exact_plans_and_accepts_legacy_alias(tmp_path):
+    provider = XApiProvider(settings(tmp_path))
+    collection = CollectionRequest.from_dict(
+        {"sourceType": "search", "sourceValue": "python", "maxPosts": 10}
+    )
+
+    plan = provider.prepare(collection)
+
+    assert provider.provider_id is ProviderType.OFFICIAL_X_API
+    assert plan["provider"] == "official_x_api"
+    assert provider.prepare(collection, plan) is plan
+    assert provider.capabilities()["confirmation"] == {
+        "field": "confirmPaidRead",
+        "kind": "paid_read",
+    }
+    legacy = {**plan, "provider": "x_api_search"}
+    validate_compiled_request(collection, legacy)
+    assert provider.prepare(collection, legacy) is legacy
+    with pytest.raises(InvalidRequestError, match="does not match"):
+        provider.prepare(collection, {**plan, "query": "tampered"})
+
+
+def test_official_resume_honors_persisted_resource_ceiling_without_a_request(tmp_path):
+    requested = []
+
+    def opener(request, timeout):
+        requested.append(request.full_url)
+        return Response(payload(next_token=None))
+
+    collection = CollectionRequest.from_dict(
+        {"sourceType": "search", "sourceValue": "python", "maxPosts": 10}
+    )
+    plan = compile_request(collection)
+    summary = XApiProvider(settings(tmp_path), opener=opener).collect(
+        collection,
+        execution_plan=plan,
+        checkpoint=checkpoint(posts=plan["maximumPostResources"]),
+        on_batch=lambda *_args: 0,
+        should_cancel=lambda: False,
+    )
+
+    assert requested == []
+    assert summary.partial is True
+    assert summary.completion_reason == "post_resource_limit_reached"

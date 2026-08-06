@@ -7,10 +7,10 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .models import CollectionRequest, JobStatus, Post, utc_now
+from .models import CollectionRequest, JobStatus, Post, ProviderType, utc_now
 
 SCHEMA_FAMILY = "x_collection_workbench"
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 SCHEMA_TABLES = {"schema_meta", "jobs", "post_observations"}
 SCHEMA_COLUMNS = {
     "schema_meta": {"key", "value"},
@@ -94,10 +94,18 @@ class Storage:
                     if tables != SCHEMA_TABLES:
                         raise RuntimeError(self._incompatible_message())
                     metadata = dict(connection.execute("SELECT key, value FROM schema_meta"))
-                    if metadata != {
-                        "schema_family": SCHEMA_FAMILY,
-                        "schema_version": SCHEMA_VERSION,
-                    } or not self._schema_is_compatible(connection):
+                    if metadata.get("schema_family") != SCHEMA_FAMILY or set(metadata) != {
+                        "schema_family",
+                        "schema_version",
+                    }:
+                        raise RuntimeError(self._incompatible_message())
+                    version = metadata["schema_version"]
+                    if version == "1" and self._schema_is_compatible(connection, version=1):
+                        self._backup_before_migration(connection)
+                        self._migrate_v1_to_v2(connection)
+                    elif version != SCHEMA_VERSION or not self._schema_is_compatible(
+                        connection, version=2
+                    ):
                         raise RuntimeError(self._incompatible_message())
                 else:
                     self._create_schema(connection)
@@ -114,7 +122,7 @@ class Storage:
         )
 
     @staticmethod
-    def _schema_is_compatible(connection: sqlite3.Connection) -> bool:
+    def _schema_is_compatible(connection: sqlite3.Connection, *, version: int = 2) -> bool:
         details = {}
         for table, expected in SCHEMA_COLUMNS.items():
             rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -131,6 +139,16 @@ class Storage:
         }
         if any(observations[name]["notnull"] for name in metrics):
             return False
+        newly_nullable = {
+            "text",
+            "is_reply",
+            "is_repost",
+            "is_quote",
+            "has_media",
+            "media_json",
+        }
+        if any(bool(observations[name]["notnull"]) == (version == 2) for name in newly_nullable):
+            return False
         foreign_keys = connection.execute("PRAGMA foreign_key_list(post_observations)").fetchall()
         return any(
             row["table"] == "jobs"
@@ -139,6 +157,73 @@ class Storage:
             and row["on_delete"].upper() == "CASCADE"
             for row in foreign_keys
         )
+
+    def _backup_before_migration(self, connection: sqlite3.Connection) -> None:
+        backup_path = self.path.with_name(f"{self.path.name}.pre-v1-to-v2.bak")
+        if not backup_path.exists():
+            with sqlite3.connect(backup_path) as backup:
+                connection.backup(backup)
+        try:
+            backup_path.chmod(0o600)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _create_observations(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE post_observations (
+                job_id                TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                post_id               TEXT NOT NULL,
+                position              INTEGER NOT NULL,
+                text                  TEXT,
+                author_id             TEXT,
+                author_username       TEXT,
+                url                   TEXT NOT NULL,
+                created_at            TEXT,
+                observed_at           TEXT NOT NULL,
+                language              TEXT,
+                conversation_id       TEXT,
+                in_reply_to_post_id   TEXT,
+                like_count            INTEGER,
+                reply_count           INTEGER,
+                repost_count          INTEGER,
+                quote_count           INTEGER,
+                bookmark_count        INTEGER,
+                is_reply              INTEGER,
+                is_repost             INTEGER,
+                is_quote              INTEGER,
+                has_media             INTEGER,
+                media_json            TEXT,
+                PRIMARY KEY (job_id, post_id),
+                UNIQUE (job_id, position)
+            )
+            """
+        )
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        columns = ", ".join(SCHEMA_COLUMNS["post_observations"])
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ALTER TABLE post_observations RENAME TO post_observations_v1")
+            self._create_observations(connection)
+            connection.execute(
+                f"INSERT INTO post_observations ({columns}) "
+                f"SELECT {columns} FROM post_observations_v1"
+            )
+            connection.execute("DROP TABLE post_observations_v1")
+            connection.execute(
+                "CREATE INDEX idx_observations_position "
+                "ON post_observations(job_id, position)"
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                (SCHEMA_VERSION,),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
@@ -150,7 +235,7 @@ class Storage:
             );
             INSERT INTO schema_meta(key, value) VALUES
                 ('schema_family', 'x_collection_workbench'),
-                ('schema_version', '1');
+                ('schema_version', '2');
 
             CREATE TABLE jobs (
                 id                    TEXT PRIMARY KEY,
@@ -177,39 +262,15 @@ class Storage:
                 updated_at            TEXT NOT NULL
             );
 
-            CREATE TABLE post_observations (
-                job_id                TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-                post_id               TEXT NOT NULL,
-                position              INTEGER NOT NULL,
-                text                  TEXT NOT NULL,
-                author_id             TEXT,
-                author_username       TEXT,
-                url                   TEXT NOT NULL,
-                created_at            TEXT,
-                observed_at           TEXT NOT NULL,
-                language              TEXT,
-                conversation_id       TEXT,
-                in_reply_to_post_id   TEXT,
-                like_count            INTEGER,
-                reply_count           INTEGER,
-                repost_count          INTEGER,
-                quote_count           INTEGER,
-                bookmark_count        INTEGER,
-                is_reply              INTEGER NOT NULL DEFAULT 0,
-                is_repost             INTEGER NOT NULL DEFAULT 0,
-                is_quote              INTEGER NOT NULL DEFAULT 0,
-                has_media             INTEGER NOT NULL DEFAULT 0,
-                media_json            TEXT NOT NULL DEFAULT '[]',
-                PRIMARY KEY (job_id, post_id),
-                UNIQUE (job_id, position)
-            );
-
             CREATE INDEX idx_jobs_status_retry ON jobs(status, retry_at);
-            CREATE INDEX idx_observations_position ON post_observations(job_id, position);
             """
         )
+        Storage._create_observations(connection)
+        connection.execute(
+            "CREATE INDEX idx_observations_position ON post_observations(job_id, position)"
+        )
 
-    def create_job(self, request: CollectionRequest, compiled_request: dict[str, Any]) -> str:
+    def create_job(self, request: CollectionRequest, execution_plan: dict[str, Any]) -> str:
         job_id = uuid.uuid4().hex
         now = utc_now()
         with self.connect() as connection:
@@ -222,7 +283,7 @@ class Storage:
                 (
                     job_id,
                     json.dumps(request.to_dict(), separators=(",", ":")),
-                    json.dumps(compiled_request, separators=(",", ":")),
+                    json.dumps(execution_plan, separators=(",", ":")),
                     JobStatus.QUEUED.value,
                     now,
                     now,
@@ -231,10 +292,71 @@ class Storage:
         return job_id
 
     @staticmethod
-    def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _decode_provider_state(value: str | None) -> tuple[Any, dict[str, Any]]:
+        if value is None:
+            return None, {}
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value, {}
+        if isinstance(decoded, dict) and decoded.get("checkpointVersion") == 1:
+            metadata = decoded.get("metadata")
+            return decoded.get("providerState"), metadata if isinstance(metadata, dict) else {}
+        return value, {}
+
+    @staticmethod
+    def _encode_provider_state(
+        provider_state: Any, metadata: dict[str, Any]
+    ) -> str | None:
+        if provider_state is None and not metadata:
+            return None
+        return json.dumps(
+            {
+                "checkpointVersion": 1,
+                "providerState": provider_state,
+                "metadata": metadata,
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _job_dict(cls, row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
-        item["request"] = json.loads(item.pop("request_json"))
-        item["compiled_request"] = json.loads(item.pop("compiled_request_json"))
+        request = json.loads(item.pop("request_json"))
+        execution_plan = json.loads(item.pop("compiled_request_json"))
+        raw_provider = request.get("provider", ProviderType.OFFICIAL_X_API.value)
+        if raw_provider == "x_api_search":
+            raw_provider = ProviderType.OFFICIAL_X_API.value
+        try:
+            provider = ProviderType(str(raw_provider))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Job {item['id']} has an unknown collection provider: {raw_provider}."
+            ) from exc
+        request["provider"] = provider.value
+        provider_state, checkpoint_metadata = cls._decode_provider_state(item["cursor"])
+        if provider is ProviderType.OFFICIAL_X_API:
+            checkpoint_metadata = {
+                **checkpoint_metadata,
+                "resourcesReturned": {
+                    "posts": int(item["post_resource_count"]),
+                    "users": int(item["user_resource_count"]),
+                    "media": int(item["media_resource_count"]),
+                },
+                "rateLimitRemaining": item["rate_limit_remaining"],
+                "rateLimitReset": item["rate_limit_reset"],
+            }
+        item["request"] = request
+        item["provider"] = provider.value
+        item["execution_plan"] = execution_plan
+        item["compiled_request"] = execution_plan
+        item["provider_state"] = provider_state
+        item["cursor"] = provider_state
+        item["checkpoint"] = {
+            "providerState": provider_state,
+            "storedCount": int(item["collected_count"]),
+            "metadata": checkpoint_metadata,
+        }
         item["warnings"] = json.loads(item.pop("warnings_json"))
         item["error_retryable"] = bool(item["error_retryable"])
         item["cancel_requested"] = bool(item["cancel_requested"])
@@ -277,12 +399,12 @@ class Storage:
         self,
         job_id: str,
         posts: Iterable[Post],
-        cursor: str | None,
-        page_stats: dict[str, Any],
+        provider_state: Any,
+        metadata: dict[str, Any],
     ) -> int:
         with self.connect() as connection:
             current = connection.execute(
-                "SELECT collected_count, warnings_json FROM jobs WHERE id = ?", (job_id,)
+                "SELECT collected_count, warnings_json, cursor FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             if current is None:
                 return 0
@@ -293,7 +415,7 @@ class Storage:
                         *json.loads(current["warnings_json"]),
                         *(
                             str(item)
-                            for item in page_stats.get("warnings", [])
+                            for item in metadata.get("warnings", [])
                             if isinstance(item, str)
                         ),
                     ]
@@ -329,17 +451,36 @@ class Storage:
                         post.repost_count,
                         post.quote_count,
                         post.bookmark_count,
-                        int(post.is_reply),
-                        int(post.is_repost),
-                        int(post.is_quote),
-                        int(post.has_media),
-                        json.dumps(post.media, separators=(",", ":")),
+                        None if post.is_reply is None else int(post.is_reply),
+                        None if post.is_repost is None else int(post.is_repost),
+                        None if post.is_quote is None else int(post.is_quote),
+                        None if post.has_media is None else int(post.has_media),
+                        (
+                            json.dumps(post.media, separators=(",", ":"))
+                            if post.media is not None
+                            else None
+                        ),
                     ),
                 ).rowcount
                 if inserted:
                     position += 1
                     added += 1
-            resources = page_stats.get("resourcesReturned") or {}
+            resources = metadata.get("resourcesReturned") or {}
+            _, persisted_metadata = self._decode_provider_state(current["cursor"])
+            provider_metadata = {
+                **persisted_metadata,
+                **{
+                    key: value
+                    for key, value in metadata.items()
+                    if key
+                    not in {
+                        "warnings",
+                        "resourcesReturned",
+                        "rateLimitRemaining",
+                        "rateLimitReset",
+                    }
+                },
+            }
             connection.execute(
                 """
                 UPDATE jobs SET collected_count = ?, cursor = ?,
@@ -352,13 +493,13 @@ class Storage:
                 """,
                 (
                     position,
-                    cursor,
+                    self._encode_provider_state(provider_state, provider_metadata),
                     int(resources.get("posts") or 0),
                     int(resources.get("users") or 0),
                     int(resources.get("media") or 0),
                     json.dumps(warnings),
-                    page_stats.get("rateLimitRemaining"),
-                    page_stats.get("rateLimitReset"),
+                    metadata.get("rateLimitRemaining"),
+                    metadata.get("rateLimitReset"),
                     utc_now(),
                     job_id,
                 ),
@@ -559,10 +700,12 @@ class Storage:
         for row in rows:
             item = dict(row)
             item.pop("job_id")
-            item.pop("position")
-            item["media"] = json.loads(item.pop("media_json"))
+            item["source_position"] = item.pop("position")
+            media = item.pop("media_json")
+            item["media"] = json.loads(media) if media is not None else None
             for name in ("is_reply", "is_repost", "is_quote", "has_media"):
-                item[name] = bool(item[name])
+                if item[name] is not None:
+                    item[name] = bool(item[name])
             result.append(item)
         return result
 

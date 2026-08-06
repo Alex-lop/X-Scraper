@@ -1,1 +1,1 @@
-"""Local official-X-API collection workbench."""
+"""Local feed-to-context snapshot bridge for X."""

@@ -24,6 +24,7 @@ let activeJob = null;
 let pollTimer = null;
 let allPosts = [];
 let offlineDemo = false;
+let providerConnections = {};
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
@@ -106,13 +107,31 @@ function setOfflineDemo() {
   $("#preview-button").disabled = true;
 }
 
+function selectedProvider() {
+  return new FormData(form).get("provider") || "playwright_browser";
+}
+
+function providerReady(provider) {
+  const connection = providerConnections[provider]?.connection || {};
+  return connection.ready === true || connection.valid === true || ["ready", "configured"].includes(connection.status);
+}
+
 function requestPayload() {
   const data = new FormData(form);
+  const provider = data.get("provider");
+  if (provider === "playwright_browser") {
+    return {
+      provider,
+      sourceType: "home",
+      maxPosts: Number($("#browser-max-posts").value),
+    };
+  }
   return {
+    provider,
     searchMode: data.get("searchMode"),
     sourceType: data.get("sourceType"),
     sourceValue: data.get("sourceValue"),
-    maxPosts: Number(data.get("maxPosts")),
+    maxPosts: Number($("#api-max-posts").value),
     startDate: data.get("startDate") || null,
     endDate: data.get("endDate") || null,
     includeReplies: data.has("includeReplies"),
@@ -121,7 +140,33 @@ function requestPayload() {
 }
 
 function updateRequestHelp() {
+  const provider = selectedProvider();
+  const browser = provider === "playwright_browser";
+  $("#browser-options").hidden = !browser;
+  $("#api-options").hidden = browser;
+  for (const control of $("#browser-options").querySelectorAll("input, select, textarea, button")) control.disabled = !browser;
+  for (const control of $("#api-options").querySelectorAll("input, select, textarea, button")) control.disabled = browser;
   const data = new FormData(form);
+  $("#source-value").required = !browser;
+  $("#setup-card").hidden = !browser || providerReady(provider);
+  $("#api-setup-card").hidden = browser || providerReady(provider);
+  $("#preview-button").textContent = browser ? "Review browser capture" : "Preview exact read and cost";
+  $("#preview-button").disabled = offlineDemo || !providerReady(provider);
+  if (!offlineDemo) {
+    const connection = providerConnections[provider]?.connection || {};
+    const ready = providerReady(provider);
+    $("#connection-card").classList.toggle("ready", ready);
+    $("#connection-status").textContent = browser
+      ? `Browser session: ${titleCase(connection.status || "unavailable")}`
+      : `Official X API: ${titleCase(connection.status || "unavailable")}`;
+    $("#connection-message").textContent = connection.message || (browser
+      ? "Run xworkbench auth to sign in manually."
+      : "Run xworkbench configure to add an optional token.");
+  }
+  if (browser) {
+    $("#scope-badge").textContent = "Browser · Home";
+    return;
+  }
   const archive = data.get("searchMode") === "fullArchive";
   const search = data.get("sourceType") === "search";
   $("#scope-badge").textContent = archive ? "Full archive · bounded" : "Recent · 7 days";
@@ -137,7 +182,7 @@ function updateRequestHelp() {
     const link = node("a", "X search operators");
     link.href = "https://docs.x.com/x-api/posts/search/integrate/build-a-query";
     link.target = "_blank";
-    link.rel = "noreferrer";
+    link.rel = "noopener noreferrer";
     help.replaceChildren("Use supported ", link, "; reply and media filters are appended automatically.");
   } else {
     help.replaceChildren("Profiles compile to an exact from: search.");
@@ -151,12 +196,13 @@ async function loadConnection() {
       setOfflineDemo();
       return;
     }
-    const configured = data.status === "configured" || data.configured === true;
-    $("#connection-card").classList.toggle("ready", configured);
-    $("#connection-status").textContent = configured ? "Official X API configured" : "Token configuration required";
-    $("#connection-message").textContent = data.message;
-    $("#setup-card").hidden = configured;
-    $("#preview-button").disabled = !configured;
+    providerConnections = data.providers || {};
+    const browser = providerConnections.playwright_browser?.connection || {};
+    const ready = providerReady("playwright_browser");
+    $("#connection-card").classList.toggle("ready", ready);
+    $("#connection-status").textContent = `Browser session: ${titleCase(browser.status || "unavailable")}`;
+    $("#connection-message").textContent = browser.message || "Run xworkbench auth to sign in manually.";
+    updateRequestHelp();
   } catch (error) {
     $("#connection-status").textContent = "Local application unavailable";
     $("#connection-message").textContent = error.message;
@@ -170,6 +216,24 @@ function expirePreview() {
 }
 
 function renderPreview() {
+  const browser = preview.provider === "playwright_browser";
+  $("#browser-preview").hidden = !browser;
+  $("#api-preview").hidden = browser;
+  $("#api-billing").hidden = browser;
+  $("#preview-eyebrow").textContent = browser ? "Human-approved capture" : "Five-minute preflight";
+  $("#preview-title").textContent = browser ? "Review browser capture" : "Review the exact paid read";
+  $("#preview-badge").textContent = browser ? "Local · bounded" : "Expires in 5 minutes";
+  $("#confirm-button").textContent = browser ? "Start browser capture" : "Confirm paid read";
+  if (browser) {
+    const intent = preview.captureIntent || preview.executionPlan;
+    $("#browser-preview-source").textContent = intent.sourceUrl || "https://x.com/home";
+    $("#browser-preview-target").textContent = `${count(intent.targetPosts)} visible Posts maximum`;
+    $("#browser-preview-session").textContent = titleCase(providerConnections.playwright_browser?.connection?.status || "unavailable");
+    $("#confirm-button").disabled = !providerReady("playwright_browser");
+    banner($("#confirm-error"), "");
+    clearTimeout(previewTimer);
+    return;
+  }
   const intent = preview.compiledIntent;
   const estimate = preview.costEstimate;
   const prices = estimate.unitPricesUsd;
@@ -236,10 +300,13 @@ $("#confirm-button").addEventListener("click", async () => {
   button.disabled = true;
   banner($("#confirm-error"), "");
   try {
+    const confirmation = preview.provider === "playwright_browser"
+      ? { confirmBrowserCapture: true }
+      : { confirmPaidRead: true };
     const data = await api("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...preview.request, compiledRequest: preview.compiledRequest, confirmPaidRead: true }),
+      body: JSON.stringify({ ...preview.request, executionPlan: preview.executionPlan, ...confirmation }),
     });
     clearTimeout(previewTimer);
     preview = null;
@@ -255,10 +322,12 @@ $("#confirm-button").addEventListener("click", async () => {
 
 function isSyntheticJob(job) {
   const provider = String(job.provenance?.provider || "").toLocaleLowerCase();
-  return job.synthetic === true || provider.includes("offline") || provider.includes("synthetic");
+  return job.synthetic === true || job.completionReason === "offline_demo_seeded"
+    || provider.includes("offline") || provider.includes("synthetic");
 }
 
 function jobLabel(job) {
+  if (job.provider === "playwright_browser") return `Home feed: ${job.id.slice(0, 8)}`;
   return `${job.request?.sourceType || "collection"}: ${job.request?.sourceValue || job.id}`;
 }
 
@@ -273,7 +342,7 @@ async function loadHistory({ openDemo = false } = {}) {
       button.type = "button";
       button.append(
         node("strong", jobLabel(job)),
-        node("small", `${titleCase(job.request?.searchMode || "recent")} · ${utc(job.createdAt)} · ${count(job.collectedCount)}/${count(job.targetCount)}`),
+        node("small", `${titleCase(job.provider || "snapshot")} · ${utc(job.createdAt)} · ${count(job.collectedCount)}/${count(job.targetCount)}`),
       );
       button.append(node("span", titleCase(job.status), `pill ${job.status || "neutral"}`));
       button.addEventListener("click", () => openJob(job.id));
@@ -299,18 +368,32 @@ function renderJob(job) {
   $("#job-status").textContent = titleCase(status);
   $("#job-status").className = `pill ${status}`;
   $("#collected-count").textContent = `${count(job.collectedCount)} / ${count(job.targetCount)}`;
-  $("#post-resource-count").textContent = count(resources.posts);
-  $("#user-resource-count").textContent = count(resources.users);
-  $("#media-resource-count").textContent = count(resources.media);
-  $("#job-cost").textContent = money(job.cost?.returnedListPriceEstimateUsd);
-  $("#rate-limit").textContent = count(job.rateLimit?.remaining);
+  $("#job-provider").textContent = titleCase(job.provider || job.provenance?.provider);
+  const browser = job.provider === "playwright_browser";
+  $("#browser-stats").hidden = !browser;
+  $("#api-stats").hidden = browser || !job.cost;
+  if (browser) {
+    const details = job.providerDetails || {};
+    $("#scan-count").textContent = count(details.scanIterations);
+    $("#scroll-count").textContent = count(details.scrollIterations);
+    $("#observation-time").textContent = utc(details.observedAt);
+  } else if (job.cost) {
+    $("#post-resource-count").textContent = count(resources.posts);
+    $("#user-resource-count").textContent = count(resources.users);
+    $("#media-resource-count").textContent = count(resources.media);
+    $("#job-cost").textContent = money(job.cost.returnedListPriceEstimateUsd);
+    $("#rate-limit").textContent = count(job.rateLimit?.remaining);
+  }
   const progress = job.targetCount ? Math.min(100, job.collectedCount / job.targetCount * 100) : 0;
   $("#job-progress").value = progress;
-  let progressCopy = `${count(job.collectedCount)} collected; ${count(resources.posts)} Post, ${count(resources.users)} User, and ${count(resources.media)} Media resources returned.`;
+  let progressCopy = `${count(job.collectedCount)} unique Posts stored locally.`;
+  if (!browser && job.resourcesReturned) progressCopy += ` ${count(resources.posts)} Post, ${count(resources.users)} User, and ${count(resources.media)} Media resources returned.`;
   if (status === "waiting" && job.retryAt) progressCopy = `Rate limited. Automatic retry at ${utc(job.retryAt)}.`;
   $("#progress-copy").textContent = progressCopy;
   const provenance = job.provenance || {};
-  $("#job-provenance").textContent = `${titleCase(provenance.provider)} ${provenance.providerVersion || ""} · ${titleCase(provenance.searchMode)} · ${provenance.endpoint || ""} · query “${provenance.query || ""}” (${count(provenance.queryLength)} characters) · ${utc(provenance.startTime)} — ${utc(provenance.endTime)} · ${job.cost?.note || ""}`;
+  $("#job-provenance").textContent = browser
+    ? `${titleCase(job.provider)} ${job.providerVersion || ""} · ${titleCase(provenance.sourceKind)} · ${provenance.sourceUrl || ""}`
+    : `${titleCase(job.provider || provenance.provider)} ${job.providerVersion || provenance.providerVersion || ""} · ${titleCase(provenance.searchMode)} · ${provenance.endpoint || ""} · query “${provenance.query || ""}” (${count(provenance.queryLength)} characters) · ${utc(provenance.startTime)} — ${utc(provenance.endTime)} · ${job.cost?.note || ""}`;
   banner($("#job-error"), status === "waiting" ? "" : job.error?.message);
   banner($("#job-warning"), (job.warnings || []).join(" · "));
   $("#cancel-button").hidden = !activeStatuses.has(status);
@@ -503,12 +586,16 @@ function postCard(post) {
   const media = node("div", "", "media-list");
   for (const item of post.media || []) {
     const source = safeUrl(item.url || item.previewImageUrl);
-    if (!source) continue;
-    const image = node("img");
-    image.src = source;
-    image.alt = item.altText || `${titleCase(item.type || "Post")} media`;
-    image.loading = "lazy";
-    media.append(image);
+    const label = item.altText || `${titleCase(item.type || "Post")} media`;
+    const entry = node("span", label, "media-item");
+    if (source) {
+      const link = node("a", "Open media ↗");
+      link.href = source;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      entry.append(" · ", link);
+    }
+    media.append(entry);
   }
   if (media.children.length) article.append(media);
 
@@ -521,7 +608,7 @@ function postCard(post) {
     const link = node("a", "Open original ↗");
     link.href = href;
     link.target = "_blank";
-    link.rel = "noreferrer";
+    link.rel = "noopener noreferrer";
     foot.append(link);
   }
   article.append(foot);
@@ -555,7 +642,9 @@ async function loadSnapshot(jobId, job) {
   $("#snapshot-status").className = `pill ${job.status}`;
   $("#partial-notice").hidden = !job.isPartial;
   const provenance = job.provenance || {};
-  $("#snapshot-meta").textContent = `${titleCase(provenance.searchMode)} · ${provenance.endpoint || ""} · effective query “${provenance.query || ""}” · observed ${utc(job.updatedAt)} · ${count(posts.length)} stored Posts`;
+  $("#snapshot-meta").textContent = job.provider === "playwright_browser"
+    ? `Browser Home · ${provenance.sourceUrl || "local snapshot"} · captured ${utc(job.capturedAt)} · ${count(posts.length)} stored Posts`
+    : `${titleCase(provenance.searchMode)} · ${provenance.endpoint || ""} · effective query “${provenance.query || ""}” · captured ${utc(job.capturedAt)} · ${count(posts.length)} stored Posts`;
   $("#json-export").href = `/api/jobs/${encodeURIComponent(jobId)}/export?format=json`;
   $("#csv-export").href = `/api/jobs/${encodeURIComponent(jobId)}/export?format=csv`;
   $("#result-count").textContent = `${count(posts.length)} Posts`;

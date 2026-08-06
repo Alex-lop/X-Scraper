@@ -14,16 +14,25 @@ from xworkbench.cli import (
 from xworkbench.config import Settings
 
 
-def test_cli_exposes_only_the_four_supported_commands():
+def test_cli_exposes_recovered_commands_and_bounded_live_gate():
     parser = build_parser()
     command_action = next(action for action in parser._actions if action.choices)
 
-    assert set(command_action.choices) == {"configure", "doctor", "serve", "demo"}
+    assert set(command_action.choices) == {
+        "configure",
+        "auth",
+        "doctor",
+        "serve",
+        "demo",
+        "mcp",
+        "live-smoke",
+    }
     assert parser.parse_args(["serve", "--port", "0"]).port == 0
     assert parser.parse_args(["doctor", "--require-token"]).require_token is True
+    assert parser.parse_args(["live-smoke", "--confirm-live-x"]).confirm_live_x is True
 
 
-def test_settings_use_xworkbench_environment_names(tmp_path, monkeypatch):
+def test_settings_include_app_owned_browser_state_and_headed_defaults(tmp_path, monkeypatch):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("XWORKBENCH_RUNTIME_DIR", str(runtime))
     monkeypatch.setenv("XWORKBENCH_X_BEARER_TOKEN", "environment-token")
@@ -32,11 +41,15 @@ def test_settings_use_xworkbench_environment_names(tmp_path, monkeypatch):
 
     assert settings.database_path == runtime / "x_collection_workbench.db"
     assert settings.bearer_token_path == runtime / "auth" / "x_bearer_token"
+    assert settings.storage_state_path == runtime / "auth" / "playwright_state.json"
+    assert settings.browser_headless is False
+    assert settings.job_timeout_seconds == 120
+    assert settings.page_timeout_ms == 30_000
+    assert settings.no_progress_limit == 3
     assert settings.bearer_token() == "environment-token"
-    assert settings.connection_status()["source"] == "environment"
 
 
-def test_configure_saves_owner_only_token_and_environment_overrides(tmp_path, monkeypatch):
+def test_configure_saves_owner_only_optional_token(tmp_path, monkeypatch):
     token_path = tmp_path / "auth" / "token"
     settings = Settings(tmp_path / "db", token_path)
     monkeypatch.setattr("xworkbench.cli.getpass.getpass", lambda _: "file-token")
@@ -45,11 +58,10 @@ def test_configure_saves_owner_only_token_and_environment_overrides(tmp_path, mo
     assert token_path.read_text().strip() == "file-token"
     assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
 
-    monkeypatch.setenv("XWORKBENCH_X_BEARER_TOKEN", "environment-token")
-    assert settings.bearer_token() == "environment-token"
 
-
-def test_doctor_checks_required_token_permissions_and_ports(tmp_path, capsys, monkeypatch):
+def test_doctor_checks_browser_chromium_session_database_and_port_without_token(
+    tmp_path, capsys, monkeypatch
+):
     class FreePort:
         def __enter__(self):
             return self
@@ -60,23 +72,58 @@ def test_doctor_checks_required_token_permissions_and_ports(tmp_path, capsys, mo
         def bind(self, address):
             return None
 
+    class Browser:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def connection_status(self):
+            return {"status": "ready", "ready": True, "message": "ready"}
+
     monkeypatch.setattr("xworkbench.cli.socket.socket", FreePort)
-    token_path = tmp_path / "auth" / "token"
-    settings = Settings(tmp_path / "db", token_path)
+    monkeypatch.setattr("xworkbench.cli.importlib.util.find_spec", lambda _: object())
+    monkeypatch.setattr(
+        "xworkbench.cli._chromium_available", lambda: (True, "Playwright Chromium is installed")
+    )
+    monkeypatch.setattr("xworkbench.cli.PlaywrightBrowserProvider", Browser)
+    settings = Settings(tmp_path / "db", tmp_path / "token")
+    assert settings.storage_state_path is not None
+    settings.ensure_runtime_dirs()
+    settings.storage_state_path.write_text("{}")
+    settings.storage_state_path.chmod(0o600)
 
     assert _doctor(settings, require_token=False, port=0) == 0
+    output = capsys.readouterr().out
+    assert "Official X API token missing" in output
+    assert "READY" in output
+
     assert _doctor(settings, require_token=True, port=0) == EXIT_PRECONDITION
-    token_path.write_text("secret")
-    token_path.chmod(0o600)
-    assert _doctor(settings, require_token=True, port=0) == 0
 
-    class BusyPort(FreePort):
-        def bind(self, address):
-            raise OSError("busy")
 
-    monkeypatch.setattr("xworkbench.cli.socket.socket", BusyPort)
-    assert _doctor(settings, require_token=False, port=5000) == EXIT_PRECONDITION
-    assert "spending limit" in capsys.readouterr().out
+def test_auth_dispatches_to_manual_browser_helper_without_credentials(
+    tmp_path, monkeypatch, capsys
+):
+    settings = Settings(tmp_path / "db", tmp_path / "token")
+    assert settings.storage_state_path is not None
+    seen = []
+    monkeypatch.setattr("xworkbench.cli.Settings.from_env", lambda: settings)
+    monkeypatch.setattr(
+        "xworkbench.cli.authenticate_interactively",
+        lambda supplied: seen.append(supplied) or supplied.storage_state_path,
+    )
+
+    assert main(["auth"]) == 0
+    assert seen == [settings]
+    assert "Saved protected browser session" in capsys.readouterr().out
+
+
+def test_live_smoke_requires_explicit_confirmation_before_provider_use(monkeypatch, capsys):
+    class ShouldNotConstruct:
+        def __init__(self, settings):
+            raise AssertionError("provider must not be constructed")
+
+    monkeypatch.setattr("xworkbench.cli.PlaywrightBrowserProvider", ShouldNotConstruct)
+    assert main(["live-smoke"]) == EXIT_PRECONDITION
+    assert "--confirm-live-x" in capsys.readouterr().err
 
 
 def test_serve_refuses_non_loopback_host():
@@ -84,7 +131,7 @@ def test_serve_refuses_non_loopback_host():
         main(["serve", "--host", "0.0.0.0", "--no-open"])
 
 
-def test_offline_demo_is_preseeded_isolated_and_blocks_live_reads(monkeypatch):
+def test_offline_demo_is_preseeded_isolated_and_blocks_live_collection(monkeypatch):
     captured = {}
     monkeypatch.setenv("XWORKBENCH_X_BEARER_TOKEN", "must-not-reach-demo")
 
@@ -92,21 +139,20 @@ def test_offline_demo_is_preseeded_isolated_and_blocks_live_reads(monkeypatch):
         service = app.extensions["xworkbench_jobs"]
         captured["path"] = service.storage.path
         client = app.test_client()
+        connection = client.get("/api/connection").get_json()
+        assert connection["demoMode"] == "offline"
         jobs = client.get("/api/jobs").get_json()["jobs"]
-        assert jobs[0]["status"] == "succeeded"
+        assert jobs[0]["provider"] == "playwright_browser"
+        assert "cost" not in jobs[0] and "resourcesReturned" not in jobs[0]
         posts = client.get(f"/api/jobs/{jobs[0]['id']}/posts").get_json()["posts"]
-        assert len(posts) >= 3
+        assert len(posts) == 3
         assert all(post["text"].startswith("[DEMO DATA]") for post in posts)
-
-        exported = client.get(f"/api/jobs/{jobs[0]['id']}/export?format=json").get_json()
-        assert len(exported["posts"]) == len(posts)
-        assert set(exported) == {"schemaVersion", "job", "posts"}
-
-        blocked = client.post(
+        assert client.post(
             "/api/collections/preview",
-            json={"sourceType": "search", "sourceValue": "demo", "maxPosts": 10},
-        )
-        assert blocked.status_code == 409
+            json={"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1},
+        ).status_code == 409
+        exported = client.get(f"/api/jobs/{jobs[0]['id']}/export?format=json").get_json()
+        assert set(exported) == {"schemaVersion", "job", "posts"}
         service.shutdown()
         return 0
 

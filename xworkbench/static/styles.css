@@ -306,6 +306,16 @@ form {
   grid-column: 1 / -1;
 }
 
+.provider-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.media-item {
+  display: block;
+}
+
 fieldset {
   min-width: 0;
   margin: 0;
@@ -846,6 +856,9 @@ meter {
 }
 
 @media (max-width: 760px) {
+  .provider-options {
+    grid-template-columns: 1fr;
+  }
   .site-header,
   .notice,
   .section-title,

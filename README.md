@@ -1,48 +1,151 @@
-# X Collection Workbench
+# X-Scraper
 
 <p align="center">
-  <img src="images/X_cool.png" alt="X Collection Workbench logo" width="280" />
+  <img src="images/X_cool.png" alt="X-Scraper logo" width="280" />
 </p>
 
-A local, single-user workbench for collecting and inspecting public Posts through the official X API. It does not use browser scraping, unofficial endpoints, account pools, proxies, stealth features, or X write actions.
+X-Scraper is a local-first, human-in-the-loop feed-to-context bridge. It turns a small,
+user-approved view of an X Home feed into a durable SQLite snapshot that can be inspected,
+exported, and shared with compatible local agents through read-only MCP.
 
-Each collection is a durable SQLite snapshot. Completed pages survive later failures, and the browser can filter and sort the local result set, summarize authors, languages, Post types, and daily volume, and surface top Posts and authors without another X request.
+The snapshot is the trust boundary. Collection contacts X; inspection, export, deterministic
+analysis, and MCP reads use the saved database and do not make another X request.
 
-## Before installing
+> **Terms warning:** X's current Terms of Service say that scraping is prohibited without X's
+> prior written consent. Noncommercial, research, or personal intent does not itself create
+> permission. You are responsible for obtaining appropriate authorization and following X's
+> terms and applicable law. See [X's current Terms of Service](https://x.com/en/tos).
 
-Python 3.11 or newer and an X developer project with official API access are required for live collection.
+## What this release does
 
-1. Create an app in the [X Developer Console](https://developer.x.com/en/portal/dashboard).
-2. Generate its Bearer Token.
-3. Review [X API pricing](https://docs.x.com/x-api/getting-started/pricing) and set a spending limit in the Developer Console. That limit—not this application—is the billing hard stop.
+- Opens a real headed Playwright Chromium window for normal, manual X sign-in. The application
+  never asks for, receives, logs, transmits, or stores your password.
+- Captures 1–25 Posts currently visible in the authenticated Home feed; the default is 5.
+- Persists each visible batch immediately in a durable, reproducible SQLite snapshot, including
+  source, provider, observation time, stop reason, warnings, and available Post metadata.
+- Preserves partial results after cancellation, timeout, session expiry, challenge, DOM drift, or
+  a later browser failure.
+- Inspects, filters, sorts, summarizes, and exports snapshots without revisiting X. Remote media is
+  not loaded automatically during inspection.
+- Exposes completed snapshots through bounded, local, read-only MCP tools and resources. Stored
+  Post text is untrusted external content, not instructions to an agent.
+- Retains the official X API recent and full-archive provider, including exact query preview,
+  resource bounds, rate-limit recovery, and explicit paid-read confirmation.
 
-At the bundled August 2026 list prices, Posts cost $0.005 per resource, Users $0.010, and Media $0.005. The preview shows the maximum Post resources and Post list-price estimate plus the separate User and Media unit prices. Completed jobs show returned counts for all three resource types and a pre-dedup list-price calculation. These are planning aids, not an invoice: X controls final billing, daily resource deduplication, access, and pricing.
+This is not an API clone, bulk social-listening platform, CAPTCHA bypasser, proxy system, account
+farm, write-action bot, or hosted multi-user service.
 
-## Install and run
+## Install
+
+Python 3.11 or newer is required.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
-xworkbench configure
-xworkbench doctor --require-token
+pip install -e ".[dev,browser,mcp]"
+playwright install chromium
+```
+
+Playwright and MCP are optional package extras so an official-API-only installation can remain
+small. Install the `browser` extra before using Browser capture or `auth`; install `mcp` before
+starting the MCP server.
+
+## Authenticate and run
+
+```bash
+xworkbench auth
+xworkbench doctor
 xworkbench serve
 ```
 
-`configure` uses a masked prompt and saves the Bearer Token under `var/auth/` with owner-only permissions. `XWORKBENCH_X_BEARER_TOKEN` overrides that file. Runtime paths can be changed with `XWORKBENCH_RUNTIME_DIR`, `XWORKBENCH_DB_PATH`, and `XWORKBENCH_X_BEARER_TOKEN_PATH`.
+`xworkbench auth` launches a fresh headed Chromium context at X's normal login flow. Enter your
+credentials and complete any normal verification only in that browser. The session saves
+automatically after the Home surface is detected. X-Scraper never uses your normal Chrome profile.
 
-`doctor` makes no X request; `--require-token` confirms only that a token was found, not that it is valid, funded, or authorized for full archive.
+Playwright authentication state is stored under the local runtime directory's `auth/` folder and
+is protected with owner-only permissions where the platform supports them. That file contains
+sensitive session material: do not share, commit, attach, or paste it into logs or bug reports.
+Delete it or run `xworkbench auth` again when you want to replace the session.
 
-The dashboard opens at <http://127.0.0.1:5000>. Use `--no-open` to suppress the browser or `--port 0` to select a free port. The server refuses non-loopback hosts and a second worker for the same database.
+The dashboard opens on <http://127.0.0.1:5000> and refuses non-loopback hosts and clients. Use
+`--no-open` to suppress opening the dashboard or `--port 0` to select a free port. A second worker
+for the same database is refused.
 
-## Collection modes
+`xworkbench doctor` is local-only. It checks Python, the runtime directory, database compatibility,
+Playwright, the Chromium executable, saved browser-state presence and permissions, and a loopback
+port. A missing official API token does not disable Browser capture. `--require-token` is available
+for an official-API-only readiness check; it never validates credits or makes a paid read.
 
-Every live collection requires a fresh preview followed by `confirmPaidRead: true`. Previews expire after five minutes so the displayed query and effective UTC window cannot silently drift. Collections are capped at 10–500 Posts.
+## Browser capture (default, experimental)
 
-- **Recent** uses `/2/tweets/search/recent` over X's rolling seven-day window. Dates are optional; a date on the rolling boundary is clamped to the exact supported cutoff. The final compiled query, including automatic filters, must fit the 512-character endpoint limit.
-- **Full archive** uses `/2/tweets/search/all`. Both dates are required, the UI treats the end date as inclusive, and the final compiled query must fit the 1,024-character limit. Your X project must have access to this endpoint.
+Choose **Browser capture**, confirm that the session status is ready, keep **Home feed** selected,
+choose a target from 1 to 25, and press **Start browser capture**. Chromium is headed by default so
+the user can see the navigation. X-Scraper parses the visible outer Post articles before each
+bounded scroll, deduplicates by canonical numeric Post ID, and stops when the target is reached or
+progress can no longer be made safely.
 
-Profile input compiles to `from:<handle>`. Reply and media controls add `-is:reply` and `has:media`; search expressions are grouped before those application filters are added so operator precedence is preserved. General searches request author and media expansions, while profile searches avoid a redundant author expansion. The preview displays the exact endpoint, compiled query, effective dates, expiry, and cost basis before collection starts.
+Unknown DOM values stay missing. In particular, missing timestamps, language, type classification,
+media, or engagement metrics are not turned into zeroes. A challenge or CAPTCHA is never solved or
+bypassed: the job stops truthfully as requiring manual action, and any already saved rows remain
+inspectable.
+
+Only Home capture is supported in this recovery slice. Playwright profile/search, Following-tab
+automation, threads, replies, lists, and historical collection are deferred.
+
+X can change its DOM, expire a session, rate-limit access, present a challenge, or block automation
+at any time. A locally present session marked `ready` means the prerequisites exist; it is not a
+promise that X will accept the session on the next capture.
+
+## Optional official X API provider
+
+If you have official API access, store a Bearer Token with a masked prompt:
+
+```bash
+xworkbench configure
+xworkbench doctor --require-token
+```
+
+The token is stored under the runtime `auth/` directory with owner-only permissions.
+`XWORKBENCH_X_BEARER_TOKEN` can provide an environment override.
+
+Official API mode retains profile/search sources, 10–500 Post limits, rolling seven-day recent
+search, full archive with required inclusive dates, exact five-minute compilation previews, and
+`confirmPaidRead: true`. Cost figures are list-price planning aids, not invoices or hard billing
+limits; configure the real spending limit in the X Developer Console.
+
+## Durable snapshots and exports
+
+SQLite uses WAL mode and restrictive file permissions. Post observations are immutable per job,
+batches and checkpoints commit together, duplicate IDs are ignored within a snapshot, and jobs
+survive cancellation, rate-limit waits, process restart, and retry. A forward migration from the
+current v1 schema creates a protected SQLite backup before changing nullable Post fields; unrelated
+older schemas are preserved and rejected rather than guessed.
+
+Stage 3 reads SQLite only. It retains local text search, author/language/type filters, sorting,
+daily volume, languages, top Posts, top authors, and JSON/CSV exports. CSV cells are protected from
+spreadsheet formula injection. Provider-neutral provenance and partial status are included; API
+cost/resource fields appear only on official API snapshots.
+
+## Read-only MCP
+
+Start the dashboard, then run:
+
+```bash
+xworkbench mcp --url http://127.0.0.1:5000
+```
+
+The stdio MCP server connects only to a loopback dashboard and exposes bounded reads:
+
+- `list_x_snapshots(limit=...)`
+- `get_x_snapshot(snapshot_id)`
+- `get_x_posts(snapshot_id, offset=..., limit=...)`
+- `search_x_snapshot(snapshot_id, query, limit=...)`
+- `get_latest_feed_snapshot()`
+
+MCP cannot authenticate, start collection, revisit X, accept an arbitrary URL, expose provider
+checkpoints or credentials, or perform X write actions. Collection remains an explicit human action
+in the dashboard. Snapshot resources are passive context; tools provide bounded lookup and
+pagination.
 
 ## Offline demo
 
@@ -50,29 +153,45 @@ Profile input compiles to `from:<handle>`. Reply and media controls add `-is:rep
 xworkbench demo
 ```
 
-The demo opens a temporary database preseeded with clearly labeled synthetic Posts. It has no token, performs no provider request, and removes the database when stopped. The same local inspection and JSON/CSV export surfaces remain available.
+The demo uses a temporary database seeded with clearly labeled synthetic Posts. It has no token,
+makes no provider request, supports the normal inspection/export flow, and removes the database on
+exit.
 
-## API and exports
+## Explicit live smoke runbook
 
-- `GET /api/connection`
-- `POST /api/collections/preview`
-- `POST /api/jobs` with the preview's `compiledRequest` and `confirmPaidRead: true`
-- `GET /api/jobs` and `GET /api/jobs/:id`
-- `GET /api/jobs/:id/posts?limit=100&offset=0`
-- `POST /api/jobs/:id/cancel`
-- `POST /api/jobs/:id/resume`
-- `DELETE /api/jobs/:id` to permanently delete a terminal job and its observations
-- `GET /api/jobs/:id/export?format=json|csv`
+No live X request runs in CI. After you have appropriate authorization and have completed
+`xworkbench auth`, the opt-in smoke gate is:
 
-API mutations require `Content-Type: application/json`. Cancellation and deletion are deliberately separate: cancellation stops an active job; deletion is accepted only after a job is terminal.
+```bash
+xworkbench live-smoke --confirm-live-x
+```
 
-HTTP 429 jobs persist their reset time, enter `waiting`, and requeue automatically, including after restart. Valid Posts from mixed X responses are retained with sanitized warnings. Post and long-form note text are stored exactly as returned, and missing author expansions preserve the author ID with a fallback URL.
+It launches headed Chromium, requests no more than two currently visible Home-feed Posts, disables
+retries, uses a temporary database, writes no committed fixture, and reports only sanitized status
+and counts. Missing login state, changed DOM, X failure, or a challenge is reported as a real
+failure; it is never converted into a fake pass.
 
-JSON exports include the request, effective compiled provenance, status, warnings, returned resource counts, cost calculation, and raw normalized Posts. CSV exports contain the same Post rows and protect spreadsheet formula prefixes. No server-side sentiment, report cache, Markdown export, or AI analysis is performed.
+## Local data and configuration
 
-## v1 database break
+By default, generated state stays under `var/`, which is excluded from Git:
 
-v1 intentionally starts a clean schema and does not migrate v0.2 databases. Before upgrading, run v0.2 and export any snapshots you need. Then move the old database aside or point `XWORKBENCH_DB_PATH` at a new file. The application rejects an older database without modifying it.
+- SQLite database, WAL, and migration backup
+- official API token file
+- Playwright authentication state
+- worker lock and temporary runtime files
+
+The application does not store full pages, request headers, raw private network payloads, or your
+password. Browser diagnostics and Playwright artifacts are also excluded from Git. Runtime paths
+can be changed with `XWORKBENCH_RUNTIME_DIR`, `XWORKBENCH_DB_PATH`,
+`XWORKBENCH_X_BEARER_TOKEN_PATH`, and `XWORKBENCH_STORAGE_STATE_PATH`.
+
+## Future enrichment boundary
+
+A later enrichment adapter may consume an immutable completed snapshot asynchronously and write a
+separate result tagged with adapter name, version, configuration, and source snapshot ID. It must
+be reproducible and optional: enrichment failure can never change a successful collection into a
+failed one. No server-side LLM, sentiment ensemble, Kafka, Redis, scheduler, alerting, or distributed
+worker is included here; the chatbot reading MCP is the initial analysis layer.
 
 ## Verify a source checkout
 
@@ -84,6 +203,12 @@ node --test tests/test_analysis.mjs
 python -m pip wheel . --no-deps --wheel-dir dist
 ```
 
-CI runs those checks on Python 3.11–3.13 and inspects the wheel for the `xworkbench` entry point, new package namespace, and packaged dashboard assets.
+All ordinary tests use synthetic data and must pass without X, an authenticated session, or an
+external model connection.
 
-Hosted deployment, OAuth user accounts, sentiment scoring, scheduling, alerts, recurring monitoring, unofficial scraping, and write actions are out of scope for v1.
+## Responsible use
+
+There is no stealth plugin, randomized fingerprinting, proxy support, account rotation, direct
+cookie extraction, private GraphQL replay, automated challenge solving, or X write action. Do not
+describe this project as compliant scraping, undetectable, ban-proof, or an unrestricted free API
+replacement. Technical limits reduce scope; they do not grant legal or contractual permission.

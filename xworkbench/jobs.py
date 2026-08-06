@@ -10,16 +10,24 @@ from typing import Any
 
 from .errors import CollectionCancelled, CollectionError, RateLimitWaiting
 from .models import CollectionRequest, JobStatus
+from .providers import CollectionProvider, ProviderRegistry
 from .storage import Storage
-from .x_api import XApiProvider
 
 logger = logging.getLogger(__name__)
 
 
 class JobService:
-    def __init__(self, storage: Storage, provider: XApiProvider, *, start_worker: bool = True):
+    def __init__(
+        self,
+        storage: Storage,
+        providers: ProviderRegistry | CollectionProvider,
+        *,
+        start_worker: bool = True,
+    ):
         self.storage = storage
-        self.provider = provider
+        self.registry = (
+            providers if isinstance(providers, ProviderRegistry) else ProviderRegistry([providers])
+        )
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -86,10 +94,10 @@ class JobService:
         if not self._thread or not self._thread.is_alive():
             self._release_process_lock()
 
-    def submit(self, request: CollectionRequest, compiled_request: dict[str, Any]) -> str:
+    def submit(self, request: CollectionRequest, execution_plan: dict[str, Any]) -> str:
         if self._shutdown:
             raise RuntimeError("Job service is shutting down.")
-        job_id = self.storage.create_job(request, compiled_request)
+        job_id = self.storage.create_job(request, execution_plan)
         self.enqueue(job_id)
         return job_id
 
@@ -109,33 +117,22 @@ class JobService:
         job = self.storage.claim_job(job_id)
         if not job:
             return
-        request = CollectionRequest.from_dict(job["request"])
-        if job["collected_count"] >= request.max_posts:
-            self.storage.finish_job(job_id, job["warnings"], completion_reason="target_reached")
-            return
-        if job["post_resource_count"] >= job["compiled_request"]["maximumPostResources"]:
-            self.storage.finish_job(
-                job_id,
-                list(
-                    dict.fromkeys(
-                        [*job["warnings"], "Stopped at the confirmed Post-resource limit."]
-                    )
-                ),
-                completion_reason="post_resource_limit_reached",
-                partial=True,
-            )
-            return
 
-        def on_batch(posts, cursor, page_stats):
-            return self.storage.add_posts(job_id, posts, cursor, page_stats)
+        def on_batch(posts, provider_state, metadata):
+            return self.storage.add_posts(job_id, posts, provider_state, metadata)
 
         try:
-            summary = self.provider.collect(
+            request = CollectionRequest.from_dict(job["request"])
+            if job["collected_count"] >= request.max_posts:
+                self.storage.finish_job(
+                    job_id, job["warnings"], completion_reason="target_reached"
+                )
+                return
+            provider = self.registry.get(request.provider)
+            summary = provider.collect(
                 request,
-                compiled_request=job["compiled_request"],
-                cursor=job["cursor"],
-                collected_count=int(job["collected_count"]),
-                returned_post_count=int(job["post_resource_count"]),
+                execution_plan=job["execution_plan"],
+                checkpoint=job["checkpoint"],
                 on_batch=on_batch,
                 should_cancel=lambda: (
                     self._stop_event.is_set() or self.storage.cancel_requested(job_id)
@@ -145,6 +142,12 @@ class JobService:
             if current and current["collected_count"] >= request.max_posts:
                 summary.completion_reason = "target_reached"
                 summary.partial = False
+            elif summary.completion_reason == "target_reached":
+                summary.completion_reason = "target_not_reached"
+                summary.partial = True
+                summary.warnings.append(
+                    "Provider stopped before the requested number of unique posts was stored."
+                )
             persisted_warnings = current["warnings"] if current else job["warnings"]
             self.storage.finish_job(
                 job_id,
@@ -162,16 +165,30 @@ class JobService:
             )
             self.storage.fail_job(job_id, status, status.value, str(exc), True)
         except CollectionError as exc:
-            self.storage.fail_job(job_id, JobStatus.FAILED, exc.code, str(exc), exc.retryable)
+            current = self.storage.get_job(job_id)
+            status = (
+                JobStatus.PARTIAL
+                if current and current["collected_count"] > 0
+                else JobStatus.FAILED
+            )
+            self.storage.fail_job(job_id, status, exc.code, str(exc), exc.retryable)
         except Exception as exc:
             logger.exception("Unexpected collection failure for job %s", job_id)
-            self.storage.fail_job(job_id, JobStatus.FAILED, "unexpected_error", str(exc), True)
+            current = self.storage.get_job(job_id)
+            status = (
+                JobStatus.PARTIAL
+                if current and current["collected_count"] > 0
+                else JobStatus.FAILED
+            )
+            self.storage.fail_job(job_id, status, "unexpected_error", str(exc), True)
 
     def _worker(self) -> None:
         while not self._stop_event.is_set():
             try:
                 job_id = self._queue.get(timeout=1)
             except queue.Empty:
+                if self._stop_event.is_set():
+                    return
                 for due_id in self.storage.requeue_due_jobs():
                     self.enqueue(due_id)
                 continue

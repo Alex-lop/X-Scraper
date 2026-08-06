@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from xworkbench.errors import InvalidRequestError
-from xworkbench.models import CollectionRequest, SearchMode
+from xworkbench.models import CollectionRequest, ProviderType, SearchMode, SourceType
 from xworkbench.x_api import (
     ARCHIVE_ENDPOINT,
     RECENT_ENDPOINT,
@@ -52,6 +52,54 @@ def test_search_is_nfc_normalized_and_request_fields_are_allowlisted():
     for value in (9, 501, "10", True):
         with pytest.raises(InvalidRequestError, match="maxPosts"):
             collection(maxPosts=value)
+
+
+def test_browser_home_request_has_its_own_small_limits_and_legacy_defaults_to_api():
+    browser = CollectionRequest.from_dict(
+        {"provider": "playwright_browser", "sourceType": "home"}
+    )
+
+    assert browser.provider is ProviderType.PLAYWRIGHT_BROWSER
+    assert browser.source_type is SourceType.HOME
+    assert browser.source_value == "home" and browser.max_posts == 5
+    assert browser.search_mode is None
+    assert browser.to_dict() == {
+        "provider": "playwright_browser",
+        "sourceType": "home",
+        "sourceValue": "home",
+        "maxPosts": 5,
+    }
+    assert CollectionRequest.from_dict(
+        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1}
+    ).max_posts == 1
+    assert CollectionRequest.from_dict(
+        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 25}
+    ).max_posts == 25
+    for value in (0, 26, True, "5"):
+        with pytest.raises(InvalidRequestError, match="maxPosts"):
+            CollectionRequest.from_dict(
+                {"provider": "playwright_browser", "sourceType": "home", "maxPosts": value}
+            )
+    for changes in (
+        {"sourceType": "profile"},
+        {"sourceType": "home", "sourceValue": "https://x.com/home"},
+        {"sourceType": "home", "searchMode": "recent"},
+    ):
+        with pytest.raises(InvalidRequestError):
+            CollectionRequest.from_dict({"provider": "playwright_browser", **changes})
+
+    legacy = CollectionRequest.from_dict(
+        {"sourceType": "search", "sourceValue": "python", "maxPosts": 10}
+    )
+    alias = CollectionRequest.from_dict(
+        {
+            "provider": "x_api_search",
+            "sourceType": "search",
+            "sourceValue": "python",
+            "maxPosts": 10,
+        }
+    )
+    assert legacy.provider is alias.provider is ProviderType.OFFICIAL_X_API
 
 
 def test_or_queries_are_grouped_before_application_filters():

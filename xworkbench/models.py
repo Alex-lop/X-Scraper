@@ -14,8 +14,14 @@ HANDLE_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 
 class SourceType(StrEnum):
+    HOME = "home"
     PROFILE = "profile"
     SEARCH = "search"
+
+
+class ProviderType(StrEnum):
+    PLAYWRIGHT_BROWSER = "playwright_browser"
+    OFFICIAL_X_API = "official_x_api"
 
 
 class SearchMode(StrEnum):
@@ -67,7 +73,8 @@ def normalize_profile(value: str) -> str:
 class CollectionRequest:
     source_type: SourceType
     source_value: str
-    search_mode: SearchMode = SearchMode.RECENT
+    provider: ProviderType = ProviderType.OFFICIAL_X_API
+    search_mode: SearchMode | None = SearchMode.RECENT
     max_posts: int = 25
     start_date: str | None = None
     end_date: str | None = None
@@ -79,6 +86,7 @@ class CollectionRequest:
         if not isinstance(body, dict):
             raise InvalidRequestError("Request body must be a JSON object.")
         allowed = {
+            "provider",
             "sourceType",
             "sourceValue",
             "searchMode",
@@ -91,10 +99,25 @@ class CollectionRequest:
         unknown = sorted(set(body) - allowed)
         if unknown:
             raise InvalidRequestError(f"Unknown request field(s): {', '.join(unknown)}.")
+        raw_provider = str(body.get("provider", ProviderType.OFFICIAL_X_API.value))
+        if raw_provider == "x_api_search":
+            raw_provider = ProviderType.OFFICIAL_X_API.value
+        try:
+            provider = ProviderType(raw_provider)
+        except ValueError as exc:
+            raise InvalidRequestError(
+                "provider must be 'playwright_browser' or 'official_x_api'."
+            ) from exc
+
+        if provider is ProviderType.PLAYWRIGHT_BROWSER:
+            return cls._browser_request(body)
+
         try:
             source_type = SourceType(str(body.get("sourceType", "")))
         except ValueError as exc:
             raise InvalidRequestError("sourceType must be 'profile' or 'search'.") from exc
+        if source_type is SourceType.HOME:
+            raise InvalidRequestError("official_x_api supports only profile or search sources.")
         try:
             search_mode = SearchMode(str(body.get("searchMode", SearchMode.RECENT.value)))
         except ValueError as exc:
@@ -126,6 +149,7 @@ class CollectionRequest:
         return cls(
             source_type=source_type,
             source_value=source_value,
+            provider=provider,
             search_mode=search_mode,
             max_posts=max_posts,
             start_date=start_date,
@@ -134,12 +158,51 @@ class CollectionRequest:
             media_only=body.get("mediaOnly", False),
         )
 
+    @classmethod
+    def _browser_request(cls, body: dict[str, Any]) -> CollectionRequest:
+        try:
+            source_type = SourceType(str(body.get("sourceType", SourceType.HOME.value)))
+        except ValueError as exc:
+            raise InvalidRequestError("Browser capture supports only the Home feed.") from exc
+        if source_type is not SourceType.HOME:
+            raise InvalidRequestError("Browser capture supports only the Home feed.")
+        source_value = body.get("sourceValue", "home")
+        if source_value not in (None, "", "home"):
+            raise InvalidRequestError("Browser capture source is fixed to the Home feed.")
+        unsupported = sorted(
+            name
+            for name in ("searchMode", "startDate", "endDate", "includeReplies", "mediaOnly")
+            if name in body
+        )
+        if unsupported:
+            raise InvalidRequestError(
+                f"Browser capture does not support: {', '.join(unsupported)}."
+            )
+        max_posts = body.get("maxPosts", 5)
+        if isinstance(max_posts, bool) or not isinstance(max_posts, int):
+            raise InvalidRequestError("maxPosts must be an integer.")
+        if not 1 <= max_posts <= 25:
+            raise InvalidRequestError("Browser maxPosts must be between 1 and 25.")
+        return cls(
+            provider=ProviderType.PLAYWRIGHT_BROWSER,
+            source_type=SourceType.HOME,
+            source_value="home",
+            search_mode=None,
+            max_posts=max_posts,
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
+            "provider": self.provider.value,
             "sourceType": self.source_type.value,
             "sourceValue": self.source_value,
-            "searchMode": self.search_mode.value,
             "maxPosts": self.max_posts,
+        }
+        if self.provider is ProviderType.PLAYWRIGHT_BROWSER:
+            return result
+        return {
+            **result,
+            "searchMode": self.search_mode.value if self.search_mode else None,
             "startDate": self.start_date,
             "endDate": self.end_date,
             "includeReplies": self.include_replies,
@@ -150,7 +213,7 @@ class CollectionRequest:
 @dataclass(slots=True)
 class Post:
     post_id: str
-    text: str
+    text: str | None
     author_username: str | None
     url: str
     created_at: str | None
@@ -164,11 +227,12 @@ class Post:
     repost_count: int | None = None
     quote_count: int | None = None
     bookmark_count: int | None = None
-    is_reply: bool = False
-    is_repost: bool = False
-    is_quote: bool = False
-    has_media: bool = False
-    media: list[dict[str, Any]] = field(default_factory=list)
+    is_reply: bool | None = None
+    is_repost: bool | None = None
+    is_quote: bool | None = None
+    has_media: bool | None = None
+    media: list[dict[str, Any]] | None = None
+    source_position: int | None = None
 
 
 @dataclass(slots=True)

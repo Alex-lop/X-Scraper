@@ -10,6 +10,18 @@ class Settings:
     database_path: Path
     bearer_token_path: Path
     allow_environment_token: bool = True
+    storage_state_path: Path | None = None
+    browser_headless: bool = False
+    job_timeout_seconds: int = 120
+    page_timeout_ms: int = 30_000
+    no_progress_limit: int = 3
+
+    def __post_init__(self) -> None:
+        runtime_dir = self.database_path.parent
+        if self.storage_state_path is None:
+            object.__setattr__(
+                self, "storage_state_path", runtime_dir / "auth" / "playwright_state.json"
+            )
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -27,11 +39,25 @@ class Settings:
             )
             .expanduser()
             .resolve(),
+            storage_state_path=Path(
+                os.environ.get(
+                    "XWORKBENCH_STORAGE_STATE_PATH",
+                    runtime_dir / "auth" / "playwright_state.json",
+                )
+            )
+            .expanduser()
+            .resolve(),
+            browser_headless=os.environ.get("XWORKBENCH_BROWSER_HEADLESS", "0") == "1",
+            job_timeout_seconds=int(os.environ.get("XWORKBENCH_JOB_TIMEOUT_SECONDS", "120")),
+            page_timeout_ms=int(os.environ.get("XWORKBENCH_PAGE_TIMEOUT_MS", "30000")),
+            no_progress_limit=int(os.environ.get("XWORKBENCH_NO_PROGRESS_LIMIT", "3")),
         )
 
     def ensure_runtime_dirs(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.bearer_token_path.parent.mkdir(parents=True, exist_ok=True)
+        assert self.storage_state_path is not None
+        self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
 
     def bearer_token(self) -> str | None:
         override = (

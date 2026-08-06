@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "x-collection-workbench"
 version = "1.0.0"
-description = "Local official-X-API collection workbench"
+description = "Local feed-to-context snapshot bridge for X"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -17,6 +17,12 @@ dependencies = [
 dev = [
   "pytest>=8,<10",
   "ruff>=0.9,<1",
+]
+browser = [
+  "playwright>=1.44,<2",
+]
+mcp = [
+  "mcp>=2,<3",
 ]
 
 [project.scripts]

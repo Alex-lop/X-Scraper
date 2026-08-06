@@ -4,73 +4,164 @@ from datetime import UTC, datetime, timedelta
 
 from xworkbench.api import create_app
 from xworkbench.config import Settings
-from xworkbench.models import CollectionSummary, Post
+from xworkbench.errors import CredentialError, InvalidRequestError
+from xworkbench.models import CollectionSummary, Post, ProviderType
+from xworkbench.providers import ProviderRegistry
 from xworkbench.storage import Storage
-from xworkbench.x_api import ARCHIVE_ENDPOINT
+from xworkbench.x_api import (
+    ARCHIVE_ENDPOINT,
+    UNIT_PRICES_USD,
+    compile_request,
+    validate_compiled_request,
+)
 
 
-class Provider:
+class BrowserProvider:
+    provider_id = ProviderType.PLAYWRIGHT_BROWSER
+    provider_version = 1
+
     def __init__(self, *, partial=False):
         self.partial = partial
-        self.calls = []
+
+    def capabilities(self):
+        return {
+            "provider": self.provider_id.value,
+            "providerVersion": self.provider_version,
+            "sourceKinds": ["home"],
+            "minimumPosts": 1,
+            "defaultPosts": 5,
+            "maximumPosts": 25,
+        }
+
+    def connection_status(self):
+        return {"status": "ready", "ready": True, "message": "Browser session ready."}
+
+    def prepare(self, request, supplied_plan=None):
+        plan = {
+            "provider": self.provider_id.value,
+            "providerVersion": self.provider_version,
+            "sourceKind": "home",
+            "sourceUrl": "https://x.com/home",
+            "targetPosts": request.max_posts,
+        }
+        if supplied_plan is not None and supplied_plan != plan:
+            raise InvalidRequestError("Browser execution plan does not match this request.")
+        return plan
 
     def collect(
-        self,
-        request,
-        *,
-        compiled_request,
-        cursor,
-        collected_count,
-        returned_post_count,
-        on_batch,
-        should_cancel,
+        self, request, *, execution_plan, checkpoint, on_batch, should_cancel
     ):
-        self.calls.append(compiled_request["endpoint"])
         on_batch(
             [
                 Post(
                     post_id="99",
-                    text="=SUM(1,1) exact text\n",
-                    author_username="tester",
-                    author_id="7",
-                    url="https://x.com/tester/status/99",
-                    created_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
-                    language="en",
-                    like_count=5,
-                    repost_count=2,
-                    media=[{"id": "media-1", "type": "photo"}],
-                    has_media=True,
+                    text="=SUM(1,1) exact visible text\n",
+                    author_username=None,
+                    author_id=None,
+                    url="https://x.com/i/web/status/99",
+                    created_at=None,
+                    language=None,
+                    media=None,
+                    source_position=0,
                 )
             ],
-            None,
             {
-                "resourcesReturned": {"posts": 1, "users": 1, "media": 2},
-                "warnings": ["X API partial response: expansion unavailable"],
-                "rateLimitRemaining": 44,
+                "seenPostIds": ["99"],
+                "scanIterations": 2,
+                "scrollIterations": 1,
+                "noProgressIterations": 0,
+            },
+            {
+                "browserVersion": "test-chromium",
+                "sourceKind": "home",
+                "sourceUrl": "https://x.com/home",
+                "scanIterations": 2,
+                "scrollIterations": 1,
+                "observedAt": "2026-08-05T12:00:00+00:00",
             },
         )
         return CollectionSummary(
-            warnings=["X API partial response: expansion unavailable"],
-            completion_reason="search_exhausted",
+            warnings=["Synthetic browser provider."],
+            completion_reason="no_progress" if self.partial else "target_reached",
             partial=self.partial,
         )
 
 
-def make_client(tmp_path, *, partial=False):
+class OfficialProvider:
+    provider_id = ProviderType.OFFICIAL_X_API
+    provider_version = 2
+
+    def __init__(self, settings):
+        self.settings = settings
+
+    def capabilities(self):
+        return {
+            "provider": self.provider_id.value,
+            "providerVersion": self.provider_version,
+            "sourceKinds": ["profile", "search"],
+            "minimumPosts": 10,
+            "maximumPosts": 500,
+        }
+
+    def connection_status(self):
+        status = self.settings.connection_status()
+        return {**status, "ready": bool(status["valid"])}
+
+    def prepare(self, request, supplied_plan=None):
+        if not self.settings.bearer_token():
+            raise CredentialError("No X API Bearer Token. Run: xworkbench configure")
+        if supplied_plan is None:
+            return compile_request(request)
+        validate_compiled_request(request, supplied_plan)
+        return supplied_plan
+
+    def collect(
+        self, request, *, execution_plan, checkpoint, on_batch, should_cancel
+    ):
+        on_batch(
+            [
+                Post(
+                    post_id="42",
+                    text="Official API text",
+                    author_username="tester",
+                    author_id="7",
+                    url="https://x.com/tester/status/42",
+                    created_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+                    language="en",
+                    like_count=5,
+                    repost_count=2,
+                    media=[],
+                    has_media=False,
+                )
+            ],
+            None,
+            {
+                "resourcesReturned": {"posts": 1, "users": 1, "media": 0},
+                "rateLimitRemaining": 44,
+            },
+        )
+        return CollectionSummary(completion_reason="recent_search_exhausted")
+
+
+def make_client(tmp_path, *, token=False, partial=False, providers=None):
     token_path = tmp_path / "auth" / "token"
     token_path.parent.mkdir(parents=True)
-    token_path.write_text("secret")
+    if token:
+        token_path.write_text("secret")
     settings = Settings(tmp_path / "test.db", token_path)
     storage = Storage(settings.database_path)
-    provider = Provider(partial=partial)
-    app = create_app(settings, storage=storage, provider=provider, start_worker=False)
+    registry = ProviderRegistry(
+        providers or [BrowserProvider(partial=partial), OfficialProvider(settings)]
+    )
+    app = create_app(settings, storage=storage, registry=registry, start_worker=False)
     app.config.update(TESTING=True)
-    return app.test_client(), app, provider
+    return app.test_client(), app
 
 
-def body(**changes):
+def official_body(**changes):
     today = datetime.now(UTC).date()
     request = {
+        "provider": "official_x_api",
         "sourceType": "search",
         "sourceValue": "python",
         "searchMode": "recent",
@@ -82,15 +173,19 @@ def body(**changes):
     return request
 
 
-def run_collection(client, app, request=None):
-    request = request or body()
+def run_collection(client, app, request):
     preview = client.post("/api/collections/preview", json=request).get_json()
+    confirmation = (
+        {"confirmBrowserCapture": True}
+        if preview["provider"] == "playwright_browser"
+        else {"confirmPaidRead": True}
+    )
     created = client.post(
         "/api/jobs",
         json={
-            **request,
-            "compiledRequest": preview["compiledRequest"],
-            "confirmPaidRead": True,
+            **preview["request"],
+            "executionPlan": preview["executionPlan"],
+            **confirmation,
         },
     )
     assert created.status_code == 202
@@ -99,123 +194,117 @@ def run_collection(client, app, request=None):
     return preview, job_id
 
 
-def test_preview_requires_confirmation_and_reports_separate_resource_prices(tmp_path):
-    client, _, _ = make_client(tmp_path)
-    request = body()
-    response = client.post("/api/collections/preview", json=request)
-    preview = response.get_json()
+def test_browser_is_default_and_does_not_require_api_token(tmp_path):
+    client, _ = make_client(tmp_path)
 
-    assert response.status_code == 200
-    assert preview["compiledIntent"]["query"] == "(python) -is:reply"
-    assert preview["request"]["searchMode"] == "recent"
-    expires = datetime.fromisoformat(preview["compiledRequest"]["expiresAt"].replace("Z", "+00:00"))
-    compiled = datetime.fromisoformat(
-        preview["compiledRequest"]["compiledAt"].replace("Z", "+00:00")
-    )
-    assert expires - compiled == timedelta(minutes=5)
-    estimate = preview["costEstimate"]
-    assert estimate["maximumPostResources"] == 10
-    assert estimate["maximumPostListPriceUsd"] == 0.05
-    assert estimate["unitPricesUsd"] == {"post": 0.005, "user": 0.01, "media": 0.005}
-    assert "not an invoice" in str(estimate).casefold()
+    connection = client.get("/api/connection").get_json()
+    assert connection["defaultProvider"] == "playwright_browser"
+    assert connection["providers"]["playwright_browser"]["connection"]["ready"] is True
+    assert connection["providers"]["official_x_api"]["connection"]["ready"] is False
 
-    rejected = client.post(
-        "/api/jobs", json={**request, "compiledRequest": preview["compiledRequest"]}
-    )
-    assert rejected.status_code == 400
-    assert "confirmPaidRead" in rejected.get_json()["error"]["message"]
-
-
-def test_completed_job_exposes_cost_provenance_and_raw_json_csv_exports(tmp_path):
-    client, app, provider = make_client(tmp_path)
-    preview, job_id = run_collection(client, app)
-
-    job = client.get(f"/api/jobs/{job_id}").get_json()
-    assert job["status"] == "succeeded" and job["collectedCount"] == 1
-    assert job["resourcesReturned"] == {"posts": 1, "users": 1, "media": 2}
-    assert job["warnings"] == ["X API partial response: expansion unavailable"]
-    assert job["provenance"]["query"] == preview["compiledIntent"]["query"]
-    assert job["provenance"]["provider"] == "x_api_search"
-    assert job["cost"]["maximumPostListPriceUsd"] == 0.05
-    assert job["cost"]["returnedListPriceEstimateUsd"] == 0.025
-    assert "not an invoice" in str(job["cost"]).casefold()
-    assert provider.calls == [preview["compiledIntent"]["endpoint"]]
-
-    exported = client.get(f"/api/jobs/{job_id}/export?format=json").get_json()
-    assert set(exported) == {"schemaVersion", "job", "posts"}
-    assert exported["posts"][0]["text"] == "=SUM(1,1) exact text\n"
-    assert exported["posts"][0]["post_id"] == "99"
-
-    csv_response = client.get(f"/api/jobs/{job_id}/export?format=csv")
-    csv_row = next(csv.DictReader(io.StringIO(csv_response.get_data(as_text=True))))
-    assert csv_row["post_id"] == "99"
-    assert csv_row["text"].startswith("'=SUM(1,1)")
-    assert client.get(f"/api/jobs/{job_id}/export?format=markdown").status_code == 400
-
-
-def test_full_archive_preview_is_supported(tmp_path):
-    client, _, _ = make_client(tmp_path)
-    response = client.post(
+    preview = client.post(
         "/api/collections/preview",
-        json=body(
-            searchMode="fullArchive",
-            startDate="2020-01-01",
-            endDate="2020-01-02",
-        ),
+        json={"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1},
     )
-
-    assert response.status_code == 200
-    preview = response.get_json()
-    assert preview["compiledIntent"]["endpoint"] == ARCHIVE_ENDPOINT
-    assert preview["compiledIntent"]["endTime"] == "2020-01-03T00:00:00Z"
+    assert preview.status_code == 200
+    assert "costEstimate" not in preview.get_json()
 
 
-def test_cancel_and_terminal_delete_are_separate_json_mutations(tmp_path):
-    client, _, _ = make_client(tmp_path)
-    request = body()
+def test_create_requires_exact_preview_and_provider_confirmation(tmp_path):
+    client, _ = make_client(tmp_path)
+    request = {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 5}
     preview = client.post("/api/collections/preview", json=request).get_json()
-    job_id = client.post(
+
+    missing_plan = client.post(
+        "/api/jobs", json={**request, "confirmBrowserCapture": True}
+    )
+    assert missing_plan.status_code == 400
+    assert client.post(
+        "/api/jobs", json={**request, "executionPlan": preview["executionPlan"]}
+    ).status_code == 400
+    assert client.post(
         "/api/jobs",
         json={
             **request,
-            "compiledRequest": preview["compiledRequest"],
-            "confirmPaidRead": True,
+            "executionPlan": preview["executionPlan"],
+            "compiledRequest": {**preview["executionPlan"], "targetPosts": 4},
+            "confirmBrowserCapture": True,
         },
-    ).get_json()["jobId"]
+    ).status_code == 400
 
-    assert client.delete(f"/api/jobs/{job_id}").status_code == 415
-    assert (
-        client.delete(
-            f"/api/jobs/{job_id}", json={}
-        ).status_code
-        == 409
+
+def test_browser_job_and_exports_omit_api_metadata_and_secrets(tmp_path):
+    client, app = make_client(tmp_path)
+    _, job_id = run_collection(
+        client,
+        app,
+        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1},
     )
-    assert client.post(f"/api/jobs/{job_id}/cancel", json={}).status_code == 202
-    assert (
-        client.delete(
-            f"/api/jobs/{job_id}", json={}
-        ).status_code
-        == 204
-    )
-    assert client.get(f"/api/jobs/{job_id}").status_code == 404
-
-
-def test_partial_snapshot_is_marked_and_can_be_deleted(tmp_path):
-    client, app, _ = make_client(tmp_path, partial=True)
-    _, job_id = run_collection(client, app)
 
     job = client.get(f"/api/jobs/{job_id}").get_json()
-    assert job["status"] == "partial" and job["isPartial"] is True
-    assert (
-        client.delete(f"/api/jobs/{job_id}", json={}).status_code
-        == 204
+    assert job["status"] == "succeeded" and job["provider"] == "playwright_browser"
+    assert job["providerDetails"]["scanIterations"] == 2
+    assert job["providerDetails"]["scrollIterations"] == 1
+    assert "cost" not in job and "resourcesReturned" not in job and "rateLimit" not in job
+    assert not {"checkpoint", "providerState", "headers", "token", "auth"}.intersection(job)
+
+    exported = client.get(f"/api/jobs/{job_id}/export?format=json").get_json()
+    assert set(exported) == {"schemaVersion", "job", "posts"}
+    assert exported["schemaVersion"] == 4
+    assert exported["posts"][0]["media"] is None
+
+    csv_response = client.get(f"/api/jobs/{job_id}/export?format=csv")
+    csv_row = next(csv.DictReader(io.StringIO(csv_response.get_data(as_text=True))))
+    assert csv_row["provider"] == "playwright_browser"
+    assert csv_row["text"].startswith("'=SUM(1,1)")
+    assert csv_row["media"] == ""
+    assert csv_row["post_resources_returned"] == ""
+
+
+def test_official_preview_collection_cost_and_full_archive_regression(tmp_path):
+    client, app = make_client(tmp_path, token=True)
+    preview, job_id = run_collection(client, app, official_body())
+
+    assert preview["compiledIntent"]["query"] == "(python) -is:reply"
+    assert preview["costEstimate"]["unitPricesUsd"] == UNIT_PRICES_USD
+    job = client.get(f"/api/jobs/{job_id}").get_json()
+    assert job["provider"] == "official_x_api"
+    assert job["resourcesReturned"] == {"posts": 1, "users": 1, "media": 0}
+    assert job["cost"]["returnedListPriceEstimateUsd"] == 0.015
+    assert job["rateLimit"]["remaining"] == 44
+
+    archive = client.post(
+        "/api/collections/preview",
+        json=official_body(
+            searchMode="fullArchive", startDate="2020-01-01", endDate="2020-01-02"
+        ),
+    ).get_json()
+    assert archive["compiledIntent"]["endpoint"] == ARCHIVE_ENDPOINT
+    assert archive["compiledIntent"]["endTime"] == "2020-01-03T00:00:00Z"
+
+
+def test_partial_browser_snapshot_is_labeled(tmp_path):
+    client, app = make_client(tmp_path, partial=True)
+    _, job_id = run_collection(
+        client,
+        app,
+        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 5},
     )
+    job = client.get(f"/api/jobs/{job_id}").get_json()
+    assert job["status"] == "partial"
+    assert job["isPartial"] is True
+    assert job["completionReason"] == "no_progress"
 
 
-def test_api_rejects_non_json_mutations_and_non_loopback_hosts(tmp_path):
-    client, _, _ = make_client(tmp_path)
-
+def test_security_headers_loopback_and_dashboard_do_not_autoload_remote_media(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.get("/")
+    assert "img-src 'self' data:;" in response.headers["Content-Security-Policy"]
+    image_policy = response.headers["Content-Security-Policy"].split("img-src", 1)[1]
+    assert "https:" not in image_policy.split(";", 1)[0]
     assert client.post("/api/collections/preview", data="{}").status_code == 415
-    forbidden = client.get("/api/health", headers={"Host": "example.com"})
-    assert forbidden.status_code == 403
-    assert forbidden.get_json()["error"]["code"] in {"local_only", "loopback_only"}
+    assert client.get("/api/health", headers={"Host": "example.com"}).status_code == 403
+
+    script = client.get("/app.js").get_data(as_text=True)
+    assert "image.src = source" not in script
+    assert "Open media" in script
