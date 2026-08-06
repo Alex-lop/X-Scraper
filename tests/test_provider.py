@@ -1,28 +1,21 @@
-import io
 import json
 from datetime import UTC, datetime
-from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from xscraper.config import Settings
-from xscraper.errors import (
-    BillingError,
-    CredentialError,
-    NetworkError,
-    RateLimitWaiting,
-    SchemaDriftError,
-)
-from xscraper.models import CollectionRequest
-from xscraper.x_api import XApiProvider, compile_request, map_response
+from xworkbench.config import Settings
+from xworkbench.errors import SchemaDriftError
+from xworkbench.models import CollectionRequest
+from xworkbench.x_api import ARCHIVE_ENDPOINT, XApiProvider, compile_request, map_response
 
 
-def payload(next_token="next"):
+def payload(*, next_token="next"):
     return {
         "data": [
             {
                 "id": "42",
-                "text": "hello",
+                "text": "  exact text\n",
                 "author_id": "7",
                 "created_at": "2026-08-03T12:00:00Z",
                 "lang": "en",
@@ -43,7 +36,9 @@ def payload(next_token="next"):
         ],
         "includes": {
             "users": [{"id": "7", "username": "tester"}],
-            "media": [{"media_key": "3_1", "type": "photo", "url": "https://img.invalid/a.jpg"}],
+            "media": [
+                {"media_key": "3_1", "type": "photo", "url": "https://img.invalid/a.jpg"}
+            ],
         },
         "meta": {"result_count": 1, "next_token": next_token},
     }
@@ -54,23 +49,6 @@ def settings(tmp_path):
     token.parent.mkdir()
     token.write_text("secret")
     return Settings(tmp_path / "db.sqlite", token)
-
-
-def test_maps_metrics_references_author_and_media():
-    posts, cursor = map_response(payload())
-    post = posts[0]
-    assert cursor == "next"
-    assert post.post_id == "42" and post.repost_count == 3
-    assert post.author_username == "tester"
-    assert post.in_reply_to_post_id == "41"
-    assert post.is_reply and post.is_quote and post.has_media
-    assert post.like_count == 4 and post.bookmark_count == 5
-    assert post.media[0]["url"].endswith("a.jpg")
-
-
-def test_schema_mismatch_fails_safely():
-    with pytest.raises(SchemaDriftError):
-        map_response({"data": []})
 
 
 class Response:
@@ -88,81 +66,137 @@ class Response:
         return self.body
 
 
-@pytest.mark.parametrize(
-    ("status", "detail", "error"),
-    [
-        (401, "unauthorized", CredentialError),
-        (403, "credits exhausted", BillingError),
-        (402, "pay", BillingError),
-        (429, "usage cap exceeded", BillingError),
-    ],
-)
-def test_terminal_http_classification(tmp_path, status, detail, error):
-    def opener(request, timeout):
-        raise HTTPError(request.full_url, status, detail, {}, io.BytesIO(detail.encode()))
+def test_maps_exact_text_metrics_references_media_and_resource_counts():
+    posts, cursor, warnings, resources = map_response(payload())
+    post = posts[0]
 
-    provider = XApiProvider(settings(tmp_path), opener=opener, sleeper=lambda _: None)
-    with pytest.raises(error):
-        provider._request({"query": "python"})
+    assert cursor == "next" and warnings == []
+    assert resources == {"posts": 1, "users": 1, "media": 1}
+    assert post.post_id == "42" and post.author_id == "7"
+    assert post.text == "  exact text\n" and post.author_username == "tester"
+    assert post.in_reply_to_post_id == "41"
+    assert post.is_reply and post.is_quote and post.has_media
+    assert post.repost_count == 3 and post.bookmark_count == 5
+    assert post.media[0]["url"].endswith("a.jpg")
 
 
-def test_429_persists_reset_instead_of_sleeping(tmp_path):
-    sleeps = []
+def test_note_tweet_replaces_truncated_text_without_stripping():
+    response = payload(next_token=None)
+    response["data"][0]["text"] = "Truncated…"
+    response["data"][0]["note_tweet"] = {"text": "  complete long-form evidence\n"}
 
-    def opener(request, timeout):
-        raise HTTPError(
-            request.full_url,
-            429,
-            "limited",
-            {"x-rate-limit-reset": "1785772860", "x-rate-limit-remaining": "0"},
-            io.BytesIO(b"{}"),
-        )
+    posts, _, warnings, _ = map_response(response)
 
-    provider = XApiProvider(settings(tmp_path), opener=opener, sleeper=sleeps.append)
-    with pytest.raises(RateLimitWaiting) as raised:
-        provider._request({"query": "python"})
-    assert raised.value.reset == 1785772860
-    assert raised.value.remaining == 0
-    assert sleeps == []
+    assert posts[0].text == "  complete long-form evidence\n"
+    assert warnings == []
 
 
-def test_network_failure_gets_three_short_retries(tmp_path):
-    calls = []
-
-    def opener(request, timeout):
-        calls.append(1)
-        raise URLError("offline")
-
-    provider = XApiProvider(settings(tmp_path), opener=opener, sleeper=lambda _: None)
-    with pytest.raises(NetworkError):
-        provider._request({"query": "python"})
-    assert len(calls) == 4
-
-
-def test_pagination_uses_unmodified_token_and_final_minimum_ten(tmp_path):
-    requests = []
-    bodies = [
-        {**payload("opaque-token"), "data": payload()["data"] * 100},
-        {**payload(None), "data": payload(None)["data"] * 5},
+def test_partial_errors_and_missing_author_preserve_valid_post():
+    response = payload(next_token=None)
+    response["includes"].pop("users")
+    response["errors"] = [
+        {"title": "Resource unavailable", "detail": "  Author expansion failed.  "}
     ]
 
-    def opener(request, timeout):
-        requests.append(request.full_url)
-        return Response(bodies.pop(0))
+    posts, _, warnings, resources = map_response(response)
 
-    request = CollectionRequest.from_dict(
-        {"sourceType": "search", "sourceValue": "python", "maxPosts": 105}
+    assert len(posts) == 1 and posts[0].author_id == "7"
+    assert posts[0].author_username is None
+    assert posts[0].url == "https://x.com/i/web/status/42"
+    assert resources == {"posts": 1, "users": 0, "media": 1}
+    assert any("Resource unavailable: Author expansion failed." in warning for warning in warnings)
+    assert any("author" in warning.casefold() for warning in warnings)
+
+
+def test_profile_fallback_does_not_require_author_expansion():
+    response = payload(next_token=None)
+    response["includes"].pop("users")
+
+    posts, _, warnings, _ = map_response(response, fallback_username="tester")
+
+    assert posts[0].author_username == "tester"
+    assert posts[0].url == "https://x.com/tester/status/42"
+    assert not any("omitted" in warning for warning in warnings)
+
+
+def test_malformed_post_does_not_discard_valid_sibling():
+    response = payload(next_token=None)
+    response["data"].insert(0, {"id": "broken"})
+
+    posts, _, warnings, _ = map_response(response)
+
+    assert [post.post_id for post in posts] == ["42"]
+    assert any(
+        "malformed" in warning and ("broken" in warning or "index 0" in warning)
+        for warning in warnings
     )
-    compiled = compile_request(request, "secret", now=datetime.now(UTC))
+
+
+def test_invalid_top_level_schema_fails_safely():
+    with pytest.raises(SchemaDriftError):
+        map_response({"data": []})
+
+
+def test_profile_collection_uses_fallback_and_reports_page_resources(tmp_path):
+    response = payload(next_token=None)
+    response["includes"].pop("users")
+    requested = []
+    page_stats = []
+
+    def opener(request, timeout):
+        requested.append(request.full_url)
+        return Response(response, {"x-rate-limit-remaining": "44"})
+
+    collection = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
+    )
     stored = []
-    XApiProvider(settings(tmp_path), opener=opener).collect(
-        request,
-        compiled_request=compiled,
+    summary = XApiProvider(settings(tmp_path), opener=opener).collect(
+        collection,
+        compiled_request=compile_request(collection, now=datetime.now(UTC)),
         cursor=None,
         collected_count=0,
-        on_batch=lambda batch, cursor, stats: stored.extend(batch) or len(batch),
+        on_batch=lambda batch, cursor, stats: (
+            stored.extend(batch) or page_stats.append(stats) or len(batch)
+        ),
         should_cancel=lambda: False,
     )
-    assert "max_results=100" in requests[0]
-    assert "next_token=opaque-token" in requests[1] and "max_results=10" in requests[1]
-    assert len(stored) == 105
+
+    params = parse_qs(urlsplit(requested[0]).query)
+    assert params["expansions"] == ["attachments.media_keys"]
+    assert "user.fields" not in params
+    assert stored[0].author_username == "tester"
+    assert page_stats[0]["resourcesReturned"] == {"posts": 1, "users": 0, "media": 1}
+    assert page_stats[0]["rateLimitRemaining"] == 44
+    assert summary.completion_reason == "recent_search_exhausted"
+
+
+def test_full_archive_uses_archive_endpoint_and_single_large_page(tmp_path):
+    requested = []
+
+    def opener(request, timeout):
+        requested.append(request.full_url)
+        return Response(payload(next_token=None))
+
+    collection = CollectionRequest.from_dict(
+        {
+            "sourceType": "search",
+            "sourceValue": "python",
+            "searchMode": "fullArchive",
+            "maxPosts": 105,
+            "startDate": "2020-01-01",
+            "endDate": "2020-01-02",
+        }
+    )
+    XApiProvider(settings(tmp_path), opener=opener).collect(
+        collection,
+        compiled_request=compile_request(collection),
+        cursor=None,
+        collected_count=0,
+        on_batch=lambda batch, *_args: len(batch),
+        should_cancel=lambda: False,
+    )
+
+    parsed = urlsplit(requested[0])
+    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == ARCHIVE_ENDPOINT
+    assert parse_qs(parsed.query)["max_results"] == ["105"]

@@ -42,14 +42,14 @@ class JobService:
                     self._lock_path.unlink(missing_ok=True)
                     continue
                 raise RuntimeError(
-                    "Another xscraper worker process is already using this database."
+                    "Another xworkbench worker process is already using this database."
                 ) from None
             with os.fdopen(descriptor, "w") as lock_file:
                 lock_file.write(f"{os.getpid()} {self.worker_id}\n")
             self._lock_owned = True
             atexit.register(self.shutdown)
             return
-        raise RuntimeError("Could not acquire the xscraper worker process lock.")
+        raise RuntimeError("Could not acquire the xworkbench worker process lock.")
 
     def _release_process_lock(self) -> None:
         if not self._lock_owned:
@@ -70,7 +70,7 @@ class JobService:
         except Exception:
             self._release_process_lock()
             raise
-        self._thread = threading.Thread(target=self._worker, name="xscraper-worker", daemon=True)
+        self._thread = threading.Thread(target=self._worker, name="xworkbench-worker", daemon=True)
         self._thread.start()
         for job_id in recovered:
             self.enqueue(job_id)
@@ -113,6 +113,18 @@ class JobService:
         if job["collected_count"] >= request.max_posts:
             self.storage.finish_job(job_id, job["warnings"], completion_reason="target_reached")
             return
+        if job["post_resource_count"] >= job["compiled_request"]["maximumPostResources"]:
+            self.storage.finish_job(
+                job_id,
+                list(
+                    dict.fromkeys(
+                        [*job["warnings"], "Stopped at the confirmed Post-resource limit."]
+                    )
+                ),
+                completion_reason="post_resource_limit_reached",
+                partial=True,
+            )
+            return
 
         def on_batch(posts, cursor, page_stats):
             return self.storage.add_posts(job_id, posts, cursor, page_stats)
@@ -123,6 +135,7 @@ class JobService:
                 compiled_request=job["compiled_request"],
                 cursor=job["cursor"],
                 collected_count=int(job["collected_count"]),
+                returned_post_count=int(job["post_resource_count"]),
                 on_batch=on_batch,
                 should_cancel=lambda: (
                     self._stop_event.is_set() or self.storage.cancel_requested(job_id)
@@ -132,9 +145,10 @@ class JobService:
             if current and current["collected_count"] >= request.max_posts:
                 summary.completion_reason = "target_reached"
                 summary.partial = False
+            persisted_warnings = current["warnings"] if current else job["warnings"]
             self.storage.finish_job(
                 job_id,
-                list(dict.fromkeys([*job["warnings"], *summary.warnings])),
+                list(dict.fromkeys([*persisted_warnings, *summary.warnings])),
                 completion_reason=summary.completion_reason,
                 partial=summary.partial,
             )

@@ -24,4 +24,30 @@ jobs:
       - run: pip install -e . --no-deps
       - run: ruff check .
       - run: pytest
-      - run: node --check xscraper/static/app.js
+      - run: node --check xworkbench/static/app.js
+      - run: node --test tests/test_analysis.mjs
+      - run: python -m pip wheel . --no-deps --wheel-dir dist
+      - name: Inspect packaged CLI and static assets
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("x_collection_workbench-*.whl"))
+          assert len(wheels) == 1, wheels
+          with ZipFile(wheels[0]) as wheel:
+              names = set(wheel.namelist())
+              assert {
+                  "xworkbench/cli.py",
+                  "xworkbench/static/analysis.js",
+                  "xworkbench/static/app.js",
+                  "xworkbench/static/index.html",
+                  "xworkbench/static/styles.css",
+              } <= names
+              assert not any(name.startswith("xscraper/") for name in names)
+              assert not any(name.endswith("mcp_server.py") for name in names)
+              entry_points = next(name for name in names if name.endswith("entry_points.txt"))
+              scripts = wheel.read(entry_points).decode()
+              assert "xworkbench = xworkbench.cli:main" in scripts
+              assert "xscraper =" not in scripts
+          PY

@@ -4,7 +4,6 @@ import csv
 import io
 import ipaddress
 import json
-from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -16,25 +15,48 @@ from .errors import InvalidRequestError
 from .jobs import JobService
 from .models import CollectionRequest
 from .storage import Storage
-from .x_api import XApiProvider, compile_request, validate_compiled_request
+from .x_api import (
+    UNIT_PRICES_USD,
+    XApiProvider,
+    compile_request,
+    returned_list_price,
+    validate_compiled_request,
+)
 
 EXPORT_FIELDS = [
-    "tweet_id",
+    "schema_version",
+    "collection_id",
+    "collection_status",
+    "completion_reason",
+    "warnings",
+    "provider",
+    "provider_version",
+    "compiler_version",
+    "search_mode",
+    "endpoint",
+    "effective_query",
+    "start_time",
+    "end_time",
+    "post_resources_returned",
+    "user_resources_returned",
+    "media_resources_returned",
+    "post_id",
     "text",
+    "author_id",
     "author_username",
     "url",
     "created_at",
-    "scraped_at",
+    "observed_at",
     "language",
     "conversation_id",
-    "in_reply_to_tweet_id",
+    "in_reply_to_post_id",
     "like_count",
     "reply_count",
-    "retweet_count",
+    "repost_count",
     "quote_count",
     "bookmark_count",
     "is_reply",
-    "is_retweet",
+    "is_repost",
     "is_quote",
     "has_media",
     "media",
@@ -43,13 +65,36 @@ EXPORT_FIELDS = [
 
 def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     compiled = job["compiled_request"]
+    unit_prices = compiled.get("unitPricesUsd", UNIT_PRICES_USD)
+    resources = {
+        "posts": job.get("post_resource_count", 0),
+        "users": job.get("user_resource_count", 0),
+        "media": job.get("media_resource_count", 0),
+    }
+    provenance_fields = (
+        "provider",
+        "providerVersion",
+        "compilerVersion",
+        "searchMode",
+        "endpoint",
+        "query",
+        "queryLength",
+        "startTime",
+        "endTime",
+        "sortOrder",
+        "tweetFields",
+        "expansions",
+        "userFields",
+        "mediaFields",
+        "compiledAt",
+    )
     return {
         "id": job["id"],
         "request": job["request"],
         "status": job["status"],
         "targetCount": job["request"]["maxPosts"],
         "collectedCount": job["collected_count"],
-        "readCount": job.get("billable_read_count", 0),
+        "resourcesReturned": resources,
         "warnings": job["warnings"],
         "error": (
             {
@@ -67,12 +112,18 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
             "remaining": job.get("rate_limit_remaining"),
             "reset": job.get("rate_limit_reset"),
         },
+        "provenance": {name: compiled[name] for name in provenance_fields},
         "cost": {
-            "maximumPostReads": compiled["maxBillableReads"],
-            "estimatedPostReadUsd": compiled["estimatedPostReadUsd"],
-            "actualPostReads": job.get("billable_read_count", 0),
+            "basis": "list_price_pre_dedup",
+            "unitPricesUsd": unit_prices,
+            "returnedListPriceEstimateUsd": returned_list_price(resources, unit_prices),
+            "maximumPostResources": compiled["maximumPostResources"],
+            "maximumPostListPriceUsd": compiled["maximumPostListPriceUsd"],
             "pricingAsOf": compiled["pricingAsOf"],
-            "estimateScope": "posts_only",
+            "note": (
+                "List-price estimate before X daily resource deduplication; "
+                "it is not an invoice total."
+            ),
         },
         "isPartial": job["status"] == "partial"
         or (job["collected_count"] > 0 and job["status"] in {"failed", "cancelled", "interrupted"}),
@@ -90,7 +141,7 @@ def _error(code: str, message: str, status: int):
 def _request_body(body: Any) -> CollectionRequest:
     if not isinstance(body, dict):
         raise InvalidRequestError("Request body must be a JSON object.")
-    controls = {"confirmPaidRead", "forceRefresh", "compiledRequest"}
+    controls = {"confirmPaidRead", "compiledRequest"}
     return CollectionRequest.from_dict(
         {key: value for key, value in body.items() if key not in controls}
     )
@@ -102,10 +153,7 @@ def create_app(
     storage: Storage | None = None,
     provider: XApiProvider | None = None,
     start_worker: bool = True,
-    demo_mode: str | None = None,
 ) -> Flask:
-    if demo_mode not in {None, "offline", "live"}:
-        raise ValueError("demo_mode must be 'offline', 'live', or None.")
     settings = settings or Settings.from_env()
     settings.ensure_runtime_dirs()
     storage = storage or Storage(settings.database_path)
@@ -115,10 +163,10 @@ def create_app(
 
     app = Flask(__name__, static_folder="static", static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
-    app.extensions["xscraper_jobs"] = jobs
+    app.extensions["xworkbench_jobs"] = jobs
 
     @app.before_request
-    def require_local_host():
+    def require_local_host_and_json_mutations():
         hostname = urlsplit(f"//{request.host}").hostname
         allowed = hostname == "localhost"
         if hostname and not allowed:
@@ -128,9 +176,36 @@ def create_app(
                 allowed = False
         if not allowed:
             return _error("local_only", "Only loopback hosts are accepted.", 403)
+        remote = request.remote_addr
+        if remote:
+            try:
+                if not ipaddress.ip_address(remote).is_loopback:
+                    return _error("local_only", "Only loopback clients are accepted.", 403)
+            except ValueError:
+                return _error("local_only", "Only loopback clients are accepted.", 403)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not request.is_json:
+            return _error(
+                "json_required",
+                "State-changing requests require Content-Type: application/json.",
+                415,
+            )
+
+    @app.after_request
+    def secure_local_response(response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'self'; connect-src 'self'; "
+            "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+            "img-src 'self' data: https:; object-src 'none'; script-src 'self'; "
+            "style-src 'self'"
+        )
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
 
     @app.errorhandler(RequestEntityTooLarge)
-    def request_too_large(_error):
+    def request_too_large(_exception):
         return _error("request_too_large", "Request body is too large.", 413)
 
     @app.get("/")
@@ -143,42 +218,24 @@ def create_app(
 
     @app.get("/api/connection")
     def connection():
-        if demo_mode == "offline":
-            return jsonify(
-                {
-                    "status": "offline_demo",
-                    "valid": False,
-                    "source": "none",
-                    "message": "Offline demo data; no X API calls are available.",
-                    "demoMode": "offline",
-                }
-            )
-        return jsonify({**settings.connection_status(), "demoMode": demo_mode})
+        status = settings.connection_status()
+        return jsonify(
+            {
+                "status": status["status"],
+                "configured": bool(status["valid"]),
+                "source": status["source"],
+                "message": status["message"],
+            }
+        )
 
     @app.post("/api/collections/preview")
     def preview_collection():
-        if demo_mode == "offline":
-            return _error(
-                "offline_demo_read_disabled",
-                "Offline demo mode cannot make X API reads.",
-                409,
-            )
         try:
             collection_request = _request_body(request.get_json(silent=True))
-            if demo_mode == "live" and collection_request.max_posts != 10:
-                return _error(
-                    "demo_post_limit",
-                    "Live demo collections are limited to exactly 10 Posts.",
-                    400,
-                )
             token = settings.bearer_token()
             if not token:
-                return _error("connection_missing", "Run: xscraper configure", 409)
+                return _error("connection_missing", "Run: xworkbench configure", 409)
             compiled = compile_request(collection_request, token)
-            cutoff = (datetime.now(UTC) - timedelta(minutes=15)).isoformat()
-            cached = storage.find_cached_job(
-                compiled["requestFingerprint"], compiled["accountScope"], cutoff=cutoff
-            )
         except InvalidRequestError as exc:
             return _error(exc.code, str(exc), 400)
         return jsonify(
@@ -186,35 +243,34 @@ def create_app(
                 "request": collection_request.to_dict(),
                 "compiledRequest": compiled,
                 "compiledIntent": {
+                    "searchMode": compiled["searchMode"],
                     "endpoint": compiled["endpoint"],
                     "query": compiled["query"],
+                    "compiledLength": compiled["queryLength"],
                     "startTime": compiled["startTime"],
                     "endTime": compiled["endTime"],
                     "sortOrder": compiled["sortOrder"],
+                    "expiresAt": compiled["expiresAt"],
                 },
-                "maximumPostReads": compiled["maxBillableReads"],
-                "estimatedPostReadUsd": compiled["estimatedPostReadUsd"],
-                "pricingAsOf": compiled["pricingAsOf"],
-                "pricingUrl": "https://docs.x.com/x-api/getting-started/pricing",
-                "billingWarning": (
-                    "Post-read estimate only. Author and media expansions may be billed "
-                    "separately; actual billing and deduplication may differ. Use the X "
-                    "Developer Console spending limit as the hard cap."
-                ),
-                "estimateScope": "posts_only",
-                "cacheAvailable": bool(cached),
-                "cachedJobId": cached["id"] if cached else None,
+                "costEstimate": {
+                    "basis": "list_price_pre_dedup",
+                    "maximumPostResources": compiled["maximumPostResources"],
+                    "maximumPostListPriceUsd": compiled["maximumPostListPriceUsd"],
+                    "unitPricesUsd": UNIT_PRICES_USD,
+                    "variableResources": ["users", "media"],
+                    "pricingAsOf": compiled["pricingAsOf"],
+                    "pricingUrl": "https://docs.x.com/x-api/getting-started/pricing",
+                    "note": (
+                        "User and media resources vary with the response. Estimates use "
+                        "list prices before X daily resource deduplication and are not an "
+                        "invoice total. Set the hard spending limit in the Developer Console."
+                    ),
+                },
             }
         )
 
     @app.post("/api/jobs")
     def create_job():
-        if demo_mode == "offline":
-            return _error(
-                "offline_demo_read_disabled",
-                "Offline demo mode cannot make X API reads.",
-                409,
-            )
         if not request.is_json:
             return _error("invalid_request", "Content-Type must be application/json.", 415)
         body = request.get_json(silent=True)
@@ -222,44 +278,19 @@ def create_app(
             collection_request = _request_body(body)
             if not isinstance(body, dict):
                 raise InvalidRequestError("Request body must be a JSON object.")
-            for name in ("confirmPaidRead", "forceRefresh"):
-                if name in body and not isinstance(body[name], bool):
-                    raise InvalidRequestError(f"{name} must be a boolean.")
-            if demo_mode == "live" and collection_request.max_posts != 10:
-                return _error(
-                    "demo_post_limit",
-                    "Live demo collections are limited to exactly 10 Posts.",
-                    400,
-                )
-            if demo_mode == "live" and body.get("forceRefresh", False):
-                return _error(
-                    "demo_force_refresh_disabled",
-                    "Force refresh is disabled in live demo mode.",
-                    400,
-                )
+            if "confirmPaidRead" in body and not isinstance(body["confirmPaidRead"], bool):
+                raise InvalidRequestError("confirmPaidRead must be a boolean.")
             token = settings.bearer_token()
             if not token:
-                return _error("connection_missing", "Run: xscraper configure", 409)
+                return _error("connection_missing", "Run: xworkbench configure", 409)
             compiled = body.get("compiledRequest")
             validate_compiled_request(collection_request, compiled, token)
-            cutoff = (datetime.now(UTC) - timedelta(minutes=15)).isoformat()
-            cached = (
-                None
-                if body.get("forceRefresh", False)
-                else storage.find_cached_job(
-                    compiled["requestFingerprint"], compiled["accountScope"], cutoff=cutoff
-                )
-            )
-            if cached:
-                return jsonify(
-                    {"jobId": cached["id"], "status": cached["status"], "cacheHit": True}
-                )
             if body.get("confirmPaidRead") is not True:
                 raise InvalidRequestError("confirmPaidRead must be true for a paid X API read.")
         except InvalidRequestError as exc:
             return _error(exc.code, str(exc), 400)
         job_id = jobs.submit(collection_request, compiled)
-        return jsonify({"jobId": job_id, "status": "queued", "cacheHit": False}), 202
+        return jsonify({"jobId": job_id, "status": "queued"}), 202
 
     @app.get("/api/jobs")
     def list_jobs():
@@ -301,13 +332,21 @@ def create_app(
             }
         )
 
-    @app.delete("/api/jobs/<job_id>")
+    @app.post("/api/jobs/<job_id>/cancel")
     def cancel_job(job_id: str):
         if not storage.get_job(job_id):
             return _error("not_found", "Job not found.", 404)
         if not jobs.cancel(job_id):
             return _error("invalid_state", "Job cannot be cancelled.", 409)
         return jsonify({"status": "cancelling"}), 202
+
+    @app.delete("/api/jobs/<job_id>")
+    def delete_job(job_id: str):
+        if not storage.get_job(job_id):
+            return _error("not_found", "Job not found.", 404)
+        if not storage.delete_job(job_id):
+            return _error("invalid_state", "Only terminal jobs can be deleted.", 409)
+        return Response(status=204)
 
     @app.post("/api/jobs/<job_id>/resume")
     def resume_job(job_id: str):
@@ -331,11 +370,12 @@ def create_app(
             "X-Completion-Reason": job.get("completion_reason") or "",
             "X-Result-Count": str(len(rows)),
             "X-Snapshot-At": job["updated_at"],
+            "X-Search-Mode": job["compiled_request"]["searchMode"],
         }
         if export_format == "json":
             return Response(
                 json.dumps(
-                    {"schemaVersion": 2, "job": _public_job(job), "posts": rows},
+                    {"schemaVersion": 3, "job": _public_job(job), "posts": rows},
                     indent=2,
                     ensure_ascii=False,
                 ),
@@ -349,11 +389,32 @@ def create_app(
             stream = io.StringIO()
             writer = csv.DictWriter(stream, fieldnames=EXPORT_FIELDS, extrasaction="ignore")
             writer.writeheader()
+            public_job = _public_job(job)
+            provenance = public_job["provenance"]
+            resources = public_job["resourcesReturned"]
             for row in rows:
-                row = dict(row)
+                row = {
+                    "schema_version": 3,
+                    "collection_id": job_id,
+                    "collection_status": job["status"],
+                    "completion_reason": job.get("completion_reason"),
+                    "warnings": json.dumps(job["warnings"], ensure_ascii=False),
+                    "provider": provenance["provider"],
+                    "provider_version": provenance["providerVersion"],
+                    "compiler_version": provenance["compilerVersion"],
+                    "search_mode": provenance["searchMode"],
+                    "endpoint": provenance["endpoint"],
+                    "effective_query": provenance["query"],
+                    "start_time": provenance["startTime"],
+                    "end_time": provenance["endTime"],
+                    "post_resources_returned": resources["posts"],
+                    "user_resources_returned": resources["users"],
+                    "media_resources_returned": resources["media"],
+                    **row,
+                }
                 row["media"] = json.dumps(row.get("media", []), ensure_ascii=False)
                 for field, value in row.items():
-                    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+                    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
                         row[field] = f"'{value}"
                 writer.writerow(row)
             return Response(

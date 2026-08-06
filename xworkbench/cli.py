@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import ipaddress
-import json
 import logging
 import os
 import socket
@@ -20,14 +19,11 @@ from werkzeug.serving import make_server
 
 from .api import create_app
 from .config import Settings
-from .errors import CollectionError, InvalidRequestError
-from .models import CollectionRequest, Post, normalize_profile
+from .models import CollectionRequest, Post
 from .storage import SCHEMA_FAMILY, SCHEMA_VERSION, Storage
-from .x_api import XApiProvider, compile_request
+from .x_api import compile_request
 
 EXIT_PRECONDITION = 2
-MAX_SMOKE_POST_READS = 10
-SMOKE_POST_READ_ESTIMATE_USD = 0.05
 
 
 def _port(value: str) -> int:
@@ -38,12 +34,12 @@ def _port(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local official-X-API analyst workbench")
+    parser = argparse.ArgumentParser(description="Local official-X-API collection workbench")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("configure", help="Save an X API Bearer Token locally")
 
-    doctor = commands.add_parser("doctor", help="Check demo prerequisites without paid reads")
-    doctor.add_argument("--live", action="store_true", help="Require a configured X token")
+    doctor = commands.add_parser("doctor", help="Check local prerequisites without paid reads")
+    doctor.add_argument("--require-token", action="store_true", help="Require a configured X token")
     doctor.add_argument("--port", type=_port, default=0, help="Check a port; 0 means any free port")
 
     serve = commands.add_parser("serve", help="Run the loopback dashboard and API")
@@ -51,19 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=_port, default=5000)
     serve.add_argument("--no-open", action="store_true", help="Do not open the dashboard")
 
-    demo = commands.add_parser("demo", help="Run an isolated, guarded demo")
-    demo.add_argument("--live", action="store_true", help="Enable guarded official X API reads")
+    demo = commands.add_parser("demo", help="Run an isolated synthetic-data demo")
     demo.add_argument("--port", type=_port, default=0, help="Use 0 to select a free port")
     demo.add_argument("--no-open", action="store_true", help="Do not open the dashboard")
-
-    mcp = commands.add_parser("mcp", help="Run the optional MCP-to-REST bridge over stdio")
-    mcp.add_argument("--url", default="http://127.0.0.1:5000")
-
-    smoke = commands.add_parser("smoke", help="Run an opt-in paid API smoke check")
-    smoke_commands = smoke.add_subparsers(dest="smoke_command", required=True)
-    api = smoke_commands.add_parser("api", help="Read at most 10 Posts through recent search")
-    api.add_argument("--profile", required=True)
-    api.add_argument("--confirm-paid-x", action="store_true")
     return parser
 
 
@@ -90,37 +76,6 @@ def _configure(settings: Settings) -> int:
     return 0
 
 
-def _run_api_smoke(settings: Settings, profile: str) -> dict[str, object]:
-    token = settings.bearer_token()
-    if not token:
-        raise RuntimeError("No X API Bearer Token. Run: xscraper configure")
-    collection = CollectionRequest.from_dict(
-        {"sourceType": "profile", "sourceValue": profile, "maxPosts": MAX_SMOKE_POST_READS}
-    )
-    posts = []
-
-    def save(batch, _cursor, _stats):
-        posts.extend(batch)
-        return len(batch)
-
-    summary = XApiProvider(settings).collect(
-        collection,
-        compiled_request=compile_request(collection, token),
-        cursor=None,
-        collected_count=0,
-        on_batch=save,
-        should_cancel=lambda: False,
-    )
-    return {
-        "status": "passed",
-        "posts": len(posts),
-        "maximumPostReads": MAX_SMOKE_POST_READS,
-        "estimatedPostReadUsd": SMOKE_POST_READ_ESTIMATE_USD,
-        "estimateScope": "posts_only",
-        "completionReason": summary.completion_reason,
-    }
-
-
 def _database_ready(path: Path) -> tuple[bool, str]:
     if not path.exists() or path.stat().st_size == 0:
         return True, f"new database will be created at {path}"
@@ -136,7 +91,7 @@ def _database_ready(path: Path) -> tuple[bool, str]:
     return valid, (f"database ready at {path}" if valid else f"database at {path} is incompatible")
 
 
-def _doctor(settings: Settings, *, live: bool, port: int) -> int:
+def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
     failures = []
 
     def result(ok: bool, message: str) -> None:
@@ -156,10 +111,10 @@ def _doctor(settings: Settings, *, live: bool, port: int) -> int:
     ready, message = _database_ready(settings.database_path)
     result(ready, message)
 
-    if live:
+    if require_token:
         token = settings.bearer_token()
-        result(bool(token), "Bearer Token configured" if token else "run: xscraper configure")
-        if token and not os.environ.get("XSCRAPER_X_BEARER_TOKEN", "").strip():
+        result(bool(token), "Bearer Token configured" if token else "run: xworkbench configure")
+        if token and not os.environ.get("XWORKBENCH_X_BEARER_TOKEN", "").strip():
             try:
                 mode = stat.S_IMODE(settings.bearer_token_path.stat().st_mode)
                 result(mode == 0o600, "token file permissions are 0600")
@@ -173,7 +128,7 @@ def _doctor(settings: Settings, *, live: bool, port: int) -> int:
     except OSError:
         result(False, f"port {port} is unavailable; use --port 0")
 
-    if live:
+    if require_token:
         print(
             "WARN  Token validity and credits are not checked without a paid read. "
             "Verify credits and a spending limit in the X Developer Console."
@@ -190,9 +145,9 @@ def _seed_offline_demo(storage: Storage) -> str:
     compiled = compile_request(request, "offline-demo-token")
     compiled.update(
         provider="offline_demo",
-        maxBillableReads=0,
-        estimatedPostReadUsd=0.0,
-        pricePerPostUsd=0.0,
+        maximumPostResources=0,
+        maximumPostListPriceUsd=0.0,
+        unitPricesUsd={"post": 0.0, "user": 0.0, "media": 0.0},
         pricingAsOf="not applicable",
     )
     now = datetime.now(UTC).replace(microsecond=0)
@@ -229,7 +184,12 @@ def _seed_offline_demo(storage: Storage) -> str:
     ]
     job_id = storage.create_job(request, compiled)
     storage.claim_job(job_id)
-    storage.add_posts(job_id, posts, None, {"billableReads": 0})
+    storage.add_posts(
+        job_id,
+        posts,
+        None,
+        {"resourcesReturned": {"posts": 0, "users": 0, "media": 0}},
+    )
     storage.finish_job(
         job_id,
         ["Synthetic offline demo; no X API request was made."],
@@ -250,11 +210,11 @@ def _run_server(app, host: str, port: int, *, open_browser: bool) -> int:
         server = make_server(host, port, app, threaded=True)
     except OSError:
         print(f"Cannot bind {host}:{port}; choose another port or use --port 0.", file=sys.stderr)
-        app.extensions["xscraper_jobs"].shutdown()
+        app.extensions["xworkbench_jobs"].shutdown()
         return EXIT_PRECONDITION
     display_host = f"[{host}]" if ":" in host else host
     url = f"http://{display_host}:{server.server_port}"
-    print(f"X API Analyst running at {url} (Ctrl+C to stop)")
+    print(f"X Collection Workbench running at {url} (Ctrl+C to stop)")
     if open_browser:
         timer = threading.Timer(0.4, lambda: webbrowser.open(url))
         timer.daemon = True
@@ -262,32 +222,21 @@ def _run_server(app, host: str, port: int, *, open_browser: bool) -> int:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping X API Analyst.")
+        print("\nStopping X Collection Workbench.")
     finally:
         server.server_close()
-        app.extensions["xscraper_jobs"].shutdown()
+        app.extensions["xworkbench_jobs"].shutdown()
     return 0
 
 
-def _run_demo(settings: Settings, *, live: bool, port: int, open_browser: bool) -> int:
-    with tempfile.TemporaryDirectory(prefix="xscraper-demo-") as temporary:
+def _run_demo(*, port: int, open_browser: bool) -> int:
+    with tempfile.TemporaryDirectory(prefix="xworkbench-demo-") as temporary:
         root = Path(temporary)
-        demo_settings = Settings(
-            root / "demo.db",
-            settings.bearer_token_path if live else root / "no-token",
-        )
-        if live and _doctor(demo_settings, live=True, port=port) != 0:
-            return EXIT_PRECONDITION
+        demo_settings = Settings(root / "demo.db", root / "no-token", allow_environment_token=False)
         storage = Storage(demo_settings.database_path)
-        if not live:
-            _seed_offline_demo(storage)
-        mode = "live" if live else "offline"
-        print(
-            "LIVE DEMO: one 10-Post page, no force refresh."
-            if live
-            else "OFFLINE DEMO: synthetic data only; no X API calls."
-        )
-        app = create_app(demo_settings, storage=storage, demo_mode=mode)
+        _seed_offline_demo(storage)
+        print("OFFLINE DEMO: synthetic data only; no X API calls.")
+        app = create_app(demo_settings, storage=storage)
         return _run_server(app, "127.0.0.1", port, open_browser=open_browser)
 
 
@@ -298,30 +247,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "configure":
         return _configure(settings)
     if args.command == "doctor":
-        return _doctor(settings, live=args.live, port=args.port)
-    if args.command == "mcp":
-        from .mcp_server import run_mcp
-
-        run_mcp(args.url)
-        return 0
-    if args.command == "smoke":
-        if not args.confirm_paid_x:
-            print(
-                "Refusing paid X reads without --confirm-paid-x "
-                f"(10-Post read estimate ${SMOKE_POST_READ_ESTIMATE_USD:.2f}; "
-                "expansions may be billed separately).",
-                file=sys.stderr,
-            )
-            return EXIT_PRECONDITION
-        try:
-            report = _run_api_smoke(settings, normalize_profile(args.profile))
-        except (InvalidRequestError, CollectionError, RuntimeError) as exc:
-            print(f"API smoke failed: {exc}", file=sys.stderr)
-            return 1
-        print(json.dumps(report, indent=2))
-        return 0
+        return _doctor(settings, require_token=args.require_token, port=args.port)
     if args.command == "demo":
-        return _run_demo(settings, live=args.live, port=args.port, open_browser=not args.no_open)
+        return _run_demo(port=args.port, open_browser=not args.no_open)
     if not _is_loopback(args.host):
         raise SystemExit("Refusing a non-loopback host. This workbench is local-only.")
     return _run_server(

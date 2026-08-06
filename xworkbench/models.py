@@ -18,6 +18,11 @@ class SourceType(StrEnum):
     SEARCH = "search"
 
 
+class SearchMode(StrEnum):
+    RECENT = "recent"
+    FULL_ARCHIVE = "fullArchive"
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -62,6 +67,7 @@ def normalize_profile(value: str) -> str:
 class CollectionRequest:
     source_type: SourceType
     source_value: str
+    search_mode: SearchMode = SearchMode.RECENT
     max_posts: int = 25
     start_date: str | None = None
     end_date: str | None = None
@@ -75,6 +81,7 @@ class CollectionRequest:
         allowed = {
             "sourceType",
             "sourceValue",
+            "searchMode",
             "maxPosts",
             "startDate",
             "endDate",
@@ -88,6 +95,10 @@ class CollectionRequest:
             source_type = SourceType(str(body.get("sourceType", "")))
         except ValueError as exc:
             raise InvalidRequestError("sourceType must be 'profile' or 'search'.") from exc
+        try:
+            search_mode = SearchMode(str(body.get("searchMode", SearchMode.RECENT.value)))
+        except ValueError as exc:
+            raise InvalidRequestError("searchMode must be 'recent' or 'fullArchive'.") from exc
         raw_value = body.get("sourceValue")
         if not isinstance(raw_value, str):
             raise InvalidRequestError("sourceValue must be a string.")
@@ -96,8 +107,8 @@ class CollectionRequest:
             raise InvalidRequestError("sourceValue is required.")
         if source_type is SourceType.PROFILE:
             source_value = normalize_profile(source_value)
-        elif len(source_value) > 500:
-            raise InvalidRequestError("Search query cannot exceed 500 characters.")
+        elif len(source_value) > 1_024:
+            raise InvalidRequestError("Search query cannot exceed 1,024 characters.")
         max_posts = body.get("maxPosts", 25)
         if isinstance(max_posts, bool) or not isinstance(max_posts, int):
             raise InvalidRequestError("maxPosts must be an integer.")
@@ -107,12 +118,15 @@ class CollectionRequest:
         end_date = _parse_date(body.get("endDate"), "endDate")
         if start_date and end_date and start_date > end_date:
             raise InvalidRequestError("startDate cannot be after endDate.")
+        if search_mode is SearchMode.FULL_ARCHIVE and not (start_date and end_date):
+            raise InvalidRequestError("Full-archive search requires startDate and endDate.")
         for name in ("includeReplies", "mediaOnly"):
             if not isinstance(body.get(name, False), bool):
                 raise InvalidRequestError(f"{name} must be a boolean.")
         return cls(
             source_type=source_type,
             source_value=source_value,
+            search_mode=search_mode,
             max_posts=max_posts,
             start_date=start_date,
             end_date=end_date,
@@ -124,6 +138,7 @@ class CollectionRequest:
         return {
             "sourceType": self.source_type.value,
             "sourceValue": self.source_value,
+            "searchMode": self.search_mode.value,
             "maxPosts": self.max_posts,
             "startDate": self.start_date,
             "endDate": self.end_date,
@@ -136,18 +151,19 @@ class CollectionRequest:
 class Post:
     post_id: str
     text: str
-    author_username: str
+    author_username: str | None
     url: str
     created_at: str | None
+    author_id: str | None = None
     observed_at: str = field(default_factory=utc_now)
     language: str | None = None
     conversation_id: str | None = None
     in_reply_to_post_id: str | None = None
-    like_count: int = 0
-    reply_count: int = 0
-    repost_count: int = 0
-    quote_count: int = 0
-    bookmark_count: int = 0
+    like_count: int | None = None
+    reply_count: int | None = None
+    repost_count: int | None = None
+    quote_count: int | None = None
+    bookmark_count: int | None = None
     is_reply: bool = False
     is_repost: bool = False
     is_quote: bool = False

@@ -9,8 +9,60 @@ from typing import Any
 
 from .models import CollectionRequest, JobStatus, Post, utc_now
 
-SCHEMA_FAMILY = "official_x_api_mvp"
+SCHEMA_FAMILY = "x_collection_workbench"
 SCHEMA_VERSION = "1"
+SCHEMA_TABLES = {"schema_meta", "jobs", "post_observations"}
+SCHEMA_COLUMNS = {
+    "schema_meta": {"key", "value"},
+    "jobs": {
+        "id",
+        "request_json",
+        "compiled_request_json",
+        "status",
+        "collected_count",
+        "cursor",
+        "warnings_json",
+        "error_code",
+        "error_message",
+        "error_retryable",
+        "cancel_requested",
+        "completion_reason",
+        "retry_at",
+        "rate_limit_remaining",
+        "rate_limit_reset",
+        "post_resource_count",
+        "user_resource_count",
+        "media_resource_count",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "updated_at",
+    },
+    "post_observations": {
+        "job_id",
+        "post_id",
+        "position",
+        "text",
+        "author_id",
+        "author_username",
+        "url",
+        "created_at",
+        "observed_at",
+        "language",
+        "conversation_id",
+        "in_reply_to_post_id",
+        "like_count",
+        "reply_count",
+        "repost_count",
+        "quote_count",
+        "bookmark_count",
+        "is_reply",
+        "is_repost",
+        "is_quote",
+        "has_media",
+        "media_json",
+    },
+}
 
 
 class Storage:
@@ -39,48 +91,71 @@ class Storage:
                     )
                 }
                 if tables:
-                    metadata = (
-                        {
-                            row[0]: row[1]
-                            for row in connection.execute("SELECT key, value FROM schema_meta")
-                        }
-                        if "schema_meta" in tables
-                        else {}
-                    )
-                    if metadata.get("schema_family") != SCHEMA_FAMILY:
-                        raise RuntimeError(
-                            "This database uses the retired scraper schema. Point "
-                            "XSCRAPER_DB_PATH at a new file to use the official X API MVP."
-                        )
-                    if metadata.get("schema_version") != SCHEMA_VERSION:
-                        raise RuntimeError("This database schema version is not supported.")
+                    if tables != SCHEMA_TABLES:
+                        raise RuntimeError(self._incompatible_message())
+                    metadata = dict(connection.execute("SELECT key, value FROM schema_meta"))
+                    if metadata != {
+                        "schema_family": SCHEMA_FAMILY,
+                        "schema_version": SCHEMA_VERSION,
+                    } or not self._schema_is_compatible(connection):
+                        raise RuntimeError(self._incompatible_message())
+                else:
+                    self._create_schema(connection)
                 connection.execute("PRAGMA journal_mode = WAL")
-                self._create_schema(connection)
         except sqlite3.DatabaseError as exc:
             raise RuntimeError(
                 f"Cannot open database at {self.path}. The file was preserved for recovery."
             ) from exc
 
+    def _incompatible_message(self) -> str:
+        return (
+            f"Database at {self.path} is not a {SCHEMA_FAMILY} v{SCHEMA_VERSION} database. "
+            "Export it with its original release or use a new database path; it was not changed."
+        )
+
+    @staticmethod
+    def _schema_is_compatible(connection: sqlite3.Connection) -> bool:
+        details = {}
+        for table, expected in SCHEMA_COLUMNS.items():
+            rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            details[table] = {row["name"]: row for row in rows}
+            if set(details[table]) != expected:
+                return False
+        observations = details["post_observations"]
+        metrics = {
+            "like_count",
+            "reply_count",
+            "repost_count",
+            "quote_count",
+            "bookmark_count",
+        }
+        if any(observations[name]["notnull"] for name in metrics):
+            return False
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(post_observations)").fetchall()
+        return any(
+            row["table"] == "jobs"
+            and row["from"] == "job_id"
+            and row["to"] == "id"
+            and row["on_delete"].upper() == "CASCADE"
+            for row in foreign_keys
+        )
+
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS schema_meta (
+            CREATE TABLE schema_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            INSERT INTO schema_meta(key, value) VALUES
+                ('schema_family', 'x_collection_workbench'),
+                ('schema_version', '1');
 
-            INSERT OR REPLACE INTO schema_meta(key, value)
-            VALUES ('schema_family', 'official_x_api_mvp');
-            INSERT OR REPLACE INTO schema_meta(key, value)
-            VALUES ('schema_version', '1');
-
-            CREATE TABLE IF NOT EXISTS jobs (
+            CREATE TABLE jobs (
                 id                    TEXT PRIMARY KEY,
                 request_json          TEXT NOT NULL,
                 compiled_request_json TEXT NOT NULL,
-                request_fingerprint   TEXT NOT NULL,
-                account_scope         TEXT NOT NULL,
                 status                TEXT NOT NULL,
                 collected_count       INTEGER NOT NULL DEFAULT 0,
                 cursor                TEXT,
@@ -93,30 +168,33 @@ class Storage:
                 retry_at              TEXT,
                 rate_limit_remaining  INTEGER,
                 rate_limit_reset      INTEGER,
-                billable_read_count   INTEGER NOT NULL DEFAULT 0,
+                post_resource_count   INTEGER NOT NULL DEFAULT 0,
+                user_resource_count   INTEGER NOT NULL DEFAULT 0,
+                media_resource_count  INTEGER NOT NULL DEFAULT 0,
                 created_at            TEXT NOT NULL,
                 started_at            TEXT,
                 finished_at           TEXT,
                 updated_at            TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS post_observations (
+            CREATE TABLE post_observations (
                 job_id                TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                 post_id               TEXT NOT NULL,
                 position              INTEGER NOT NULL,
                 text                  TEXT NOT NULL,
-                author_username       TEXT NOT NULL,
+                author_id             TEXT,
+                author_username       TEXT,
                 url                   TEXT NOT NULL,
                 created_at            TEXT,
                 observed_at           TEXT NOT NULL,
                 language              TEXT,
                 conversation_id       TEXT,
                 in_reply_to_post_id   TEXT,
-                like_count            INTEGER NOT NULL DEFAULT 0,
-                reply_count           INTEGER NOT NULL DEFAULT 0,
-                repost_count          INTEGER NOT NULL DEFAULT 0,
-                quote_count           INTEGER NOT NULL DEFAULT 0,
-                bookmark_count        INTEGER NOT NULL DEFAULT 0,
+                like_count            INTEGER,
+                reply_count           INTEGER,
+                repost_count          INTEGER,
+                quote_count           INTEGER,
+                bookmark_count        INTEGER,
                 is_reply              INTEGER NOT NULL DEFAULT 0,
                 is_repost             INTEGER NOT NULL DEFAULT 0,
                 is_quote              INTEGER NOT NULL DEFAULT 0,
@@ -126,12 +204,8 @@ class Storage:
                 UNIQUE (job_id, position)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_jobs_status_retry
-                ON jobs(status, retry_at);
-            CREATE INDEX IF NOT EXISTS idx_jobs_cache
-                ON jobs(account_scope, request_fingerprint, finished_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_observations_position
-                ON post_observations(job_id, position);
+            CREATE INDEX idx_jobs_status_retry ON jobs(status, retry_at);
+            CREATE INDEX idx_observations_position ON post_observations(job_id, position);
             """
         )
 
@@ -142,16 +216,13 @@ class Storage:
             connection.execute(
                 """
                 INSERT INTO jobs (
-                    id, request_json, compiled_request_json, request_fingerprint,
-                    account_scope, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    id, request_json, compiled_request_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     json.dumps(request.to_dict(), separators=(",", ":")),
                     json.dumps(compiled_request, separators=(",", ":")),
-                    compiled_request["requestFingerprint"],
-                    compiled_request["accountScope"],
                     JobStatus.QUEUED.value,
                     now,
                     now,
@@ -187,13 +258,13 @@ class Storage:
             connection.execute("BEGIN IMMEDIATE")
             changed = connection.execute(
                 """
-                UPDATE jobs SET status = ?, started_at = COALESCE(started_at, ?),
+                UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?),
                     finished_at = NULL, retry_at = NULL, error_code = NULL,
                     error_message = NULL, error_retryable = 0,
                     completion_reason = NULL, updated_at = ?
-                WHERE id = ? AND status = ? AND cancel_requested = 0
+                WHERE id = ? AND status = 'queued' AND cancel_requested = 0
                 """,
-                (JobStatus.RUNNING.value, now, now, job_id, JobStatus.QUEUED.value),
+                (now, now, job_id),
             ).rowcount
             row = (
                 connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -209,31 +280,43 @@ class Storage:
         cursor: str | None,
         page_stats: dict[str, Any],
     ) -> int:
-        posts = list(posts)
         with self.connect() as connection:
             current = connection.execute(
-                "SELECT collected_count FROM jobs WHERE id = ?", (job_id,)
+                "SELECT collected_count, warnings_json FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             if current is None:
                 return 0
-            position = int(current[0])
+            position = int(current["collected_count"])
+            warnings = list(
+                dict.fromkeys(
+                    [
+                        *json.loads(current["warnings_json"]),
+                        *(
+                            str(item)
+                            for item in page_stats.get("warnings", [])
+                            if isinstance(item, str)
+                        ),
+                    ]
+                )
+            )
             added = 0
             for post in posts:
                 inserted = connection.execute(
                     """
                     INSERT OR IGNORE INTO post_observations (
-                        job_id, post_id, position, text, author_username, url,
+                        job_id, post_id, position, text, author_id, author_username, url,
                         created_at, observed_at, language, conversation_id,
                         in_reply_to_post_id, like_count, reply_count, repost_count,
                         quote_count, bookmark_count, is_reply, is_repost, is_quote,
                         has_media, media_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id,
                         post.post_id,
                         position,
                         post.text,
+                        post.author_id,
                         post.author_username,
                         post.url,
                         post.created_at,
@@ -256,10 +339,13 @@ class Storage:
                 if inserted:
                     position += 1
                     added += 1
+            resources = page_stats.get("resourcesReturned") or {}
             connection.execute(
                 """
                 UPDATE jobs SET collected_count = ?, cursor = ?,
-                    billable_read_count = billable_read_count + ?,
+                    post_resource_count = post_resource_count + ?,
+                    user_resource_count = user_resource_count + ?,
+                    media_resource_count = media_resource_count + ?, warnings_json = ?,
                     rate_limit_remaining = COALESCE(?, rate_limit_remaining),
                     rate_limit_reset = COALESCE(?, rate_limit_reset), updated_at = ?
                 WHERE id = ?
@@ -267,7 +353,10 @@ class Storage:
                 (
                     position,
                     cursor,
-                    int(page_stats.get("billableReads") or 0),
+                    int(resources.get("posts") or 0),
+                    int(resources.get("users") or 0),
+                    int(resources.get("media") or 0),
+                    json.dumps(warnings),
                     page_stats.get("rateLimitRemaining"),
                     page_stats.get("rateLimitReset"),
                     utc_now(),
@@ -295,12 +384,12 @@ class Storage:
             if row["cancel_requested"]:
                 connection.execute(
                     """
-                    UPDATE jobs SET status = ?, error_code = 'cancelled',
+                    UPDATE jobs SET status = 'cancelled', error_code = 'cancelled',
                         error_message = 'Collection cancelled.', error_retryable = 1,
                         completion_reason = 'cancelled', finished_at = ?, updated_at = ?
-                    WHERE id = ? AND status = ?
+                    WHERE id = ? AND status = 'running'
                     """,
-                    (JobStatus.CANCELLED.value, now, now, job_id, JobStatus.RUNNING.value),
+                    (now, now, job_id),
                 )
                 return JobStatus.CANCELLED.value
             status = JobStatus.PARTIAL if partial else JobStatus.SUCCEEDED
@@ -308,17 +397,9 @@ class Storage:
                 """
                 UPDATE jobs SET status = ?, warnings_json = ?, completion_reason = ?,
                     finished_at = ?, updated_at = ?
-                WHERE id = ? AND status = ? AND cancel_requested = 0
+                WHERE id = ? AND status = 'running' AND cancel_requested = 0
                 """,
-                (
-                    status.value,
-                    json.dumps(warnings),
-                    completion_reason,
-                    now,
-                    now,
-                    job_id,
-                    JobStatus.RUNNING.value,
-                ),
+                (status.value, json.dumps(warnings), completion_reason, now, now, job_id),
             ).rowcount
         return status.value if changed else None
 
@@ -365,7 +446,7 @@ class Storage:
         now = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            queued = connection.execute(
+            stopped = connection.execute(
                 """
                 UPDATE jobs SET status = 'cancelled', cancel_requested = 1,
                     error_code = 'cancelled', error_message = 'Collection cancelled.',
@@ -380,7 +461,15 @@ class Storage:
                 "WHERE id = ? AND status = 'running'",
                 (now, job_id),
             ).rowcount
-        return bool(queued or running)
+        return bool(stopped or running)
+
+    def delete_job(self, job_id: str) -> bool:
+        with self.connect() as connection:
+            changed = connection.execute(
+                "DELETE FROM jobs WHERE id = ? AND status NOT IN ('queued', 'running', 'waiting')",
+                (job_id,),
+            ).rowcount
+        return bool(changed)
 
     def cancel_requested(self, job_id: str) -> bool:
         with self.connect() as connection:
@@ -457,21 +546,6 @@ class Storage:
             )
         return ids
 
-    def find_cached_job(
-        self, request_fingerprint: str, account_scope: str, *, cutoff: str
-    ) -> dict[str, Any] | None:
-        with self.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM jobs
-                WHERE status = 'succeeded' AND request_fingerprint = ? AND account_scope = ?
-                  AND finished_at IS NOT NULL AND finished_at >= ?
-                ORDER BY finished_at DESC LIMIT 1
-                """,
-                (request_fingerprint, account_scope, cutoff),
-            ).fetchone()
-        return self._job_dict(row) if row else None
-
     def get_job_posts(
         self, job_id: str, *, limit: int = 500, offset: int = 0
     ) -> list[dict[str, Any]]:
@@ -489,11 +563,6 @@ class Storage:
             item["media"] = json.loads(item.pop("media_json"))
             for name in ("is_reply", "is_repost", "is_quote", "has_media"):
                 item[name] = bool(item[name])
-            item["tweet_id"] = item.pop("post_id")
-            item["scraped_at"] = item.pop("observed_at")
-            item["in_reply_to_tweet_id"] = item.pop("in_reply_to_post_id")
-            item["retweet_count"] = item.pop("repost_count")
-            item["is_retweet"] = item.pop("is_repost")
             result.append(item)
         return result
 

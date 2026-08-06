@@ -9,17 +9,20 @@ from pathlib import Path
 class Settings:
     database_path: Path
     bearer_token_path: Path
+    allow_environment_token: bool = True
 
     @classmethod
     def from_env(cls) -> Settings:
-        runtime_dir = Path(os.environ.get("XSCRAPER_RUNTIME_DIR", "var")).expanduser().resolve()
+        runtime_dir = Path(os.environ.get("XWORKBENCH_RUNTIME_DIR", "var")).expanduser().resolve()
         return cls(
-            database_path=Path(os.environ.get("XSCRAPER_DB_PATH", runtime_dir / "x_api_analyst.db"))
+            database_path=Path(
+                os.environ.get("XWORKBENCH_DB_PATH", runtime_dir / "x_collection_workbench.db")
+            )
             .expanduser()
             .resolve(),
             bearer_token_path=Path(
                 os.environ.get(
-                    "XSCRAPER_X_BEARER_TOKEN_PATH", runtime_dir / "auth" / "x_bearer_token"
+                    "XWORKBENCH_X_BEARER_TOKEN_PATH", runtime_dir / "auth" / "x_bearer_token"
                 )
             )
             .expanduser()
@@ -31,7 +34,11 @@ class Settings:
         self.bearer_token_path.parent.mkdir(parents=True, exist_ok=True)
 
     def bearer_token(self) -> str | None:
-        override = os.environ.get("XSCRAPER_X_BEARER_TOKEN", "").strip()
+        override = (
+            os.environ.get("XWORKBENCH_X_BEARER_TOKEN", "").strip()
+            if self.allow_environment_token
+            else ""
+        )
         if override:
             return override
         try:
@@ -42,10 +49,15 @@ class Settings:
 
     def connection_status(self) -> dict[str, str | bool]:
         token = self.bearer_token()
-        source = "environment" if os.environ.get("XSCRAPER_X_BEARER_TOKEN", "").strip() else "file"
+        source = (
+            "environment"
+            if self.allow_environment_token
+            and os.environ.get("XWORKBENCH_X_BEARER_TOKEN", "").strip()
+            else "file"
+        )
         return {
             "status": "configured" if token else "missing",
             "valid": bool(token),
             "source": source if token else "none",
-            "message": ("Bearer Token is configured." if token else "Run: xscraper configure"),
+            "message": ("Bearer Token is configured." if token else "Run: xworkbench configure"),
         }

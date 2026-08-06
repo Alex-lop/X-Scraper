@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Collect, inspect, and export reproducible X API snapshots locally.">
+  <title>X Collection Workbench</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <header class="site-header">
+    <div>
+      <p class="eyebrow">Local research workspace</p>
+      <h1>X Collection Workbench</h1>
+      <p class="tagline">Bound the read. Preserve the snapshot. Inspect it locally.</p>
+    </div>
+    <div id="connection-card" class="connection" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <div><strong id="connection-status">Checking local configuration…</strong><small id="connection-message">Your Bearer Token stays on this machine.</small></div>
+    </div>
+  </header>
+
+  <main id="main" class="shell">
+    <section id="setup-card" class="notice warning" hidden>
+      <div><strong>Official X API token required</strong><p>Save a project Bearer Token locally, then refresh this page.</p></div>
+      <code>xworkbench configure</code>
+    </section>
+    <section id="demo-card" class="notice demo" hidden>
+      <div><strong>Synthetic offline demo</strong><p>Every visible Post is local demo data. No X request is available, made, or billed.</p></div>
+    </section>
+
+    <nav aria-label="Workflow stages">
+      <ol class="steps">
+        <li id="step-1" class="current"><span>1</span> Configure and preview</li>
+        <li id="step-2"><span>2</span> Collect and monitor</li>
+        <li id="step-3"><span>3</span> Inspect and export</li>
+      </ol>
+    </nav>
+
+    <section id="stage-configure" class="panel" aria-labelledby="configure-title">
+      <div class="section-title">
+        <div><p class="eyebrow">Stage 1</p><h2 id="configure-title">Configure and preview</h2></div>
+        <span id="scope-badge" class="pill neutral">Recent · 7 days</span>
+      </div>
+      <p class="intro">Previewing is local and free. Nothing is sent to X until you review the exact five-minute request and explicitly confirm.</p>
+
+      <form id="collection-form">
+        <fieldset class="segments full">
+          <legend>Search scope</legend>
+          <label><input type="radio" name="searchMode" value="recent" checked> Recent</label>
+          <label><input type="radio" name="searchMode" value="fullArchive"> Full archive</label>
+        </fieldset>
+        <fieldset class="segments full">
+          <legend>Source</legend>
+          <label><input type="radio" name="sourceType" value="profile" checked> X profile</label>
+          <label><input type="radio" name="sourceType" value="search"> Search query</label>
+        </fieldset>
+        <label class="full"><span id="source-label">Username or profile URL</span>
+          <input id="source-value" name="sourceValue" required autocomplete="off" placeholder="@OpenAI" aria-describedby="query-help">
+          <small id="query-help">Profiles compile to an exact <code>from:</code> query.</small>
+        </label>
+        <label>Start date <input id="start-date" name="startDate" type="date"><small>UTC calendar date</small></label>
+        <label>End date <input id="end-date" name="endDate" type="date"><small>UTC; inclusive</small></label>
+        <p id="date-feedback" class="field-note full" aria-live="polite">Optional. Recent mode uses a rolling seven-day window; a boundary date may be clamped to the exact cutoff.</p>
+        <label>Maximum Posts <input name="maxPosts" type="number" min="10" max="500" value="10" required></label>
+        <div class="checks" aria-label="Collection options">
+          <label><input name="includeReplies" type="checkbox"> Include replies</label>
+          <label><input name="mediaOnly" type="checkbox"> Require media</label>
+        </div>
+        <div id="form-error" class="banner error full" role="alert" hidden></div>
+        <button id="preview-button" class="primary full" type="submit">Preview exact read and cost</button>
+      </form>
+
+      <div id="preview-card" class="preview" hidden>
+        <div class="section-title"><div><p class="eyebrow">Five-minute preflight</p><h3>Review the exact paid read</h3></div><span class="pill neutral">Expires in 5 minutes</span></div>
+        <dl class="preview-grid">
+          <div><dt>Scope</dt><dd id="preview-scope"></dd></div>
+          <div><dt>Endpoint</dt><dd><code id="preview-endpoint"></code></dd></div>
+          <div class="wide"><dt>Compiled query</dt><dd><code id="preview-query"></code><small id="query-count"></small><meter id="query-meter" min="0" value="0"></meter></dd></div>
+          <div><dt>Effective UTC window</dt><dd id="preview-window"></dd></div>
+          <div><dt>Preview expires</dt><dd id="preview-expiry"></dd></div>
+          <div><dt>Post resources</dt><dd id="preview-post-cost"></dd></div>
+          <div><dt>User resources</dt><dd id="preview-user-cost"></dd></div>
+          <div><dt>Media resources</dt><dd id="preview-media-cost"></dd></div>
+        </dl>
+        <p id="billing-note" class="fine"></p>
+        <p class="fine">Use the X Developer Console spending limit as the hard cap. <a id="pricing-link" href="https://docs.x.com/x-api/getting-started/pricing" target="_blank" rel="noreferrer">Current X pricing</a></p>
+        <div id="confirm-error" class="banner error" role="alert" hidden></div>
+        <div class="actions"><button id="confirm-button" class="primary" type="button">Confirm paid read</button><button id="edit-button" type="button">Edit request</button></div>
+      </div>
+    </section>
+
+    <section id="stage-collect" class="panel" aria-labelledby="collect-title">
+      <div class="section-title">
+        <div><p class="eyebrow">Stage 2</p><h2 id="collect-title">Collect and monitor</h2></div>
+        <button id="refresh-history" type="button" aria-label="Refresh saved snapshots">Refresh</button>
+      </div>
+      <div class="collect-grid">
+        <div>
+          <h3>Stored snapshots</h3>
+          <div id="history-list" class="history" aria-live="polite"><p class="empty">Loading local snapshots…</p></div>
+        </div>
+        <div id="active-panel" class="monitor">
+          <div id="collection-empty" class="empty">Preview a bounded request or reopen a stored snapshot.</div>
+          <div id="collection-content" hidden>
+            <div class="section-title"><h3 id="job-title">Collection</h3><span id="job-status" class="pill neutral">Queued</span></div>
+            <div class="stats">
+              <div><span>Collected</span><strong id="collected-count">0</strong></div>
+              <div><span>Post resources</span><strong id="post-resource-count">0</strong></div>
+              <div><span>User resources</span><strong id="user-resource-count">0</strong></div>
+              <div><span>Media resources</span><strong id="media-resource-count">0</strong></div>
+              <div><span>Returned list estimate</span><strong id="job-cost">—</strong></div>
+              <div><span>Rate limit remaining</span><strong id="rate-limit">—</strong></div>
+            </div>
+            <progress id="job-progress" class="progress" aria-label="Collected Posts versus requested maximum" max="100" value="0"></progress>
+            <p id="progress-copy" class="muted" aria-live="polite"></p>
+            <p id="job-provenance" class="fine"></p>
+            <div id="job-error" class="banner error" role="alert" hidden></div>
+            <div id="job-warning" class="banner warning" role="status" hidden></div>
+            <div class="actions">
+              <button id="cancel-button" class="danger" type="button" hidden>Cancel collection</button>
+              <button id="resume-button" type="button" hidden>Resume</button>
+              <button id="delete-button" class="danger" type="button" hidden>Delete snapshot</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="stage-inspect" class="panel" aria-labelledby="inspect-title" hidden>
+      <div class="section-title">
+        <div><p class="eyebrow">Stage 3</p><h2 id="inspect-title">Inspect and export</h2></div>
+        <span id="snapshot-status" class="pill neutral"></span>
+      </div>
+      <p id="snapshot-meta" class="fine"></p>
+      <div id="partial-notice" class="banner warning" role="status" hidden>Partial results are preserved. This snapshot may not represent the full requested range.</div>
+      <div id="quality-notice" class="banner warning" role="status" hidden></div>
+      <div class="actions export-actions" aria-label="Export snapshot">
+        <a id="json-export" class="button" href="#">Export JSON</a>
+        <a id="csv-export" class="button" href="#">Export CSV</a>
+      </div>
+
+      <div class="summary-cards">
+        <div><span>Posts</span><strong id="summary-total">0</strong></div>
+        <div><span>Unique authors</span><strong id="summary-authors">0</strong></div>
+        <div><span>Languages</span><strong id="summary-languages">0</strong></div>
+        <div><span>Timestamp coverage</span><strong id="summary-timestamps">0 / 0</strong></div>
+      </div>
+      <p id="type-summary" class="type-summary"></p>
+
+      <div class="filters" aria-label="Post filters">
+        <label>Text <input id="text-filter" type="search" placeholder="Search collected text"></label>
+        <label>Author <select id="author-filter"><option value="">All authors</option></select></label>
+        <label>Language <select id="language-filter"><option value="">All languages</option></select></label>
+        <label>Type <select id="type-filter"><option value="">All types</option><option value="original">Original</option><option value="reply">Reply</option><option value="repost">Repost</option><option value="quote">Quote</option><option value="unclassified">Unclassified</option><option value="media">Media</option></select></label>
+        <label>Sort <select id="sort-filter"><option value="newest">Newest</option><option value="oldest">Oldest</option><option value="engagement">Available engagement</option></select></label>
+      </div>
+      <p id="filtered-count" class="muted" aria-live="polite"></p>
+
+      <div class="analysis-grid">
+        <section><h3>Daily volume <small>UTC</small></h3><ol id="daily-volume" class="ranked-list"></ol></section>
+        <section><h3>Languages</h3><ol id="language-summary" class="ranked-list"></ol></section>
+        <section><h3>Top Posts <small>by available engagement</small></h3><ol id="top-posts" class="ranked-list"></ol></section>
+        <section><h3>Top authors <small>by available engagement</small></h3><ol id="top-authors" class="ranked-list"></ol></section>
+      </div>
+
+      <section aria-labelledby="posts-title">
+        <div class="section-title"><h3 id="posts-title">Post evidence</h3><span id="result-count" class="pill neutral">0 Posts</span></div>
+        <div id="posts-list" class="posts"><p class="empty">Open a terminal snapshot to inspect its Posts.</p></div>
+      </section>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
