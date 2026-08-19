@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "recordedDate": "2026-08-19",
+  "environment": {
+    "operatingSystem": "Darwin 25.5.0",
+    "architecture": "arm64",
+    "logicalCpuCount": 11,
+    "pythonVersion": "3.13.9",
+    "chromiumVersion": "151.0.7922.34"
+  },
+  "lightweightQueueStress": {
+    "fixture": "deterministic in-process provider through production JobService and SQLite",
+    "workers": 2,
+    "rounds": 3,
+    "jobsPerRound": 100,
+    "jobs": 300,
+    "wallSeconds": 1.516,
+    "roundSeconds": [0.516, 0.482, 0.519],
+    "cpuSeconds": 1.397,
+    "rssAfterRoundBytes": [50937856, 51232768, 51429376],
+    "postWarmupRssGrowthBytes": 491520,
+    "rssGrowthLimitBytes": 33554432,
+    "sqliteCallbackSeconds": 0.354,
+    "maxPersistenceBacklog": 2,
+    "correctResults": 300,
+    "leasesAfterEachRound": 0,
+    "cleanupFailures": 0
+  },
+  "realBrowserMatrix": {
+    "fixture": "production Playwright provider with dynamic numeric-loopback HTML",
+    "externalEgress": false,
+    "jobsPerCase": 4,
+    "cases": [
+      {
+        "workers": 1,
+        "wallSeconds": 3.145,
+        "peakProcessTreeRssBytes": 488701952,
+        "cpuSeconds": 3.071,
+        "sqliteCallbackSeconds": 0.012,
+        "maxPersistenceBacklog": 1,
+        "cleanupSeconds": 0.024,
+        "cleanupFailures": 0,
+        "correctResults": 4
+      },
+      {
+        "workers": 2,
+        "wallSeconds": 1.233,
+        "peakProcessTreeRssBytes": 916553728,
+        "cpuSeconds": 2.57,
+        "sqliteCallbackSeconds": 0.014,
+        "maxPersistenceBacklog": 2,
+        "cleanupSeconds": 0.026,
+        "cleanupFailures": 0,
+        "correctResults": 4
+      }
+    ],
+    "speedup": 2.551,
+    "stablePostId": "2001",
+    "remainingLeases": 0,
+    "remainingPages": 0,
+    "remainingContexts": 0,
+    "remainingBrowsers": 0,
+    "remainingWorkerThreads": 0
+  },
+  "decision": {
+    "defaultWorkers": 1,
+    "normalOptInMaximum": 2,
+    "hardMaximum": 4,
+    "reason": "Two workers materially reduced local wall time with correct cleanup, but increased peak process-tree RSS by about 428 MB."
+  }
+}

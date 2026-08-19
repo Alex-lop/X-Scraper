@@ -75,3 +75,7 @@ jobs:
       - run: playwright install --with-deps chromium
       - name: Run offline local-Chromium integration test
         run: pytest tests/test_playwright_integration.py
+      - name: Run bounded queue browser matrix
+        env:
+          XWORKBENCH_RUN_BROWSER_MATRIX: "1"
+        run: pytest tests/test_queue_performance.py -k production_playwright
