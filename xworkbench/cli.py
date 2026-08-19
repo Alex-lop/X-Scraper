@@ -198,7 +198,13 @@ def _local_mcp_read(
     return asyncio.run(read())
 
 
-def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
+def _doctor(
+    settings: Settings,
+    *,
+    require_token: bool,
+    port: int,
+    allow_missing_chromium: bool = False,
+) -> int:
     failures: list[str] = []
     warnings: list[str] = []
 
@@ -229,7 +235,7 @@ def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
     )
     chromium_ready, chromium_message = _chromium_available()
     result(
-        "PASS" if chromium_ready else "FAIL",
+        "PASS" if chromium_ready else "WARN" if allow_missing_chromium else "FAIL",
         "chromium",
         chromium_message,
         None if chromium_ready else "Run: python -m playwright install chromium",
@@ -404,7 +410,12 @@ def _setup(settings: Settings) -> int:
     print(f"PASS  database           initialized at {settings.database_path}")
 
     print("INFO  setup never signs in or contacts X; use xworkbench auth when ready.")
-    return _doctor(settings, require_token=False, port=0)
+    return _doctor(
+        settings,
+        require_token=False,
+        port=0,
+        allow_missing_chromium=True,
+    )
 
 
 def _config(settings: Settings, command: str) -> int:

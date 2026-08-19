@@ -124,6 +124,25 @@ def test_setup_is_idempotent_and_ignores_permissive_umask(tmp_path, monkeypatch)
     assert stat.S_IMODE(settings.database_path.stat().st_mode) == 0o600
 
 
+def test_setup_keeps_the_offline_demo_available_without_chromium(
+    tmp_path, monkeypatch, capsys
+):
+    settings = Settings(
+        tmp_path / "runtime" / "db",
+        tmp_path / "runtime" / "auth" / "token",
+    )
+    monkeypatch.setattr(
+        "xworkbench.cli._chromium_available",
+        lambda: (False, "Chromium is missing; run: python -m playwright install chromium"),
+    )
+
+    assert _setup(settings) == 0
+    output = capsys.readouterr().out
+    assert "WARN  chromium" in output
+    assert "python -m playwright install chromium" in output
+    assert "READY WITH WARNINGS" in output
+
+
 def test_setup_does_not_chmod_an_unsafe_existing_parent(tmp_path):
     parent = tmp_path / "shared"
     parent.mkdir()
