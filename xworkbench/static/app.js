@@ -137,6 +137,8 @@ function setOfflineDemo() {
   $("#connection-message").textContent = "Local demo evidence only; no X request or API cost.";
   $("#setup-card").hidden = true;
   $("#demo-card").hidden = false;
+  $("#agent-test-result").textContent =
+    "MCP test passed during demo startup: direct local comparison succeeded with 12 read-only tools.";
   $("#preview-button").disabled = true;
   $("#batch-preview-button").disabled = true;
 }
@@ -1268,8 +1270,11 @@ async function loadSnapshot(jobId, job) {
   $("#snapshot-status").className = `pill ${job.status}`;
   $("#partial-notice").hidden = !job.isPartial;
   const provenance = job.provenance || {};
+  const browserSurface = titleCase(
+    provenance.sourceKind || job.request?.sourceType || "browser",
+  );
   $("#snapshot-meta").textContent = job.provider === "playwright_browser"
-    ? `Browser Home · ${provenance.sourceUrl || "local snapshot"} · captured ${utc(job.capturedAt)} · ${count(posts.length)} stored Posts`
+    ? `Browser ${browserSurface} · ${provenance.sourceUrl || "local snapshot"} · captured ${utc(job.capturedAt)} · ${count(posts.length)} stored Posts`
     : `${titleCase(provenance.searchMode)} · ${provenance.endpoint || ""} · effective query “${provenance.query || ""}” · captured ${utc(job.capturedAt)} · ${count(posts.length)} stored Posts`;
   $("#json-export").href = `/api/jobs/${encodeURIComponent(jobId)}/export?format=json`;
   $("#csv-export").href = `/api/jobs/${encodeURIComponent(jobId)}/export?format=csv`;

@@ -103,6 +103,9 @@ test("keeps the product loop CSP-safe, keyboard-native, and motion-safe", () => 
   assert.match(htmlSource, /id="batch-preview-rows"/);
   assert.match(htmlSource, /id="batch-confirm-error"[^>]*role="alert"/);
   assert.match(appSource, /Username or exact X profile URL/);
+  assert.match(appSource, /provenance\.sourceKind \|\| job\.request\?\.sourceType/);
+  assert.doesNotMatch(appSource, /`Browser Home ·/);
+  assert.match(appSource, /MCP test passed during demo startup/);
   assert.match(appSource, /\/api\/batches\/preview/);
   assert.match(appSource, /\/api\/progress\?after=/);
   assert.equal(/<(?:script|link)[^>]+https?:\/\//i.test(htmlSource), false);
