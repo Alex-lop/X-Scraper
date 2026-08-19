@@ -935,6 +935,10 @@ def test_progress_events_are_bounded_coalesced_and_fall_back_to_durable_state(
     job_id = service.submit(request, compile_request(request))
     service.start()
     assert wait_for_jobs(storage, [job_id]) == {job_id: "succeeded"}
+    deadline = time.monotonic() + 2
+    while service.metrics()["finished"] < 1 and time.monotonic() < deadline:
+        threading.Event().wait(0.005)
+    assert service.metrics()["finished"] == 1
     snapshot = service.events(0)
     current = service.events(snapshot["lastSequence"])
     metrics = service.metrics()
