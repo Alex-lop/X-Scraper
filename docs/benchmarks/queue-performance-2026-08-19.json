@@ -14,14 +14,15 @@
     "rounds": 3,
     "jobsPerRound": 100,
     "jobs": 300,
-    "wallSeconds": 1.516,
-    "roundSeconds": [0.516, 0.482, 0.519],
-    "cpuSeconds": 1.397,
-    "rssAfterRoundBytes": [50937856, 51232768, 51429376],
-    "postWarmupRssGrowthBytes": 491520,
+    "wallSeconds": 1.667,
+    "roundSeconds": [0.562, 0.558, 0.548],
+    "cpuSeconds": 1.614,
+    "rssAfterRoundBytes": [52183040, 52428800, 53067776],
+    "postWarmupRssGrowthBytes": 884736,
     "rssGrowthLimitBytes": 33554432,
-    "sqliteCallbackSeconds": 0.354,
+    "sqliteCallbackSeconds": 0.409,
     "maxPersistenceBacklog": 2,
+    "concurrentStorageReads": 1176,
     "correctResults": 300,
     "leasesAfterEachRound": 0,
     "cleanupFailures": 0
@@ -33,28 +34,28 @@
     "cases": [
       {
         "workers": 1,
-        "wallSeconds": 3.145,
-        "peakProcessTreeRssBytes": 488701952,
-        "cpuSeconds": 3.071,
-        "sqliteCallbackSeconds": 0.012,
+        "wallSeconds": 3.111,
+        "peakProcessTreeRssBytes": 487227392,
+        "cpuSeconds": 3.218,
+        "sqliteCallbackSeconds": 0.009,
         "maxPersistenceBacklog": 1,
-        "cleanupSeconds": 0.024,
+        "cleanupSeconds": 0.022,
         "cleanupFailures": 0,
         "correctResults": 4
       },
       {
         "workers": 2,
-        "wallSeconds": 1.233,
-        "peakProcessTreeRssBytes": 916553728,
-        "cpuSeconds": 2.57,
+        "wallSeconds": 1.288,
+        "peakProcessTreeRssBytes": 871743488,
+        "cpuSeconds": 2.754,
         "sqliteCallbackSeconds": 0.014,
         "maxPersistenceBacklog": 2,
-        "cleanupSeconds": 0.026,
+        "cleanupSeconds": 0.024,
         "cleanupFailures": 0,
         "correctResults": 4
       }
     ],
-    "speedup": 2.551,
+    "speedup": 2.415,
     "stablePostId": "2001",
     "remainingLeases": 0,
     "remainingPages": 0,
@@ -66,6 +67,6 @@
     "defaultWorkers": 1,
     "normalOptInMaximum": 2,
     "hardMaximum": 4,
-    "reason": "Two workers materially reduced local wall time with correct cleanup, but increased peak process-tree RSS by about 428 MB."
+    "reason": "Two workers materially reduced local wall time with correct cleanup, but increased peak process-tree RSS by about 385 MB."
   }
 }

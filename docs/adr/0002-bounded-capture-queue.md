@@ -46,20 +46,21 @@ The sanitized local benchmark is recorded in
 
 | Fixture | Workers | Jobs | Wall | Peak process-tree RSS | CPU | SQLite callback time | Cleanup |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Production Playwright, dynamic numeric-loopback page | 1 | 4 | 3.145s | 488.7MB | 3.071s | 0.012s | 0 failures |
-| Production Playwright, dynamic numeric-loopback page | 2 | 4 | 1.233s | 916.6MB | 2.570s | 0.014s | 0 failures |
+| Production Playwright, dynamic numeric-loopback page | 1 | 4 | 3.111s | 487.2MB | 3.218s | 0.009s | 0 failures |
+| Production Playwright, dynamic numeric-loopback page | 2 | 4 | 1.288s | 871.7MB | 2.754s | 0.014s | 0 failures |
 
-Two workers were 2.551 times faster on this fixture and produced the same stable Post IDs, zero
+Two workers were 2.415 times faster on this fixture and produced the same stable Post IDs, zero
 duplicate observations within a snapshot, zero external requests, zero remaining leases, and no
-live pages, contexts, browsers, or worker threads. Peak process-tree RSS increased by 428MB. This
+live pages, contexts, browsers, or worker threads. Peak process-tree RSS increased by 385MB. This
 supports an explicit two-worker option on the measured machine but not a higher default. Static
 local HTML is not evidence that live X should receive more concurrency.
 
 Three consecutive 100-job lightweight drains used the real queue, leases, checkpoints, Post
-persistence, and terminal transitions. All 300 jobs succeeded exactly once in 1.516s. The maximum
+persistence, and terminal transitions. All 300 jobs succeeded exactly once in 1.667s. The maximum
 persistence backlog was two, leases and workers returned to zero after every drain, and RSS grew
-491,520 bytes after warmup against a 33,554,432-byte tolerance. The test also enforces global,
-source, and auth-state caps and checks lock, thread, and temporary-state cleanup.
+884,736 bytes after warmup against a 33,554,432-byte tolerance. A concurrent reader completed
+1,176 `queue_counts`/`list_jobs` calls while workers ran. The test also enforces global, source, and
+auth-state caps and checks lock, thread, and temporary-state cleanup.
 
 The browser matrix is opt-in so ordinary Python jobs do not need an installed Chromium:
 

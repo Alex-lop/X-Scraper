@@ -187,6 +187,32 @@ class _LifecycleTracker:
             self.persistence_seconds += elapsed
 
 
+class _ConcurrentStorageReader:
+    def __init__(self, storage: Storage) -> None:
+        self.storage = storage
+        self.stop_event = threading.Event()
+        self.errors: list[Exception] = []
+        self.reads = 0
+        self.thread = threading.Thread(target=self._poll, daemon=True)
+
+    def _poll(self) -> None:
+        while not self.stop_event.wait(0.001):
+            try:
+                self.storage.queue_counts()
+                self.storage.list_jobs(1)
+                self.reads += 2
+            except Exception as exc:
+                self.errors.append(exc)
+                return
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
+
 class _LightweightProvider:
     provider_id = ProviderType.PLAYWRIGHT_BROWSER
     provider_version = 2
@@ -244,6 +270,8 @@ def test_repeated_hundred_job_drains_are_bounded_and_leave_no_resources(tmp_path
         max_queue=100,
         provider_factory=lambda: _LightweightProvider(tracker),
     )
+    reader = _ConcurrentStorageReader(storage)
+    reader.start()
     rss_after_round: list[int] = []
     round_seconds: list[float] = []
     cpu_started = _cpu_seconds()
@@ -303,6 +331,7 @@ def test_repeated_hundred_job_drains_are_bounded_and_leave_no_resources(tmp_path
 
     metrics = service.metrics()
     service.shutdown()
+    reader.stop()
     rss_growth = max(rss_after_round[1:]) - rss_after_round[0]
     summary = {
         "jobs": 300,
@@ -317,10 +346,13 @@ def test_repeated_hundred_job_drains_are_bounded_and_leave_no_resources(tmp_path
         "rssGrowthLimitBytes": RSS_GROWTH_LIMIT_BYTES,
         "persistenceSeconds": round(tracker.persistence_seconds, 3),
         "maxPersistenceBacklog": metrics["maxPersistenceBacklog"],
+        "concurrentStorageReads": reader.reads,
     }
     print("QUEUE_STRESS_SUMMARY=" + json.dumps(summary, sort_keys=True))
 
     assert rss_growth <= RSS_GROWTH_LIMIT_BYTES
+    assert reader.reads >= 100 and reader.errors == []
+    assert not reader.thread.is_alive()
     assert tracker.max_active <= 2
     assert tracker.max_source == tracker.max_auth == 1
     assert tracker.active == 0
