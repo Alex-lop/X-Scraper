@@ -7,7 +7,7 @@ from xworkbench.api import create_app
 from xworkbench.config import Settings
 from xworkbench.jobs import JobService
 from xworkbench.models import CollectionRequest
-from xworkbench.playwright_browser import PlaywrightBrowserProvider
+from xworkbench.playwright_browser import PlaywrightBrowserProvider, _record_status
 from xworkbench.providers import ProviderRegistry
 from xworkbench.storage import Storage
 
@@ -118,7 +118,10 @@ def _browser_stack(tmp_path):
         storage_state_path=tmp_path / "auth" / "playwright.json",
     )
     settings.ensure_runtime_dirs()
-    settings.storage_state_path.write_text("{}")
+    settings.storage_state_path.parent.chmod(0o700)
+    settings.storage_state_path.write_text('{"cookies":[],"origins":[]}')
+    settings.storage_state_path.chmod(0o600)
+    _record_status(settings, "verified_live")
     lifecycle = _Lifecycle()
     provider = PlaywrightBrowserProvider(
         settings, _playwright_factory=lambda: lifecycle

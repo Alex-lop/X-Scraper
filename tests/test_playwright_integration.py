@@ -10,6 +10,7 @@ from xworkbench.playwright_browser import (
     DOM_PROJECTION,
     HOME_URL,
     PlaywrightBrowserProvider,
+    _record_status,
     parse_projected_article,
 )
 
@@ -58,9 +59,13 @@ def test_production_dom_projection_in_real_chromium_covers_sanitized_cards():
     assert compact["metrics"] == {
         "reply": "1.2K Replies",
         "repost": "2.5M reposts",
+        "quote": "4.5K Quotes",
         "like": "3B Likes",
         "bookmark": None,
+        "view": "6.7K Views",
     }
+    assert original.quote_count == 4_500
+    assert original.view_count == 6_700
 
     assert by_id["1002"][1].is_reply is True
     assert by_id["1003"][1].is_repost is True
@@ -150,6 +155,9 @@ class _FixtureContext:
         page = self._context.new_page()
         return _FixturePage(page, self._fixture)
 
+    def __getattr__(self, name):
+        return getattr(self._context, name)
+
     def close(self):
         self._context.close()
         if not self._context.pages:
@@ -172,8 +180,10 @@ class _FixturePage:
 
 def _collect_timeline(tmp_path, target):
     state_path = tmp_path / "auth" / "playwright.json"
-    state_path.parent.mkdir(parents=True)
+    state_path.parent.mkdir(parents=True, mode=0o700)
+    state_path.parent.chmod(0o700)
     state_path.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+    state_path.chmod(0o600)
     configured = Settings(
         database_path=tmp_path / "workbench.db",
         bearer_token_path=tmp_path / "api-token",
@@ -183,6 +193,7 @@ def _collect_timeline(tmp_path, target):
         page_timeout_ms=2_000,
         no_progress_limit=2,
     )
+    _record_status(configured, "verified_live")
     fixture = _FixturePlaywright(TIMELINE.read_text(encoding="utf-8"))
     provider = PlaywrightBrowserProvider(configured, _playwright_factory=lambda: fixture)
     request = CollectionRequest.from_dict(
@@ -218,6 +229,8 @@ def test_dynamic_real_chromium_reaches_exact_target_without_duplicates_and_clean
         "seenPostIds": ["2001", "2002", "2003", "2004"],
         "scanIterations": 4,
         "scrollIterations": 3,
+        "captureSegment": 0,
+        "segmentScanIterations": 4,
     }
     assert summary.completion_reason == "target_reached" and summary.partial is False
     assert elapsed < 10
@@ -233,6 +246,8 @@ def test_dynamic_real_chromium_stall_is_bounded_and_cleans_up(tmp_path):
         "seenPostIds": ["2001", "2002", "2003", "2004"],
         "scanIterations": 6,
         "scrollIterations": 5,
+        "captureSegment": 0,
+        "segmentScanIterations": 6,
     }
     assert summary.completion_reason == "no_progress" and summary.partial is True
     assert elapsed < 10

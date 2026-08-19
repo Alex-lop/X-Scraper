@@ -249,7 +249,10 @@ class FakeContext:
         return self.page
 
     def storage_state(self, *, path):
-        Path(path).write_text('{"cookies":[{"name":"sensitive"}]}')
+        Path(path).write_text(
+            '{"cookies":[{"name":"sensitive","value":"fixture",'
+            '"domain":"x.com"}],"origins":[]}'
+        )
 
     def close(self):
         self.closed = True
@@ -278,8 +281,9 @@ class FakeLifecycle:
         self.headless = None
         self.chromium = SimpleNamespace(launch=self.launch)
 
-    def launch(self, *, headless):
+    def launch(self, *, headless, timeout=None):
         self.headless = headless
+        self.launch_timeout = timeout
         return self.browser
 
     def __enter__(self):
@@ -291,8 +295,11 @@ class FakeLifecycle:
 
 def ready_provider(tmp_path, lifecycle, **setting_changes):
     configured = settings(tmp_path, **setting_changes)
-    configured.storage_state_path.parent.mkdir(parents=True)
-    configured.storage_state_path.write_text("{}")
+    configured.storage_state_path.parent.mkdir(parents=True, mode=0o700)
+    configured.storage_state_path.parent.chmod(0o700)
+    configured.storage_state_path.write_text('{"cookies":[],"origins":[]}')
+    configured.storage_state_path.chmod(0o600)
+    _record_status(configured, "verified_live")
     return (
         PlaywrightBrowserProvider(configured, _playwright_factory=lambda: lifecycle),
         configured,
@@ -312,7 +319,8 @@ def test_fixture_parser_prefers_outer_timestamp_identity_and_preserves_nullable_
     assert first.created_at == "2026-08-05T12:00:00Z" and first.is_quote is True
     assert first.text.startswith("  exact") and first.like_count == 1234
     assert first.reply_count == 2 and first.repost_count == 3
-    assert first.bookmark_count is None and first.media[0]["altText"] == "Synthetic landscape"
+    assert first.bookmark_count == 1_000
+    assert first.media[0]["altText"] == "Synthetic landscape"
     assert missing.post_id == "222" and missing.author_username is None
     assert missing.text is missing.created_at is missing.like_count is missing.media is None
     assert invalid is None
@@ -325,10 +333,11 @@ def test_prepare_and_passive_session_states(tmp_path):
     plan = provider.prepare(request())
 
     assert plan["sourceUrl"] == "https://x.com/home"
+    assert plan["providerVersion"] == plan["parserVersion"] == 2
     assert "maximumPostResources" not in plan
     assert provider.prepare(request(), plan) is plan
     assert provider.capabilities()["limits"]["maximum"] == 25
-    assert provider.connection_status()["status"] == "ready"
+    assert provider.connection_status()["status"] == "verified_live"
     _record_status(configured, "expired")
     assert provider.connection_status()["status"] == "expired"
     _record_status(configured, "manual_action_required")
@@ -406,13 +415,16 @@ def test_cancellation_and_timeout_close_every_browser_object(tmp_path):
             on_batch=lambda *_args: 0,
             should_cancel=lambda: True,
         )
-    assert cancelled_lifecycle.page.closed and cancelled_lifecycle.context.closed
-    assert cancelled_lifecycle.browser.closed
+    assert cancelled_lifecycle.headless is None
+    assert not cancelled_lifecycle.page.closed and not cancelled_lifecycle.browser.closed
 
     moments = iter((0.0, 2.0))
     timeout_lifecycle = FakeLifecycle([[article("1")]])
     configured = settings(tmp_path, job_timeout_seconds=1)
-    configured.storage_state_path.write_text("{}")
+    configured.storage_state_path.parent.chmod(0o700)
+    configured.storage_state_path.write_text('{"cookies":[],"origins":[]}')
+    configured.storage_state_path.chmod(0o600)
+    _record_status(configured, "verified_live")
     timed = PlaywrightBrowserProvider(
         configured,
         _playwright_factory=lambda: timeout_lifecycle,
@@ -426,7 +438,8 @@ def test_cancellation_and_timeout_close_every_browser_object(tmp_path):
             on_batch=lambda *_args: 0,
             should_cancel=lambda: False,
         )
-    assert timeout_lifecycle.page.closed and timeout_lifecycle.browser.closed
+    assert timeout_lifecycle.headless is None
+    assert not timeout_lifecycle.page.closed and not timeout_lifecycle.browser.closed
 
 
 @pytest.mark.parametrize(
@@ -459,10 +472,12 @@ def test_session_failures_are_truthful_and_close(tmp_path, page_options, error, 
 def test_headed_auth_saves_state_atomically_with_owner_only_permissions(tmp_path):
     lifecycle = FakeLifecycle([[]])
     configured = settings(tmp_path)
+    configured.storage_state_path.parent.mkdir(parents=True, mode=0o700)
+    configured.storage_state_path.parent.chmod(0o700)
 
     result = authenticate(configured, _playwright_factory=lambda: lifecycle)
 
-    assert result["status"] == "ready" and lifecycle.headless is False
+    assert result["status"] == "verified_live" and lifecycle.headless is False
     assert stat.S_IMODE(configured.storage_state_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(
         configured.storage_state_path.with_name(".playwright.json.auth-status").stat().st_mode
