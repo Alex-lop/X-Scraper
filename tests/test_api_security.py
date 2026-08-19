@@ -325,6 +325,19 @@ def test_collection_health_and_queue_metrics_are_bounded_public_views(
 
     secret = "SENTINEL-QUEUE-SECRET"
     jobs = client.application.extensions["xworkbench_jobs"]
+    samples = [
+        {
+            "sequence": index,
+            "rssBytes": 100 + index,
+            "cpuPercent": 12.5,
+            "eventLoopLagMs": 999,
+            "chromiumProcessCount": 2,
+            "liveContextCount": 1,
+            "livePageCount": 1,
+            "token": secret,
+        }
+        for index in range(12)
+    ]
     monkeypatch.setattr(
         jobs,
         "metrics",
@@ -338,6 +351,24 @@ def test_collection_health_and_queue_metrics_are_bounded_public_views(
                 "failed": -1,
             },
             "queueWaitP50Ms": float("nan"),
+            "rssBytes": 123,
+            "cpuPercent": 12.5,
+            "eventLoopLagMs": 999,
+            "chromiumProcessCount": 2,
+            "liveContextCount": 1,
+            "livePageCount": 1,
+            "resourcePaused": True,
+            "resourcePauseReasons": ["rss", secret],
+            "resourceSamples": samples,
+            "resourceSignalStatus": {
+                "rssBytes": "supported",
+                "cpuPercent": "supported",
+                "eventLoopLagMs": "supported",
+                "secret": secret,
+            },
+            "resourceMaxRssMb": 1_536,
+            "resourceMaxCpuPercent": 300,
+            "resourceRecoverySeconds": 5,
             "token": secret,
         },
     )
@@ -348,6 +379,13 @@ def test_collection_health_and_queue_metrics_are_bounded_public_views(
     assert metrics["queueCapacity"] == 100
     assert metrics["completedByStatus"] == {"succeeded": 3}
     assert metrics["queueWaitP50Ms"] is None
+    assert metrics["resourcePaused"] is True
+    assert metrics["resourcePauseReasons"] == ["rss"]
+    assert metrics["rssBytes"] == 123 and metrics["cpuPercent"] == 12.5
+    assert metrics["eventLoopLagMs"] is None
+    assert metrics["resourceSignalStatus"]["eventLoopLagMs"] == "not_applicable"
+    assert len(metrics["resourceSamples"]) == 10
+    assert metrics["resourceSamples"][0]["sequence"] == 2
     assert metrics["limits"] == {
         "configuredMaxWorkers": 1,
         "configuredQueueCapacity": 100,
@@ -355,6 +393,9 @@ def test_collection_health_and_queue_metrics_are_bounded_public_views(
         "hardQueueCapacity": 10_000,
         "perSourceConcurrency": 1,
         "perAuthStateConcurrency": 1,
+        "resourceMaxRssMb": 1_536,
+        "resourceMaxCpuPercent": 300,
+        "resourceRecoverySeconds": 5,
     }
     assert "token" not in metrics
     assert secret not in response.get_data(as_text=True)

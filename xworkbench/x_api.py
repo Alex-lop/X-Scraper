@@ -483,7 +483,7 @@ class XApiProvider:
                         seconds=random.uniform(0.5, 2.0)
                     )
                     raise RateLimitWaiting(
-                        "X API rate limit reached; collection will resume automatically.",
+                        "X API rate limit reached; start a new approved capture later.",
                         _iso(retry_at),
                         remaining,
                         reset,

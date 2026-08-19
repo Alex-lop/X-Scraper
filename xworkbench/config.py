@@ -102,6 +102,9 @@ class Settings:
     no_progress_limit: int = 3
     max_workers: int = 1
     queue_capacity: int = 100
+    resource_max_rss_mb: int = 1_536
+    resource_max_cpu_percent: int = 300
+    resource_recovery_seconds: int = 5
     retention_keep_per_source: int = 10
     snapshot_stale_after_seconds: int = 86_400
     config_path: Path | None = None
@@ -145,6 +148,9 @@ class Settings:
             ("no_progress_limit", self.no_progress_limit, 1, 100),
             ("max_workers", self.max_workers, 1, 2),
             ("queue_capacity", self.queue_capacity, 1, 10_000),
+            ("resource_max_rss_mb", self.resource_max_rss_mb, 128, 131_072),
+            ("resource_max_cpu_percent", self.resource_max_cpu_percent, 1, 1_000),
+            ("resource_recovery_seconds", self.resource_recovery_seconds, 1, 300),
             ("retention_keep_per_source", self.retention_keep_per_source, 1, 100),
             (
                 "snapshot_stale_after_seconds",
@@ -197,6 +203,17 @@ class Settings:
             queue_capacity=cls._integer(
                 setting("queue_capacity", 100), "queue_capacity"
             ),
+            resource_max_rss_mb=cls._integer(
+                setting("resource_max_rss_mb", 1_536), "resource_max_rss_mb"
+            ),
+            resource_max_cpu_percent=cls._integer(
+                setting("resource_max_cpu_percent", 300),
+                "resource_max_cpu_percent",
+            ),
+            resource_recovery_seconds=cls._integer(
+                setting("resource_recovery_seconds", 5),
+                "resource_recovery_seconds",
+            ),
             retention_keep_per_source=cls._integer(
                 setting("retention_keep_per_source", 10),
                 "retention_keep_per_source",
@@ -233,6 +250,9 @@ class Settings:
             "no_progress_limit",
             "max_workers",
             "queue_capacity",
+            "resource_max_rss_mb",
+            "resource_max_cpu_percent",
+            "resource_recovery_seconds",
             "retention_keep_per_source",
             "snapshot_stale_after_seconds",
         }
@@ -280,6 +300,9 @@ class Settings:
                 "no_progress_limit": self.no_progress_limit,
                 "max_workers": self.max_workers,
                 "queue_capacity": self.queue_capacity,
+                "resource_max_rss_mb": self.resource_max_rss_mb,
+                "resource_max_cpu_percent": self.resource_max_cpu_percent,
+                "resource_recovery_seconds": self.resource_recovery_seconds,
                 "retention_keep_per_source": self.retention_keep_per_source,
                 "snapshot_stale_after_seconds": self.snapshot_stale_after_seconds,
             },
@@ -333,6 +356,9 @@ class Settings:
             "no_progress_limit": self.no_progress_limit,
             "max_workers": self.max_workers,
             "queue_capacity": self.queue_capacity,
+            "resource_max_rss_mb": self.resource_max_rss_mb,
+            "resource_max_cpu_percent": self.resource_max_cpu_percent,
+            "resource_recovery_seconds": self.resource_recovery_seconds,
             "retention_keep_per_source": self.retention_keep_per_source,
             "snapshot_stale_after_seconds": self.snapshot_stale_after_seconds,
             "per_source_concurrency": 1,

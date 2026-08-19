@@ -52,6 +52,9 @@ def test_malformed_settings_have_stable_error_without_traceback(tmp_path, monkey
         ('{"surprise": true}', "Unknown config key"),
         ('{"job_timeout_seconds": 0}', "from 1 to 3600"),
         ('{"max_workers": 3}', "from 1 to 2"),
+        ('{"resource_max_rss_mb": 127}', "from 128 to 131072"),
+        ('{"resource_max_cpu_percent": 1001}', "from 1 to 1000"),
+        ('{"resource_recovery_seconds": 0}', "from 1 to 300"),
     ],
 )
 def test_config_rejects_malformed_unknown_and_unsafe_values(
@@ -266,6 +269,9 @@ def test_config_show_redacts_environment_token(tmp_path, monkeypatch, capsys):
     assert resolved["max_workers"] == resolved["per_auth_state_concurrency"] == 1
     assert resolved["hard_worker_maximum"] == 4
     assert resolved["route_mode"] == "direct"
+    assert resolved["resource_max_rss_mb"] == 1_536
+    assert resolved["resource_max_cpu_percent"] == 300
+    assert resolved["resource_recovery_seconds"] == 5
 
 
 def test_expected_browser_failure_has_stable_exit_without_traceback(

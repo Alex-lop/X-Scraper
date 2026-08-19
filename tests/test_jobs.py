@@ -430,6 +430,55 @@ class EventProvider:
         return CollectionSummary(completion_reason="search_exhausted")
 
 
+class ResourceProbe:
+    def __init__(self, *, rss_supported=True):
+        self.high = False
+        self.rss_supported = rss_supported
+        self.now = 0.0
+        self.calls = 0
+        self.lock = threading.Lock()
+
+    def clock(self):
+        with self.lock:
+            return self.now
+
+    def __call__(self):
+        with self.lock:
+            self.calls += 1
+            high = self.high
+        return {
+            "rssBytes": (256 if high else 64) * 1024 * 1024
+            if self.rss_supported
+            else None,
+            "cpuPercent": 250.0 if high else 10.0,
+            "eventLoopLagMs": 999.0,
+            "chromiumProcessCount": 3,
+            "liveContextCount": 2,
+            "livePageCount": 1,
+            "token": "RESOURCE-SENTINEL",
+        }
+
+    def set(self, *, high, now):
+        with self.lock:
+            self.high = high
+            self.now = now
+
+
+class ResourceProvider:
+    provider_id = ProviderType.OFFICIAL_X_API
+    provider_version = 1
+
+    def __init__(self, entered, release):
+        self.entered = entered
+        self.release = release
+
+    def collect(self, request, *, execution_plan, checkpoint, on_batch, should_cancel):
+        if execution_plan["schedulerLabel"] == "first":
+            self.entered.set()
+            assert self.release.wait(2)
+        return CollectionSummary(completion_reason="search_exhausted")
+
+
 def scheduled_plan(request, source, auth, label):
     return {
         **compile_request(request),
@@ -959,3 +1008,78 @@ def test_progress_events_are_bounded_coalesced_and_fall_back_to_durable_state(
     assert metrics["eventLastSequence"] == 5
     assert metrics["eventDropped"] == metrics["eventCoalesced"] == 1
     assert all("event payload" not in repr(event) for event in snapshot["events"])
+
+
+@pytest.mark.parametrize("rss_supported", [True, False])
+def test_resource_governor_pauses_new_leases_and_recovers_without_interrupting_active(
+    tmp_path, rss_supported
+):
+    storage = Storage(tmp_path / "resource-governor.db")
+    storage.initialize()
+    entered = threading.Event()
+    release = threading.Event()
+    probe = ResourceProbe(rss_supported=rss_supported)
+    provider = ResourceProvider(entered, release)
+    service = JobService(
+        storage,
+        provider,
+        start_worker=False,
+        resource_max_rss_mb=128,
+        resource_max_cpu_percent=200,
+        resource_recovery_seconds=1,
+        resource_probe=probe,
+        resource_clock=probe.clock,
+    )
+    job_ids = []
+    for label in ("first", "second"):
+        request = CollectionRequest.from_dict(
+            {"sourceType": "profile", "sourceValue": label, "maxPosts": 10}
+        )
+        job_ids.append(
+            service.submit(
+                request,
+                scheduled_plan(request, label, label, label),
+                auth_state_id=label,
+            )
+        )
+    service.start()
+    assert entered.wait(2)
+    assert service.metrics()["activeWorkers"] == 1
+
+    probe.set(high=True, now=1.0)
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not service.metrics()["resourcePaused"]:
+        threading.Event().wait(0.01)
+    paused = service.metrics()
+    second = storage.get_job(job_ids[1])
+
+    assert paused["resourcePaused"] is True
+    assert paused["resourcePauseReasons"] == (["rss", "cpu"] if rss_supported else ["cpu"])
+    assert paused["finished"] == paused["started"] == 1
+    assert paused["queueDepth"] == 1 and paused["activeWorkers"] == 0
+    assert second["status"] == "queued" and second["attempt_number"] == 0
+    assert storage.get_job(job_ids[0])["status"] == "succeeded"
+
+    probe.set(high=False, now=2.0)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and probe.calls < 3:
+        threading.Event().wait(0.01)
+    assert service.metrics()["resourcePauseReasons"] == ["recovery_window"]
+    probe.set(high=False, now=3.1)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and service.metrics()["finished"] < 2:
+        threading.Event().wait(0.01)
+    metrics = service.metrics()
+    service.shutdown()
+
+    assert storage.get_job(job_ids[1])["status"] == "succeeded"
+    assert metrics["resourcePaused"] is False
+    assert metrics["resourcePauseReasons"] == []
+    assert metrics["rssBytes"] == (64 * 1024 * 1024 if rss_supported else None)
+    assert metrics["cpuPercent"] == 10.0
+    assert metrics["eventLoopLagMs"] is None
+    assert metrics["resourceSignalStatus"]["eventLoopLagMs"] == "not_applicable"
+    assert metrics["chromiumProcessCount"] == 3
+    assert len(metrics["resourceSamples"]) <= metrics["resourceSampleCapacity"] == 10
+    assert "RESOURCE-SENTINEL" not in repr(metrics)

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
 import logging
+import math
 import os
+import sys
 import threading
 import traceback
 import uuid
@@ -11,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import monotonic
+from time import monotonic, process_time
 from typing import Any
 
 from .errors import CollectionCancelled, CollectionError, RateLimitWaiting
@@ -68,6 +71,74 @@ class QueueFullError(CollectionError):
     retryable = True
 
 
+class _ProcessResourceProbe:
+    # ponytail: stdlib process metrics only; add an optional tree probe if browser-tree
+    # admission becomes portable enough to test on every supported OS.
+    def __init__(self, clock: Callable[[], float]):
+        self._clock = clock
+        self._last_wall: float | None = None
+        self._last_cpu: float | None = None
+        self._cpu_percent: float | None = None
+
+    @staticmethod
+    def _rss_bytes() -> int | None:
+        if sys.platform.startswith("linux"):
+            try:
+                resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+                return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+            except (OSError, ValueError, IndexError):
+                return None
+        if sys.platform == "darwin":
+
+            class ProcTaskInfo(ctypes.Structure):
+                _fields_ = [
+                    ("virtual_size", ctypes.c_uint64),
+                    ("resident_size", ctypes.c_uint64),
+                    ("total_user", ctypes.c_uint64),
+                    ("total_system", ctypes.c_uint64),
+                    ("threads_user", ctypes.c_uint64),
+                    ("threads_system", ctypes.c_uint64),
+                    *[
+                        (name, ctypes.c_int32)
+                        for name in (
+                            "policy",
+                            "faults",
+                            "pageins",
+                            "cow_faults",
+                            "messages_sent",
+                            "messages_received",
+                            "syscalls_mach",
+                            "syscalls_unix",
+                            "csw",
+                            "threadnum",
+                            "numrunning",
+                            "priority",
+                        )
+                    ],
+                ]
+
+            try:
+                libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+                info = ProcTaskInfo()
+                size = ctypes.sizeof(info)
+                returned = libproc.proc_pidinfo(os.getpid(), 4, 0, ctypes.byref(info), size)
+                return int(info.resident_size) if returned == size else None
+            except (AttributeError, OSError):
+                return None
+        return None
+
+    def __call__(self) -> dict[str, Any]:
+        wall = self._clock()
+        cpu = process_time()
+        if self._last_wall is not None and wall - self._last_wall >= 0.1:
+            self._cpu_percent = max(
+                0.0, (cpu - (self._last_cpu or 0.0)) / (wall - self._last_wall) * 100
+            )
+        self._last_wall = wall
+        self._last_cpu = cpu
+        return {"rssBytes": self._rss_bytes(), "cpuPercent": self._cpu_percent}
+
+
 @dataclass(slots=True)
 class _QueuedJob:
     job_id: str
@@ -90,6 +161,11 @@ class JobService:
         provider_factory: Callable[[], ProviderRegistry | CollectionProvider] | None = None,
         lease_seconds: int = 30,
         event_capacity: int = 1_000,
+        resource_max_rss_mb: int = 1_536,
+        resource_max_cpu_percent: int = 300,
+        resource_recovery_seconds: int = 5,
+        resource_probe: Callable[[], dict[str, Any]] | None = None,
+        resource_clock: Callable[[], float] = monotonic,
     ):
         if isinstance(max_workers, bool) or not 1 <= max_workers <= 4:
             raise ValueError("max_workers must be between 1 and 4.")
@@ -101,6 +177,23 @@ class JobService:
             raise ValueError("lease_seconds must be between 1 and 300.")
         if isinstance(event_capacity, bool) or not 1 <= event_capacity <= 10_000:
             raise ValueError("event_capacity must be between 1 and 10,000.")
+        for name, value, minimum, maximum in (
+            ("resource_max_rss_mb", resource_max_rss_mb, 128, 131_072),
+            ("resource_max_cpu_percent", resource_max_cpu_percent, 1, 1_000),
+            ("resource_recovery_seconds", resource_recovery_seconds, 1, 300),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+        if (
+            not callable(resource_clock)
+            or resource_probe is not None
+            and not callable(resource_probe)
+        ):
+            raise ValueError("resource probe and clock must be callable.")
         self.storage = storage
         self.registry = (
             providers if isinstance(providers, ProviderRegistry) else ProviderRegistry([providers])
@@ -108,6 +201,11 @@ class JobService:
         self.max_workers = max_workers
         self.max_queue = max_queue
         self.lease_seconds = lease_seconds
+        self.resource_max_rss_mb = resource_max_rss_mb
+        self.resource_max_cpu_percent = resource_max_cpu_percent
+        self.resource_recovery_seconds = resource_recovery_seconds
+        self._resource_clock = resource_clock
+        self._resource_probe = resource_probe or _ProcessResourceProbe(resource_clock)
         self._provider_factory = provider_factory
         self._condition = threading.Condition()
         # ponytail: serialize SQLite callbacks until Storage owns queue backpressure/leases.
@@ -137,6 +235,22 @@ class JobService:
         self._event_sequence = 0
         self._event_dropped = 0
         self._event_coalesced = 0
+        self._resource_samples: deque[dict[str, Any]] = deque(maxlen=10)
+        self._resource_sample_sequence = 0
+        self._resource_next_sample_at = 0.0
+        self._resource_paused = False
+        self._resource_pause_reasons: list[str] = []
+        self._resource_tripped_signals: set[str] = set()
+        self._resource_recovery_since: float | None = None
+        self._resource_probe_failures = 0
+        self._resource_signal_status = {
+            "rssBytes": "unsupported",
+            "cpuPercent": "unsupported",
+            "eventLoopLagMs": "not_applicable",
+            "chromiumProcessCount": "unsupported",
+            "liveContextCount": "unsupported",
+            "livePageCount": "unsupported",
+        }
         self._threads: list[threading.Thread] = []
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -562,6 +676,92 @@ class JobService:
             del self._source_order[item.priority]
         return True
 
+    @staticmethod
+    def _resource_value(value: Any, *, integer: bool) -> int | float | None:
+        if (
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or value < 0
+            or not math.isfinite(value)
+            or integer
+            and not isinstance(value, int)
+        ):
+            return None
+        return value
+
+    def _resource_ready_locked(self) -> bool:
+        try:
+            now = float(self._resource_clock())
+            if not math.isfinite(now):
+                raise ValueError
+        except Exception:
+            self._resource_probe_failures += 1
+            if self._resource_paused:
+                self._resource_pause_reasons = ["signals_unavailable"]
+                self._resource_recovery_since = None
+            return not self._resource_paused
+        if self._resource_samples and now < self._resource_next_sample_at:
+            return not self._resource_paused
+        try:
+            raw = self._resource_probe()
+            if not isinstance(raw, dict):
+                raise TypeError
+        except Exception:
+            raw = {}
+            self._resource_probe_failures += 1
+        sample = {
+            "rssBytes": self._resource_value(raw.get("rssBytes"), integer=True),
+            "cpuPercent": self._resource_value(raw.get("cpuPercent"), integer=False),
+            "eventLoopLagMs": None,
+            "chromiumProcessCount": self._resource_value(
+                raw.get("chromiumProcessCount"), integer=True
+            ),
+            "liveContextCount": self._resource_value(raw.get("liveContextCount"), integer=True),
+            "livePageCount": self._resource_value(raw.get("livePageCount"), integer=True),
+        }
+        for name, value in sample.items():
+            self._resource_signal_status[name] = (
+                "not_applicable"
+                if name == "eventLoopLagMs"
+                else "supported"
+                if value is not None
+                else "unsupported"
+            )
+        self._resource_sample_sequence += 1
+        self._resource_samples.append({"sequence": self._resource_sample_sequence, **sample})
+        self._resource_next_sample_at = now + 0.25
+        reasons = []
+        if (
+            sample["rssBytes"] is not None
+            and sample["rssBytes"] > self.resource_max_rss_mb * 1024 * 1024
+        ):
+            reasons.append("rss")
+        if (
+            sample["cpuPercent"] is not None
+            and sample["cpuPercent"] > self.resource_max_cpu_percent
+        ):
+            reasons.append("cpu")
+        if reasons:
+            self._resource_paused = True
+            self._resource_pause_reasons = reasons
+            self._resource_tripped_signals = set(reasons)
+            self._resource_recovery_since = None
+        elif self._resource_paused:
+            signal_values = {"rss": sample["rssBytes"], "cpu": sample["cpuPercent"]}
+            if any(signal_values[name] is None for name in self._resource_tripped_signals):
+                self._resource_pause_reasons = ["signals_unavailable"]
+                self._resource_recovery_since = None
+            elif self._resource_recovery_since is None:
+                self._resource_pause_reasons = ["recovery_window"]
+                self._resource_recovery_since = now
+            elif now - self._resource_recovery_since >= self.resource_recovery_seconds:
+                self._resource_paused = False
+                self._resource_pause_reasons = []
+                self._resource_tripped_signals.clear()
+                self._resource_recovery_since = None
+                self._condition.notify_all()
+        return not self._resource_paused
+
     def _next_job_locked(self) -> _QueuedJob | None:
         for priority in sorted(self._pending, reverse=True):
             sources = self._source_order[priority]
@@ -660,6 +860,18 @@ class JobService:
     def metrics(self) -> dict[str, Any]:
         with self._condition:
             uptime = max(monotonic() - self._started_at, 0.000_001)
+            latest_resources = (
+                self._resource_samples[-1]
+                if self._resource_samples
+                else {
+                    "rssBytes": None,
+                    "cpuPercent": None,
+                    "eventLoopLagMs": None,
+                    "chromiumProcessCount": None,
+                    "liveContextCount": None,
+                    "livePageCount": None,
+                }
+            )
             return {
                 "queueDepth": len(self._pending_jobs),
                 "queueCapacity": self.max_queue,
@@ -687,6 +899,27 @@ class JobService:
                 "eventLastSequence": self._event_sequence,
                 "eventDropped": self._event_dropped,
                 "eventCoalesced": self._event_coalesced,
+                **{
+                    name: latest_resources[name]
+                    for name in (
+                        "rssBytes",
+                        "cpuPercent",
+                        "eventLoopLagMs",
+                        "chromiumProcessCount",
+                        "liveContextCount",
+                        "livePageCount",
+                    )
+                },
+                "resourcePaused": self._resource_paused,
+                "resourcePauseReasons": list(self._resource_pause_reasons),
+                "resourceSamples": [dict(sample) for sample in self._resource_samples],
+                "resourceSampleCapacity": self._resource_samples.maxlen,
+                "resourceSampleCount": len(self._resource_samples),
+                "resourceProbeFailures": self._resource_probe_failures,
+                "resourceSignalStatus": dict(self._resource_signal_status),
+                "resourceRecoverySeconds": self.resource_recovery_seconds,
+                "resourceMaxRssMb": self.resource_max_rss_mb,
+                "resourceMaxCpuPercent": self.resource_max_cpu_percent,
             }
 
     @staticmethod
@@ -951,6 +1184,9 @@ class JobService:
             with self._condition:
                 item = None
                 while not self._stop_event.is_set():
+                    if self._pending_jobs and not self._resource_ready_locked():
+                        self._condition.wait(timeout=0.25)
+                        continue
                     item = self._next_job_locked()
                     if item is not None:
                         break

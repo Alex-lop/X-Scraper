@@ -641,8 +641,7 @@ def _public_queue_metrics(
 ) -> dict[str, Any]:
     value = value if isinstance(value, dict) else {}
 
-    def number(name: str, *, integer: bool = True) -> int | float | None:
-        item = value.get(name)
+    def safe_number(item: Any, *, integer: bool = True) -> int | float | None:
         valid = (
             isinstance(item, int | float)
             and not isinstance(item, bool)
@@ -652,6 +651,9 @@ def _public_queue_metrics(
         if not valid or (integer and not isinstance(item, int)):
             return None
         return item
+
+    def number(name: str, *, integer: bool = True) -> int | float | None:
+        return safe_number(value.get(name), integer=integer)
 
     result = {
         name: number(name)
@@ -677,6 +679,13 @@ def _public_queue_metrics(
             "eventLastSequence",
             "eventDropped",
             "eventCoalesced",
+            "rssBytes",
+            "chromiumProcessCount",
+            "liveContextCount",
+            "livePageCount",
+            "resourceSampleCapacity",
+            "resourceSampleCount",
+            "resourceProbeFailures",
         )
     }
     result.update(
@@ -687,9 +696,62 @@ def _public_queue_metrics(
                 "queueWaitP95Ms",
                 "throughputJobsPerSecond",
                 "cleanupSeconds",
+                "cpuPercent",
             )
         }
     )
+    result["eventLoopLagMs"] = None
+    paused = value.get("resourcePaused")
+    result["resourcePaused"] = paused if isinstance(paused, bool) else None
+    allowed_reasons = {"rss", "cpu", "recovery_window", "signals_unavailable"}
+    raw_reasons = value.get("resourcePauseReasons")
+    result["resourcePauseReasons"] = list(
+        dict.fromkeys(
+            reason
+            for reason in (raw_reasons if isinstance(raw_reasons, list) else [])
+            if reason in allowed_reasons
+        )
+    )
+    signal_names = (
+        "rssBytes",
+        "cpuPercent",
+        "eventLoopLagMs",
+        "chromiumProcessCount",
+        "liveContextCount",
+        "livePageCount",
+    )
+    raw_signals = value.get("resourceSignalStatus")
+    result["resourceSignalStatus"] = {
+        name: (
+            "not_applicable"
+            if name == "eventLoopLagMs"
+            else raw_signals.get(name)
+            if isinstance(raw_signals, dict)
+            and raw_signals.get(name) in {"supported", "unsupported", "not_applicable"}
+            else "unsupported"
+        )
+        for name in signal_names
+    }
+    raw_samples = value.get("resourceSamples")
+    result["resourceSamples"] = []
+    for sample in raw_samples[-10:] if isinstance(raw_samples, list) else []:
+        if not isinstance(sample, dict):
+            continue
+        result["resourceSamples"].append(
+            {
+                "sequence": safe_number(sample.get("sequence")),
+                "rssBytes": safe_number(sample.get("rssBytes")),
+                "cpuPercent": safe_number(
+                    sample.get("cpuPercent"), integer=False
+                ),
+                "eventLoopLagMs": None,
+                "chromiumProcessCount": safe_number(
+                    sample.get("chromiumProcessCount")
+                ),
+                "liveContextCount": safe_number(sample.get("liveContextCount")),
+                "livePageCount": safe_number(sample.get("livePageCount")),
+            }
+        )
     raw_statuses = value.get("completedByStatus")
     result["completedByStatus"] = {
         name: item
@@ -706,6 +768,9 @@ def _public_queue_metrics(
         "hardQueueCapacity": HARD_QUEUE_CAPACITY,
         "perSourceConcurrency": PER_SOURCE_CONCURRENCY,
         "perAuthStateConcurrency": PER_AUTH_STATE_CONCURRENCY,
+        "resourceMaxRssMb": number("resourceMaxRssMb"),
+        "resourceMaxCpuPercent": number("resourceMaxCpuPercent"),
+        "resourceRecoverySeconds": number("resourceRecoverySeconds"),
     }
     return result
 
@@ -915,6 +980,9 @@ def create_app(
         start_worker=start_worker,
         max_workers=max_workers,
         max_queue=settings.queue_capacity,
+        resource_max_rss_mb=settings.resource_max_rss_mb,
+        resource_max_cpu_percent=settings.resource_max_cpu_percent,
+        resource_recovery_seconds=settings.resource_recovery_seconds,
         provider_factory=(
             (lambda: _default_registry(settings))
             if not custom_registry and max_workers > 1
