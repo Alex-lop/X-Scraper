@@ -65,6 +65,7 @@ jobs:
   browser:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -76,7 +77,9 @@ jobs:
           cache-dependency-path: requirements.lock
       - run: pip install -r requirements.lock
       - run: pip install -e . --no-deps
-      - run: playwright install --with-deps chromium
+      - name: Install pinned Chromium
+        timeout-minutes: 8
+        run: playwright install chromium
       - name: Run offline local-Chromium integration test
         run: pytest tests/test_playwright_integration.py
       - name: Run bounded queue browser matrix
@@ -99,7 +102,9 @@ jobs:
           cache-dependency-path: requirements.lock
       - run: pip install -r requirements.lock
       - run: pip install -e . --no-deps
-      - run: playwright install --with-deps chromium
+      - name: Install pinned Chromium
+        timeout-minutes: 8
+        run: playwright install chromium
       - name: Build release wheel for lab boundary inspection
         run: |
           mkdir -p "$RUNNER_TEMP/capability-lab-home"
