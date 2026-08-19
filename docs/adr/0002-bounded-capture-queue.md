@@ -32,12 +32,17 @@ thread-affine Playwright objects. Each browser capture owns its Playwright runti
 context, page, and app-owned auth-state file; cleanup happens in the provider's `finally` path.
 Auth-state refreshes remain serialized and a stale capture cannot overwrite newer state.
 
-Start with fixed bounds. The current governor stops at queue, worker, source, auth-state, and
-serialized-persistence limits. It does not yet pause admission from sampled RSS, CPU, or event-loop
-thresholds, and therefore must not report `resource_paused`. Add that state only with deterministic
-threshold and recovery-window tests. Existing queue metrics expose depth, waits, workers, states,
-throughput, persistence backlog, and cleanup; browser and operating-system measurements stay in
-the local benchmark proof until their sampling lifecycle is production-safe.
+Combine fixed queue, worker, source, auth-state, and serialized-persistence bounds with a small
+pre-lease resource governor. At most every 250 ms it samples the coordinator process's RSS and CPU;
+defaults are 1536 MiB and 300%. Crossing either threshold pauses new leases but never interrupts an
+active capture. Resume requires both signals to remain supported and below threshold for five
+seconds; probe failure while paused restarts that window. Metrics retain at most 10 samples and
+expose pause reasons, failures, thresholds, and signal status.
+
+The default probe supports process RSS/CPU on macOS and Linux. Chromium process/context/page counts
+remain unsupported, and synchronous workers have no applicable event-loop-lag signal. The governor
+therefore complements rather than replaces the process-tree benchmark and must not be described as
+a whole-browser memory ceiling.
 
 ## Evidence
 
