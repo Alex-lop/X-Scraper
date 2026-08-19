@@ -20,9 +20,12 @@ def test_cli_exposes_recovered_commands_and_bounded_live_gate():
 
     assert set(command_action.choices) == {
         "configure",
+        "setup",
         "auth",
         "doctor",
+        "start",
         "serve",
+        "config",
         "demo",
         "mcp",
         "live-smoke",
@@ -124,6 +127,22 @@ def test_live_smoke_requires_explicit_confirmation_before_provider_use(monkeypat
     monkeypatch.setattr("xworkbench.cli.PlaywrightBrowserProvider", ShouldNotConstruct)
     assert main(["live-smoke"]) == EXIT_PRECONDITION
     assert "--confirm-live-x" in capsys.readouterr().err
+
+
+def test_live_smoke_rejects_legacy_ready_without_verified_live(tmp_path, monkeypatch, capsys):
+    class LegacyReady:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def connection_status(self):
+            return {"status": "ready", "ready": True}
+
+    settings = Settings(tmp_path / "db", tmp_path / "token")
+    monkeypatch.setattr("xworkbench.cli.Settings.from_env", lambda: settings)
+    monkeypatch.setattr("xworkbench.cli.PlaywrightBrowserProvider", LegacyReady)
+
+    assert main(["live-smoke", "--confirm-live-x"]) == EXIT_PRECONDITION
+    assert "browser session ready" in capsys.readouterr().err
 
 
 def test_serve_refuses_non_loopback_host():

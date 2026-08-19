@@ -145,9 +145,10 @@ class OfficialProvider:
 
 def make_client(tmp_path, *, token=False, partial=False, providers=None):
     token_path = tmp_path / "auth" / "token"
-    token_path.parent.mkdir(parents=True)
+    token_path.parent.mkdir(parents=True, mode=0o700)
     if token:
         token_path.write_text("secret")
+        token_path.chmod(0o600)
     settings = Settings(tmp_path / "test.db", token_path)
     storage = Storage(settings.database_path)
     registry = ProviderRegistry(

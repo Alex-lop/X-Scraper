@@ -52,8 +52,9 @@ def payload(*, next_token="next"):
 
 def settings(tmp_path):
     token = tmp_path / "auth" / "token"
-    token.parent.mkdir()
+    token.parent.mkdir(mode=0o700)
     token.write_text("secret")
+    token.chmod(0o600)
     return Settings(tmp_path / "db.sqlite", token)
 
 
