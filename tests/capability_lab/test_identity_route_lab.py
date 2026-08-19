@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import secrets
@@ -9,12 +8,8 @@ import socketserver
 import threading
 import time
 from dataclasses import dataclass, field
-from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, build_opener
 
 import pytest
 
@@ -115,15 +110,28 @@ class _FixtureDisconnectServer(socketserver.TCPServer):
     allow_reuse_address = False
 
 
-class _DisconnectHandler(socketserver.BaseRequestHandler):
-    def handle(self) -> None:
-        self.request.shutdown(socket.SHUT_RDWR)
+_FIXTURE_TARGET = "http://127.0.0.1:9/fixture-target"
+_ABSOLUTE_REQUEST_LINE = f"GET {_FIXTURE_TARGET} HTTP/1.1"
 
 
-def _handler_for(outcome: str) -> type[BaseHTTPRequestHandler]:
+def _disconnect_handler_for(records: list[str]) -> type[socketserver.BaseRequestHandler]:
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            request = self.request.recv(2_048)
+            records.append(request.partition(b"\r\n")[0].decode("ascii", "replace"))
+            try:
+                self.request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    return Handler
+
+
+def _handler_for(outcome: str, records: list[str]) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
-            if self.path != "/fixture-route":
+            records.append(self.requestline)
+            if self.path != _FIXTURE_TARGET:
                 self.send_error(404)
                 return
             if outcome == "timeout":
@@ -144,33 +152,11 @@ def _handler_for(outcome: str) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-@dataclass(frozen=True)
-class _FixtureEndpoint:
-    alias: str
-    url: str = field(repr=False)
+class _RouteHandle:
+    __slots__ = ()
 
-
-class _RejectRedirects(HTTPRedirectHandler):
-    def redirect_request(self, *_: Any, **__: Any) -> None:
-        raise RuntimeError("Fixture redirects are prohibited.")
-
-
-def _request_generated_endpoint(endpoint: _FixtureEndpoint) -> str:
-    parsed = urlsplit(endpoint.url)
-    try:
-        address = ipaddress.ip_address(parsed.hostname or "")
-    except ValueError as exc:
-        raise RuntimeError("Fixture endpoints must use a numeric loopback address.") from exc
-    if (
-        parsed.scheme != "http"
-        or not address.is_loopback
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path != "/fixture-route"
-    ):
-        raise RuntimeError("Fixture endpoint failed the loopback preflight check.")
-    with build_opener(_RejectRedirects).open(endpoint.url, timeout=0.02) as response:
-        return response.read(128).decode("ascii")
+    def __repr__(self) -> str:
+        return "<opaque fixture route>"
 
 
 class _RouteFixture:
@@ -188,19 +174,28 @@ class _RouteFixture:
         _require_lab_activation(activation)
         self.audit: list[dict[str, str | int]] = []
         self.cooldowns: dict[str, int] = {}
+        self.now = 0
+        self.contact_count = 0
         self._servers: list[socketserver.BaseServer] = []
         self._threads: list[threading.Thread] = []
-        self._endpoints: dict[str, _FixtureEndpoint] = {}
+        self._handles = {alias: _RouteHandle() for alias, _ in self._SCRIPT}
+        self._aliases = {handle: alias for alias, handle in self._handles.items()}
+        self._ports: dict[_RouteHandle, int] = {}
+        self._records = {handle: [] for handle in self._handles.values()}
 
     def __enter__(self) -> _RouteFixture:
         try:
             for alias, outcome in self._SCRIPT:
+                handle = self._handles[alias]
+                records = self._records[handle]
                 if outcome == "disconnect":
                     server: socketserver.BaseServer = _FixtureDisconnectServer(
-                        ("127.0.0.1", 0), _DisconnectHandler
+                        ("127.0.0.1", 0), _disconnect_handler_for(records)
                     )
                 else:
-                    server = _FixtureHTTPServer(("127.0.0.1", 0), _handler_for(outcome))
+                    server = _FixtureHTTPServer(
+                        ("127.0.0.1", 0), _handler_for(outcome, records)
+                    )
                 host, port = server.server_address
                 if host != "127.0.0.1":
                     server.server_close()
@@ -209,9 +204,7 @@ class _RouteFixture:
                 thread.start()
                 self._servers.append(server)
                 self._threads.append(thread)
-                self._endpoints[alias] = _FixtureEndpoint(
-                    alias, f"http://127.0.0.1:{port}/fixture-route"
-                )
+                self._ports[handle] = port
         except Exception:
             self.close()
             raise
@@ -228,33 +221,64 @@ class _RouteFixture:
             thread.join(timeout=1)
         self._servers.clear()
         self._threads.clear()
-        self._endpoints.clear()
+        self._ports.clear()
+        self._records.clear()
+        self._aliases.clear()
+        self._handles.clear()
         self.cooldowns.clear()
 
-    def run(self) -> dict[str, object]:
-        for attempt, (alias, expected) in enumerate(self._SCRIPT, start=1):
-            endpoint = self._endpoints[alias]
-            try:
-                body = _request_generated_endpoint(endpoint)
-                observed = "challenge" if body == "fixture-challenge" else "unexpected_success"
-            except HTTPError as exc:
-                observed = str(exc.code)
-            except TimeoutError:
-                observed = "timeout"
-            except (RemoteDisconnected, URLError, ConnectionError):
+    def _attempt(self, handle: _RouteHandle, attempt: int) -> str:
+        if handle not in self._ports or handle not in self._aliases:
+            raise RuntimeError("Route handle was not issued by this fixture.")
+        alias = self._aliases[handle]
+        if self.cooldowns.get(alias, 0) > self.now:
+            raise RuntimeError(f"{alias} is cooling down")
+        self.contact_count += 1
+        request = (
+            f"{_ABSOLUTE_REQUEST_LINE}\r\n"
+            "Host: 127.0.0.1:9\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        response = bytearray()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.02)
+                connection.connect(("127.0.0.1", self._ports[handle]))
+                connection.sendall(request)
+                while chunk := connection.recv(2_048):
+                    response.extend(chunk)
+        except TimeoutError:
+            observed = "timeout"
+        except (ConnectionError, OSError):
+            observed = "connection_failure"
+        else:
+            first_line = bytes(response).partition(b"\r\n")[0]
+            if first_line.startswith(b"HTTP/"):
+                status = first_line.split(maxsplit=2)[1].decode("ascii")
+                observed = (
+                    "challenge" if b"fixture-challenge" in response else status
+                )
+            else:
                 observed = "connection_failure"
+        self.cooldowns[alias] = self.now + 5
+        self.audit.append(
+            {
+                "attempt": attempt,
+                "route": alias,
+                "outcome": observed,
+                "cooldownUntil": self.cooldowns[alias],
+            }
+        )
+        return observed
+
+    def run(self) -> dict[str, object]:
+        self.now = 0
+        for attempt, (alias, expected) in enumerate(self._SCRIPT, start=1):
+            observed = self._attempt(self._handles[alias], attempt)
             expected_observation = "connection_failure" if expected == "disconnect" else expected
             if observed != expected_observation:
                 raise AssertionError(f"fixture {alias} returned {observed}")
-            self.cooldowns[alias] = attempt * 5
-            self.audit.append(
-                {
-                    "attempt": attempt,
-                    "route": alias,
-                    "outcome": observed,
-                    "cooldownUntil": self.cooldowns[alias],
-                }
-            )
+            self.now += 5
         self.audit.append(
             {
                 "attempt": len(self._SCRIPT),
@@ -298,7 +322,8 @@ def test_synthetic_identity_lease_cap_cooldown_expiry_replacement_and_redaction(
         fixture.now = 10
         assert fixture.lease().alias == "fixture-alpha"
         public_evidence = fixture.report() + repr(fixture.identities) + "".join(errors)
-        assert all(secret not in public_evidence for secret in sentinels)
+        if any(secret in public_evidence for secret in sentinels):
+            pytest.fail("synthetic identity secret escaped redaction", pytrace=False)
         assert [event["event"] for event in fixture.audit] == [
             "leased",
             "leased",
@@ -309,9 +334,9 @@ def test_synthetic_identity_lease_cap_cooldown_expiry_replacement_and_redaction(
             "leased",
         ]
 
-    assert fixture.identities == {}
+    if fixture.identities:
+        pytest.fail("synthetic identities survived cleanup", pytrace=False)
     sentinels.clear()
-    assert sentinels == []
 
 
 def test_identity_fixture_rejects_production_x_before_secret_access(monkeypatch) -> None:
@@ -329,6 +354,20 @@ def test_identity_fixture_rejects_production_x_before_secret_access(monkeypatch)
 
 
 def test_loopback_route_transitions_are_bounded_audited_and_cleaned_up() -> None:
+    cooldown_fixture = _RouteFixture()
+    with cooldown_fixture:
+        cooldown_threads = list(cooldown_fixture._threads)
+        forbidden = cooldown_fixture._handles["route-forbidden"]
+        assert cooldown_fixture._attempt(forbidden, 1) == "403"
+        contacts = cooldown_fixture.contact_count
+        with pytest.raises(RuntimeError, match="cooling down"):
+            cooldown_fixture._attempt(forbidden, 2)
+        assert cooldown_fixture.contact_count == contacts
+
+    assert cooldown_fixture._ports == {}
+    assert cooldown_fixture._handles == {}
+    assert all(not thread.is_alive() for thread in cooldown_threads)
+
     fixture = _RouteFixture()
     with fixture:
         threads = list(fixture._threads)
@@ -344,6 +383,10 @@ def test_loopback_route_transitions_are_bounded_audited_and_cleaned_up() -> None
             "connection_failure",
         ]
         assert list(fixture.cooldowns.values()) == [5, 10, 15, 20, 25]
+        assert all(
+            fixture._records[fixture._handles[alias]] == [_ABSOLUTE_REQUEST_LINE]
+            for alias, _ in fixture._SCRIPT
+        )
         assert fixture.audit[-1] == {
             "attempt": 5,
             "event": "terminal_failure",
@@ -352,13 +395,17 @@ def test_loopback_route_transitions_are_bounded_audited_and_cleaned_up() -> None
 
     assert fixture._servers == []
     assert fixture._threads == []
-    assert fixture._endpoints == {}
+    assert fixture._ports == {}
+    assert fixture._records == {}
+    assert fixture._aliases == {}
+    assert fixture._handles == {}
     assert fixture.cooldowns == {}
     assert all(not thread.is_alive() for thread in threads)
 
 
 def test_routes_reject_production_x_and_external_proxy_before_contact(monkeypatch) -> None:
     contacted = False
+    fixture = _RouteFixture()
 
     def forbidden_socket(*_: Any, **__: Any) -> socket.socket:
         nonlocal contacted
@@ -370,8 +417,10 @@ def test_routes_reject_production_x_and_external_proxy_before_contact(monkeypatc
         _RouteFixture(activation="production_x")
     with pytest.raises(TypeError):
         _RouteFixture(proxy_address="http://198.51.100.7:8080")  # type: ignore[call-arg]
-    with pytest.raises(RuntimeError, match="loopback preflight"):
-        _request_generated_endpoint(
-            _FixtureEndpoint("forged-external", "http://198.51.100.7:8080/fixture-route")
-        )
+    with pytest.raises(TypeError):
+        _RouteHandle("http://198.51.100.7:8080")  # type: ignore[call-arg]
+    with pytest.raises(RuntimeError, match="not issued"):
+        fixture._attempt(_RouteHandle(), 1)
+    assert fixture.contact_count == 0
     assert not contacted
+    fixture.close()

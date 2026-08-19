@@ -30,6 +30,27 @@ _CURSOR = "lab_fixture_cursor_page_2"
 _REDACTED = "[fixture-secret-redacted]"
 
 
+def _valid_graphql_payload(payload: object) -> bool:
+    if not isinstance(payload, dict) or set(payload) != {
+        "operationName",
+        "queryId",
+        "variables",
+    }:
+        return False
+    variables = payload.get("variables")
+    query_id = payload.get("queryId")
+    cursor = variables.get("cursor") if isinstance(variables, dict) else None
+    return (
+        payload.get("operationName") == _OPERATION
+        and query_id in {_QUERY_V1, _QUERY_V2}
+        and isinstance(variables, dict)
+        and set(variables) == {"cursor", "pageSize"}
+        and cursor in {None, _CURSOR}
+        and (query_id != _QUERY_V1 or cursor is None)
+        and variables.get("pageSize") == 2
+    )
+
+
 class _ExpiredFixtureQuery(RuntimeError):
     def __init__(self, replacement: str | None):
         super().__init__(f"synthetic query ID expired; declared replacement: {replacement!r}")
@@ -42,11 +63,11 @@ class _ProtocolFixture:
     def __init__(self) -> None:
         self.graphql_handle: object | None = None
         self.challenge_handle: object | None = None
-        self.sentinel: str | None = None
         self.captures: list[dict[str, Any]] = []
         self.request_count = 0
-        self.port: int | None = None
-        self.thread: threading.Thread | None = None
+        self._sentinel: str | None = None
+        self._port: int | None = None
+        self._thread: threading.Thread | None = None
         self._server: ThreadingHTTPServer | None = None
 
     def __enter__(self) -> _ProtocolFixture:
@@ -76,41 +97,52 @@ class _ProtocolFixture:
                 fixture.request_count += 1
                 body = self._json()
                 if self.path == "/internal/graphql":
-                    fixture.captures.append(
-                        {
-                            "path": self.path,
-                            "headers": {"X-Fixture-Session": _REDACTED},
-                            "body": json.loads(json.dumps(body)),
-                        }
-                    )
-                    if self.headers.get("X-Fixture-Session") != fixture.sentinel:
+                    if self.headers.get("X-Fixture-Session") != fixture._sentinel:
                         self._reply(401, {"error": "fixture session rejected"})
-                    elif body.get("queryId") == _QUERY_V1:
-                        self._reply(
-                            410,
-                            {
-                                "error": "synthetic query ID expired",
-                                "replacementQueryId": _QUERY_V2,
-                            },
-                        )
+                    elif not _valid_graphql_payload(body):
+                        self._reply(400, {"error": "outside fixed GraphQL fixture schema"})
                     else:
-                        cursor = body.get("variables", {}).get("cursor")
-                        if cursor is None:
+                        fixture.captures.append(
+                            {
+                                "path": self.path,
+                                "headers": {"X-Fixture-Session": _REDACTED},
+                                "body": json.loads(json.dumps(body)),
+                            }
+                        )
+                        if body.get("queryId") == _QUERY_V1:
                             self._reply(
-                                200,
+                                410,
                                 {
-                                    "data": {"items": ["fixture-post-1", "fixture-post-2"]},
-                                    "pageInfo": {"nextCursor": _CURSOR, "hasNextPage": True},
+                                    "error": "synthetic query ID expired",
+                                    "replacementQueryId": _QUERY_V2,
                                 },
                             )
                         else:
-                            self._reply(
-                                200,
-                                {
-                                    "data": {"items": ["fixture-post-3"]},
-                                    "pageInfo": {"nextCursor": None, "hasNextPage": False},
-                                },
-                            )
+                            cursor = body.get("variables", {}).get("cursor")
+                            if cursor is None:
+                                self._reply(
+                                    200,
+                                    {
+                                        "data": {
+                                            "items": ["fixture-post-1", "fixture-post-2"]
+                                        },
+                                        "pageInfo": {
+                                            "nextCursor": _CURSOR,
+                                            "hasNextPage": True,
+                                        },
+                                    },
+                                )
+                            else:
+                                self._reply(
+                                    200,
+                                    {
+                                        "data": {"items": ["fixture-post-3"]},
+                                        "pageInfo": {
+                                            "nextCursor": None,
+                                            "hasNextPage": False,
+                                        },
+                                    },
+                                )
                     return
                 if self.path == "/fixture/toy-challenge/answer":
                     candidate = body.get("candidate")
@@ -143,44 +175,85 @@ class _ProtocolFixture:
 
         self.graphql_handle = object()
         self.challenge_handle = object()
-        self.sentinel = secrets.token_urlsafe(18)
+        self._sentinel = secrets.token_urlsafe(18)
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        host, self.port = self._server.server_address
+        host, self._port = self._server.server_address
         if host != "127.0.0.1":
             self._server.server_close()
             raise RuntimeError("protocol fixture did not bind to IPv4 loopback")
-        self.thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self.thread.start()
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
         return self
 
     def __exit__(self, *_exc: object) -> None:
         assert self._server is not None
         self._server.shutdown()
         self._server.server_close()
-        assert self.thread is not None
-        self.thread.join(timeout=2)
+        assert self._thread is not None
+        self._thread.join(timeout=2)
         self._server = None
         self.graphql_handle = None
         self.challenge_handle = None
-        self.sentinel = None
-        self.port = None
+        self._sentinel = None
+        self._port = None
 
-    def _exchange(
-        self,
-        method: str,
-        path: str,
-        body: dict[str, Any] | None = None,
+    def _post_graphql(
+        self, handle: object, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
-        if self.port is None:
+        if handle is not self.graphql_handle:
+            raise ValueError("unissued GraphQL fixture handle")
+        if self._port is None or self._sentinel is None:
             raise RuntimeError("protocol fixture is not running")
-        encoded = None if body is None else json.dumps(body, separators=(",", ":"))
-        headers = {"Content-Type": "application/json"}
-        if path == "/internal/graphql":
-            assert self.sentinel is not None
-            headers["X-Fixture-Session"] = self.sentinel
-        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=1)
+        connection = http.client.HTTPConnection("127.0.0.1", self._port, timeout=1)
         try:
-            connection.request(method, path, body=encoded, headers=headers)
+            connection.request(
+                "POST",
+                "/internal/graphql",
+                body=json.dumps(body, separators=(",", ":")),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Fixture-Session": self._sentinel,
+                },
+            )
+            response = connection.getresponse()
+            value = json.loads(response.read())
+            if 300 <= response.status < 400:
+                raise RuntimeError("fixture redirects are prohibited")
+            return response.status, value
+        finally:
+            connection.close()
+
+    def _get_toy_challenge(self, handle: object) -> tuple[int, dict[str, Any]]:
+        if handle is not self.challenge_handle:
+            raise ValueError("unissued toy-challenge fixture handle")
+        if self._port is None:
+            raise RuntimeError("protocol fixture is not running")
+        connection = http.client.HTTPConnection("127.0.0.1", self._port, timeout=1)
+        try:
+            connection.request("GET", "/fixture/toy-challenge")
+            response = connection.getresponse()
+            value = json.loads(response.read())
+            if 300 <= response.status < 400:
+                raise RuntimeError("fixture redirects are prohibited")
+            return response.status, value
+        finally:
+            connection.close()
+
+    def _post_toy_answer(
+        self, handle: object, candidate: int
+    ) -> tuple[int, dict[str, Any]]:
+        if handle is not self.challenge_handle:
+            raise ValueError("unissued toy-challenge fixture handle")
+        if self._port is None:
+            raise RuntimeError("protocol fixture is not running")
+        connection = http.client.HTTPConnection("127.0.0.1", self._port, timeout=1)
+        try:
+            connection.request(
+                "POST",
+                "/fixture/toy-challenge/answer",
+                body=json.dumps({"candidate": candidate}, separators=(",", ":")),
+                headers={"Content-Type": "application/json"},
+            )
             response = connection.getresponse()
             value = json.loads(response.read())
             if 300 <= response.status < 400:
@@ -192,18 +265,9 @@ class _ProtocolFixture:
     def graphql(self, handle: object, payload: dict[str, Any]) -> dict[str, Any]:
         if handle is not self.graphql_handle:
             raise ValueError("unissued GraphQL fixture handle")
-        variables = payload.get("variables") if isinstance(payload, dict) else None
-        if (
-            set(payload) != {"operationName", "queryId", "variables"}
-            or payload.get("operationName") != _OPERATION
-            or payload.get("queryId") not in {_QUERY_V1, _QUERY_V2}
-            or not isinstance(variables, dict)
-            or set(variables) != {"cursor", "pageSize"}
-            or variables.get("cursor") not in {None, _CURSOR}
-            or variables.get("pageSize") != 2
-        ):
+        if not _valid_graphql_payload(payload):
             raise ValueError("request is outside the fixed GraphQL fixture schema")
-        status, value = self._exchange("POST", "/internal/graphql", payload)
+        status, value = self._post_graphql(handle, payload)
         if status == 410:
             raise _ExpiredFixtureQuery(value.get("replacementQueryId"))
         if status != 200:
@@ -236,9 +300,7 @@ class _ProtocolFixture:
             raise ValueError("unissued toy-challenge fixture handle")
         if isinstance(candidate, bool) or not isinstance(candidate, int) or not 0 <= candidate < 12:
             raise ValueError("toy answer is outside the fixture's bounded range")
-        status, value = self._exchange(
-            "POST", "/fixture/toy-challenge/answer", {"candidate": candidate}
-        )
+        status, value = self._post_toy_answer(handle, candidate)
         if status not in {200, 403}:
             raise RuntimeError(f"toy challenge answer failed with {status}")
         return value
@@ -250,7 +312,7 @@ class _ProtocolFixture:
     ) -> dict[str, Any]:
         if handle is not self.challenge_handle:
             raise ValueError("unissued toy-challenge fixture handle")
-        status, challenge = self._exchange("GET", "/fixture/toy-challenge")
+        status, challenge = self._get_toy_challenge(handle)
         expected = {
             "kind": "lab-fixture-toy-challenge",
             "rule": "candidate-times-7-plus-3-mod-13",
@@ -285,13 +347,20 @@ def _assert_listener_closed(port: int, thread: threading.Thread) -> None:
         socket.create_connection(("127.0.0.1", port), timeout=0.05)
 
 
+def _require_secret_absent(secret: str | None, artifact: object) -> None:
+    if not secret:
+        pytest.fail("synthetic fixture secret was missing", pytrace=False)
+    if secret in json.dumps(artifact):
+        pytest.fail("fixture artifact retained a secret", pytrace=False)
+
+
 def test_fixture_graphql_capture_replay_version_change_and_pagination() -> None:
     with _ProtocolFixture() as lab:
         assert lab.graphql_handle is not None
         first = lab.graphql(lab.graphql_handle, _graphql_payload())
         capture = lab.captures[-1]
         assert capture["headers"] == {"X-Fixture-Session": _REDACTED}
-        assert lab.sentinel not in json.dumps(capture)
+        _require_secret_absent(lab._sentinel, capture)
         assert lab.replay(lab.graphql_handle, capture) == first
         assert first["data"]["items"] == ["fixture-post-1", "fixture-post-2"]
         assert first["pageInfo"] == {"nextCursor": _CURSOR, "hasNextPage": True}
@@ -306,15 +375,41 @@ def test_fixture_graphql_capture_replay_version_change_and_pagination() -> None:
             "data": {"items": ["fixture-post-3"]},
             "pageInfo": {"nextCursor": None, "hasNextPage": False},
         }
-        assert lab.thread is not None and lab.port is not None
-        thread, port = lab.thread, lab.port
-    assert lab.sentinel is lab.graphql_handle is lab.challenge_handle is lab.port is None
+        assert lab._thread is not None and lab._port is not None
+        thread, port = lab._thread, lab._port
+    assert lab._sentinel is lab.graphql_handle is lab.challenge_handle is lab._port is None
     _assert_listener_closed(port, thread)
 
 
 def test_fixture_graphql_rejects_external_activation_before_contact(monkeypatch) -> None:
     with _ProtocolFixture() as lab:
         assert lab.graphql_handle is not None
+        pasted_secret = "PASTED_TOKEN_AUDIT_SENTINEL"
+        status, value = lab._post_graphql(lab.graphql_handle, {"token": pasted_secret})
+        assert status == 400
+        _require_secret_absent(pasted_secret, {"captures": lab.captures, "response": value})
+
+        invalid_payloads = []
+        for field, value in (
+            ("queryId", "unknown_fixture_query"),
+            ("operationName", "UnknownFixtureOperation"),
+        ):
+            payload = _graphql_payload()
+            payload[field] = value
+            invalid_payloads.append(payload)
+        payload = _graphql_payload()
+        payload["variables"]["unexpected"] = "fixture-only"
+        invalid_payloads.append(payload)
+
+        for payload in invalid_payloads:
+            before = lab.request_count
+            with pytest.raises(ValueError, match="fixed GraphQL fixture schema"):
+                lab.graphql(lab.graphql_handle, payload)
+            assert lab.request_count == before
+            status, value = lab._post_graphql(lab.graphql_handle, payload)
+            assert status == 400
+            assert value == {"error": "outside fixed GraphQL fixture schema"}
+
         before = lab.request_count
         contacted = False
 
@@ -354,9 +449,9 @@ def test_toy_challenge_detection_bounded_solution_timeout_wrong_answer_and_clean
         ticks = iter((0.0, 1.0))
         with pytest.raises(TimeoutError, match="deadline expired"):
             lab.detect_and_solve_toy(lab.challenge_handle, lambda: next(ticks))
-        assert lab.thread is not None and lab.port is not None
-        thread, port = lab.thread, lab.port
-    assert lab.sentinel is lab.graphql_handle is lab.challenge_handle is lab.port is None
+        assert lab._thread is not None and lab._port is not None
+        thread, port = lab._thread, lab._port
+    assert lab._sentinel is lab.graphql_handle is lab.challenge_handle is lab._port is None
     _assert_listener_closed(port, thread)
 
 

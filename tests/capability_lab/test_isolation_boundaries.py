@@ -6,6 +6,7 @@ import importlib
 import io
 import os
 import socket
+import subprocess
 import sys
 from email.message import Message
 from pathlib import Path
@@ -164,7 +165,11 @@ def test_production_api_rejections_stop_once_without_changing_route_or_token(
     token_path.parent.mkdir(mode=0o700)
     token_path.write_text("SYNTHETIC_OFFICIAL_TOKEN", encoding="utf-8")
     token_path.chmod(0o600)
-    configured = Settings(tmp_path / "workbench.db", token_path)
+    configured = Settings(
+        tmp_path / "workbench.db",
+        token_path,
+        allow_environment_token=False,
+    )
     calls: list[tuple[str, int]] = []
 
     def rejected(request, timeout):
@@ -293,7 +298,7 @@ def test_built_wheel_excludes_lab_and_all_tests():
 
 @pytest.mark.skipif(sys.platform != "linux", reason="CI network namespaces are Linux-only")
 def test_ci_process_has_only_loopback_and_no_external_route():
-    interfaces = {path.name for path in Path("/sys/class/net").iterdir()}
+    interfaces = {name for _index, name in socket.if_nameindex()}
     assert interfaces == {"lo"}, "capability lab must run under unshare --net"
     routes = Path("/proc/net/route").read_text(encoding="ascii").splitlines()[1:]
     assert not any(line.split()[1] == "00000000" for line in routes if line.split())
@@ -302,3 +307,37 @@ def test_ci_process_has_only_loopback_and_no_external_route():
         probe.settimeout(0.2)
         result = probe.connect_ex(("192.0.2.1", 443))
     assert result in {errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH}
+    status = Path("/proc/self/status").read_text(encoding="ascii")
+    assert os.geteuid() != 0
+    assert os.getppid() == 1
+    assert set(status.split("Uid:\t", 1)[1].splitlines()[0].split()) == {str(os.geteuid())}
+    assert "NoNewPrivs:\t1" in status
+    assert "CapEff:\t0000000000000000" in status
+    assert not {
+        "GITHUB_TOKEN",
+        "XWORKBENCH_X_BEARER_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    } & os.environ.keys()
+    persisted_credentials = subprocess.run(
+        [
+            "git",
+            "config",
+            "--local",
+            "--get-regexp",
+            r"^(http\..*\.extraheader|include.*\.path)$",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        timeout=2,
+    )
+    if persisted_credentials.returncode != 1:
+        pytest.fail("repository credentials are visible to the capability lab", pytrace=False)
+    elevation = subprocess.run(
+        ["sudo", "-n", "true"],
+        capture_output=True,
+        check=False,
+        timeout=2,
+    )
+    assert elevation.returncode != 0
