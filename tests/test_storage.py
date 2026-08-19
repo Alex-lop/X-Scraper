@@ -1,11 +1,12 @@
 import json
 import sqlite3
 import stat
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from xworkbench.models import CollectionRequest, JobStatus, Post
-from xworkbench.storage import SCHEMA_FAMILY, SCHEMA_VERSION, Storage
+from xworkbench.models import CollectionRequest, JobStatus, Post, SourceDefinition
+from xworkbench.storage import SCHEMA_FAMILY, SCHEMA_TABLES, SCHEMA_VERSION, Storage
 from xworkbench.x_api import compile_request
 
 
@@ -34,11 +35,49 @@ def post(post_id="1", *, source_position=None, url=None):
 
 
 def _make_legacy(storage, version):
-    storage.initialize()
     with storage.connect() as connection:
-        connection.execute("DROP INDEX idx_observations_position")
-        connection.execute("DROP TABLE post_observations")
-        connection.execute("ALTER TABLE jobs DROP COLUMN capture_segment")
+        capture_segment = "capture_segment INTEGER," if version == 3 else ""
+        connection.executescript(
+            f"""
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta(key, value) VALUES
+                ('schema_family', 'x_collection_workbench'),
+                ('schema_version', '{version}');
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                request_json TEXT NOT NULL,
+                compiled_request_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                collected_count INTEGER NOT NULL DEFAULT 0,
+                cursor TEXT,
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                error_code TEXT,
+                error_message TEXT,
+                error_retryable INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                completion_reason TEXT,
+                retry_at TEXT,
+                rate_limit_remaining INTEGER,
+                rate_limit_reset INTEGER,
+                post_resource_count INTEGER NOT NULL DEFAULT 0,
+                user_resource_count INTEGER NOT NULL DEFAULT 0,
+                media_resource_count INTEGER NOT NULL DEFAULT 0,
+                {capture_segment}
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_jobs_status_retry ON jobs(status, retry_at);
+            """
+        )
+        if version == 3:
+            Storage._create_observations(connection)
+            connection.execute(
+                "CREATE INDEX idx_observations_position "
+                "ON post_observations(job_id, snapshot_position)"
+            )
+            return
         null = "" if version == 2 else " NOT NULL"
         defaults = "" if version == 2 else " DEFAULT 0"
         media_default = "" if version == 2 else " DEFAULT '[]'"
@@ -74,9 +113,6 @@ def _make_legacy(storage, version):
                 ON post_observations(job_id, position);
             """
         )
-        connection.execute(
-            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (str(version),)
-        )
 
 
 def _create_job(storage):
@@ -84,7 +120,7 @@ def _create_job(storage):
     return storage.create_job(request, compile_request(request))
 
 
-def test_clean_v3_schema_is_secure_and_idempotent(tmp_path):
+def test_clean_v4_schema_is_secure_and_idempotent(tmp_path):
     storage = Storage(tmp_path / "test.db")
     storage.initialize()
     storage.initialize()
@@ -98,7 +134,7 @@ def test_clean_v3_schema_is_secure_and_idempotent(tmp_path):
         }
         metadata = dict(connection.execute("SELECT key, value FROM schema_meta"))
 
-    assert tables == {"schema_meta", "jobs", "post_observations"}
+    assert tables == SCHEMA_TABLES
     assert metadata == {"schema_family": SCHEMA_FAMILY, "schema_version": SCHEMA_VERSION}
     assert stat.S_IMODE(storage.path.stat().st_mode) == 0o600
 
@@ -231,7 +267,7 @@ def test_resume_starts_a_new_capture_segment(tmp_path):
     assert [row["dom_position"] for row in rows] == [4, 9]
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_legacy_database_is_atomically_backed_up_and_migrated_honestly(tmp_path, version):
     storage = Storage(tmp_path / f"legacy-v{version}.db")
     _make_legacy(storage, version)
@@ -254,10 +290,11 @@ def test_legacy_database_is_atomically_backed_up_and_migrated_honestly(tmp_path,
                 "2026-08-05T00:00:00+00:00",
             ),
         )
+        position = "snapshot_position" if version == 3 else "position"
         connection.execute(
-            """
+            f"""
             INSERT INTO post_observations (
-                job_id, post_id, position, text, url, observed_at
+                job_id, post_id, {position}, text, url, observed_at
             ) VALUES ('legacy', '1', 0, 'preserved',
                       'https://x.com/i/web/status/1', '2026-08-05T00:00:00+00:00')
             """
@@ -265,7 +302,7 @@ def test_legacy_database_is_atomically_backed_up_and_migrated_honestly(tmp_path,
 
     storage.initialize()
 
-    backup = tmp_path / f"legacy-v{version}.db.pre-v{version}-to-v3.bak"
+    backup = tmp_path / f"legacy-v{version}.db.pre-v{version}-to-v4.bak"
     assert backup.exists() and stat.S_IMODE(backup.stat().st_mode) == 0o600
     with sqlite3.connect(backup) as connection:
         assert connection.execute(
@@ -300,14 +337,14 @@ def test_failed_migration_rolls_back_database_and_leaves_recovery_backup(tmp_pat
         }
     assert "capture_segment" not in columns
     assert "position" in observation_columns and "snapshot_position" not in observation_columns
-    assert (tmp_path / "legacy.db.pre-v2-to-v3.bak").exists()
+    assert (tmp_path / "legacy.db.pre-v2-to-v4.bak").exists()
 
 
 @pytest.mark.parametrize("contents", [b"", b"stale partial backup"])
 def test_migration_fails_closed_when_backup_target_already_exists(tmp_path, contents):
     storage = Storage(tmp_path / "legacy.db")
     _make_legacy(storage, 2)
-    backup = tmp_path / "legacy.db.pre-v2-to-v3.bak"
+    backup = tmp_path / "legacy.db.pre-v2-to-v4.bak"
     backup.write_bytes(contents)
 
     with pytest.raises(RuntimeError, match="backup already exists"):
@@ -321,7 +358,8 @@ def test_migration_fails_closed_when_backup_target_already_exists(tmp_path, cont
 
 
 @pytest.mark.parametrize(
-    "drift", ["primary_key", "unique", "foreign_key", "index", "view"]
+    "drift",
+    ["primary_key", "unique", "foreign_key", "index", "partial_index", "view"],
 )
 def test_schema_validation_rejects_key_and_index_drift(tmp_path, drift):
     storage = Storage(tmp_path / f"{drift}.db")
@@ -334,6 +372,11 @@ def test_schema_validation_rejects_key_and_index_drift(tmp_path, drift):
             connection.execute("DROP TABLE old_schema_meta")
         elif drift == "index":
             connection.execute("DROP INDEX idx_jobs_status_retry")
+        elif drift == "partial_index":
+            connection.execute("DROP INDEX idx_jobs_idempotency")
+            connection.execute(
+                "CREATE UNIQUE INDEX idx_jobs_idempotency ON jobs(idempotency_key)"
+            )
         elif drift == "view":
             connection.execute("CREATE VIEW unexpected_jobs AS SELECT id FROM jobs")
         else:
@@ -351,7 +394,7 @@ def test_schema_validation_rejects_key_and_index_drift(tmp_path, drift):
                 "CREATE INDEX idx_observations_position "
                 "ON post_observations(job_id, snapshot_position)"
             )
-        assert not storage._schema_is_compatible(connection, version=3)
+        assert not storage._schema_is_compatible(connection, version=4)
 
 
 @pytest.mark.parametrize("kind", ["symlink", "directory"])
@@ -420,7 +463,7 @@ def test_unknown_persisted_provider_is_flagged_without_killing_reads(tmp_path):
         )
 
     job = storage.get_job(job_id)
-    assert job["provider"] == "future_provider"
+    assert job["provider"] == "unknown"
     assert job["stored_metadata_valid"] is False
     assert "unknown" in job["warnings"][-1]
 
@@ -465,7 +508,283 @@ def test_incompatible_database_is_rejected_without_modification(tmp_path):
         connection.execute("CREATE TABLE legacy_posts (id TEXT)")
     before = storage.path.read_bytes()
 
-    with pytest.raises(RuntimeError, match="not a .* v3"):
+    with pytest.raises(RuntimeError, match="not a .* v4"):
         storage.initialize()
 
     assert storage.path.read_bytes() == before
+
+
+def source_definition(source_id="source-a", value="tester"):
+    return SourceDefinition.from_dict(
+        {
+            "id": source_id,
+            "displayName": source_id,
+            "provider": "official_x_api",
+            "surface": "profile",
+            "value": value,
+            "createdAt": "2026-08-19T05:00:00+00:00",
+        }
+    )
+
+
+def completed_snapshot(storage, request=None, *, source_id=None, text="alpha evidence"):
+    request = request or collection()
+    plan = (
+        compile_request(request)
+        if request.provider.value == "official_x_api"
+        else {"provider": "playwright_browser", "providerVersion": 1}
+    )
+    job_id = storage.create_job(request, plan, source_id=source_id)
+    storage.claim_job(job_id)
+    item = post(job_id)
+    item.text = text
+    storage.add_posts(
+        job_id,
+        [item],
+        None,
+        {"fieldCoverage": {"text": 1.0}, "truncated": False},
+    )
+    storage.finish_job(job_id, [], completion_reason="target_reached")
+    return job_id
+
+
+def test_saved_sources_are_immutable_bounded_and_match_jobs(tmp_path):
+    storage = Storage(tmp_path / "sources.db")
+    storage.initialize()
+    source = source_definition()
+
+    saved = storage.save_source(source)
+    assert storage.save_source(source) == saved
+    assert storage.list_sources(limit=1, offset=0) == [saved]
+    job_id = storage.create_job(
+        collection(), compile_request(collection()), source_id=source.source_id
+    )
+    assert storage.get_job(job_id)["source_id"] == source.source_id
+    assert storage.get_source(source.source_id)["last_status"] == "queued"
+
+    changed = SourceDefinition.from_dict({**source.to_dict(), "displayName": "changed"})
+    with pytest.raises(ValueError, match="immutable"):
+        storage.save_source(changed)
+    mismatch = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "different", "maxPosts": 10}
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        storage.create_job(mismatch, compile_request(mismatch), source_id=source.source_id)
+
+
+def test_snapshot_metadata_is_immutable_home_is_not_reusable_and_corruption_is_skipped(
+    tmp_path,
+):
+    storage = Storage(tmp_path / "snapshots.db")
+    storage.initialize()
+    older = completed_snapshot(storage)
+    newer = completed_snapshot(storage, text="newer evidence")
+    original = storage.get_snapshot(older)
+    assert original["usable"] is True
+    assert original["coverage"] == {"text": 1.0}
+    assert original["snapshot_partial"] is False
+    assert storage.finish_job(older, ["late"], completion_reason="late") is None
+    assert storage.get_snapshot(older)["snapshot_at"] == original["snapshot_at"]
+
+    with storage.connect() as connection:
+        connection.execute(
+            "UPDATE jobs SET collected_count = 'Bearer SECRET' WHERE id = ?", (newer,)
+        )
+    assert storage.get_latest_usable_snapshot()["id"] == older
+    assert storage.list_snapshots(1, usable=True)[0]["id"] == older
+    corrupt = storage.get_snapshot(newer)
+    assert corrupt["stored_metadata_valid"] is False
+    assert "Bearer SECRET" not in json.dumps(corrupt)
+
+    captured = datetime.fromisoformat(original["snapshot_at"])
+    stale = storage.get_snapshot(
+        older, now=captured + timedelta(seconds=original["stale_after_seconds"] + 1)
+    )
+    assert stale["freshness"] == "stale"
+    home = CollectionRequest.from_dict(
+        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1}
+    )
+    home_snapshot = storage.get_snapshot(completed_snapshot(storage, home))
+    assert home_snapshot["usable"] is True
+    assert home_snapshot["reuse_eligible"] is False
+
+
+def test_fts_search_is_literal_isolated_time_bounded_and_purged_with_retention(tmp_path):
+    storage = Storage(tmp_path / "evidence.db")
+    storage.initialize()
+    source_a = source_definition("source-a", "tester")
+    source_b = source_definition("source-b", "different")
+    storage.save_source(source_a)
+    storage.save_source(source_b)
+    first = completed_snapshot(
+        storage, source_id=source_a.source_id, text="alpha near quoted evidence"
+    )
+    second = completed_snapshot(
+        storage, source_id=source_a.source_id, text="alpha newer evidence"
+    )
+    foreign_request = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "different", "maxPosts": 10}
+    )
+    completed_snapshot(
+        storage,
+        foreign_request,
+        source_id=source_b.source_id,
+        text="alpha foreign evidence",
+    )
+
+    rows = storage.search_post_evidence("alpha", source_ids=[source_a.source_id])
+    assert {row["snapshot_id"] for row in rows} == {first, second}
+    assert all(row["source_id"] == source_a.source_id for row in rows)
+    assert all(row["url"].startswith("https://x.com/") for row in rows)
+    assert storage.search_post_evidence('"alpha" NEAR evidence', snapshot_ids=[first])
+    assert storage.search_post_evidence("alpha*", snapshot_ids=[second])
+    for invalid in ("*", "\0", "alpha\nforeign"):
+        with pytest.raises(ValueError):
+            storage.search_post_evidence(invalid)
+    after = datetime.fromisoformat(storage.get_snapshot(second)["snapshot_at"]) + timedelta(
+        seconds=1
+    )
+    assert storage.search_post_evidence("alpha", start_time=after) == []
+
+    assert storage.purge_snapshots(keep_per_source=1) == 1
+    assert storage.get_snapshot(first) is None
+    retained = storage.search_post_evidence("alpha", source_ids=[source_a.source_id])
+    assert [row["snapshot_id"] for row in retained] == [second]
+
+
+def test_durable_admission_fair_leases_owner_scope_and_recovery(tmp_path):
+    storage = Storage(tmp_path / "queue.db")
+    storage.initialize()
+    deadline = datetime.now(UTC) + timedelta(minutes=10)
+    approval = {
+        "approvedAt": datetime.now(UTC).isoformat(),
+        "confirmation": "test_fixture",
+    }
+    limits = {
+        "maxPosts": 10,
+        "deadlineSeconds": 30,
+        "routeAlias": "direct",
+        "maxConcurrency": 2,
+    }
+
+    def admit(value, auth, *, key=None):
+        request = CollectionRequest.from_dict(
+            {"sourceType": "profile", "sourceValue": value, "maxPosts": 10}
+        )
+        return storage.admit_job(
+            request,
+            compile_request(request),
+            queue_capacity=20,
+            priority=5,
+            source_id=None,
+            auth_state_id=auth,
+            batch_id="batch",
+            idempotency_key=key,
+            approval=approval,
+            limits=limits,
+            deadline_at=deadline,
+        )
+
+    a1 = admit("a", "auth-a", key="same")
+    assert a1["result"] == "created"
+    request_a = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "a", "maxPosts": 10}
+    )
+    same = storage.admit_job(
+        request_a,
+        compile_request(request_a),
+        queue_capacity=20,
+        priority=5,
+        source_id=None,
+        auth_state_id="auth-a",
+        batch_id="batch",
+        idempotency_key="same",
+        approval=approval,
+        limits=limits,
+        deadline_at=deadline,
+    )
+    assert same == {"result": "existing", "job_id": a1["job_id"]}
+    a2 = admit("a", "auth-b")["job_id"]
+    b1 = admit("b", "auth-a")["job_id"]
+    c1 = admit("c", "auth-c")["job_id"]
+    assert [row["id"] for row in storage.list_queued_jobs()] == [
+        a1["job_id"],
+        b1,
+        c1,
+        a2,
+    ]
+    public = storage.get_job(a1["job_id"])
+    assert public["approval_recorded"] and public["limits_recorded"]
+    assert "approval_json" not in public and "limits_json" not in public
+
+    expiry = datetime.now(UTC) + timedelta(minutes=1)
+    leased = storage.lease_job(a1["job_id"], worker_id="worker-a", lease_expires_at=expiry)
+    assert leased["attempt_number"] == 1 and leased["capture_segment"] == 0
+    assert storage.lease_job(a2, worker_id="worker-b", lease_expires_at=expiry) is None
+    assert storage.lease_job(b1, worker_id="worker-b", lease_expires_at=expiry) is None
+    assert storage.lease_job(c1, worker_id="worker-c", lease_expires_at=expiry)
+    assert storage.finish_job(
+        a1["job_id"], [], completion_reason="done", worker_id="wrong"
+    ) is None
+    assert storage.heartbeat_job(
+        a1["job_id"],
+        worker_id="worker-a",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=2),
+    )
+    assert storage.finish_job(
+        a1["job_id"], [], completion_reason="done", worker_id="worker-a"
+    ) == "succeeded"
+
+    recovery_now = datetime.now(UTC) + timedelta(minutes=2)
+    recovered = storage.recover_jobs(recovery_now)
+    assert c1 in recovered and storage.get_job(c1)["status"] == "queued"
+    assert storage.get_job(c1)["lease_owner"] is None
+    assert len(storage.list_batch_jobs("batch")) == 4
+    assert storage.cancel_batch("batch") == 3
+
+
+def test_corrupt_queue_scalars_and_private_records_are_generic_and_local(tmp_path):
+    storage = Storage(tmp_path / "scalar-corruption.db")
+    storage.initialize()
+    corrupt_id = _create_job(storage)
+    healthy_id = _create_job(storage)
+    with storage.connect() as connection:
+        connection.execute(
+            """
+            UPDATE jobs SET collected_count = 'Bearer SECRET', cancel_requested = 'secret',
+                created_at = 'secret', deadline_at = 'secret',
+                approval_json = '{"token":"Bearer SECRET"}'
+            WHERE id = ?
+            """,
+            (corrupt_id,),
+        )
+
+    jobs = {job["id"]: job for job in storage.list_attempts(10)}
+    assert jobs[healthy_id]["stored_metadata_valid"] is True
+    corrupt = jobs[corrupt_id]
+    assert corrupt["stored_metadata_valid"] is False
+    assert corrupt["collected_count"] == 0 and corrupt["cancel_requested"] is False
+    assert corrupt["created_at"] is corrupt["deadline_at"] is None
+    assert corrupt["approval_recorded"] is False
+    assert "Bearer SECRET" not in json.dumps(corrupt)
+
+
+def test_repeated_context_connections_close_under_a_low_fd_limit(tmp_path):
+    resource = pytest.importorskip("resource")
+    descriptors = type(tmp_path)("/dev/fd")
+    if not descriptors.exists():
+        pytest.skip("descriptor accounting is unavailable")
+    storage = Storage(tmp_path / "fds.db")
+    storage.initialize()
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    baseline = len(list(descriptors.iterdir()))
+    lowered = min(soft, max(64, baseline + 32))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (lowered, hard))
+    try:
+        for _ in range(100):
+            _create_job(storage)
+            storage.list_attempts(1)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    assert len(list(descriptors.iterdir())) <= baseline + 4
