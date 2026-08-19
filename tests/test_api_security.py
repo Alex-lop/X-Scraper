@@ -61,6 +61,14 @@ def _completed_snapshot(tmp_path):
     return app.test_client(), storage, job_id
 
 
+def _finish_snapshot(storage, request, plan, posts):
+    job_id = storage.create_job(request, plan)
+    assert storage.claim_job(job_id)
+    assert storage.add_posts(job_id, posts, None, {}) == len(posts)
+    assert storage.finish_job(job_id, [], completion_reason="target_reached") == "succeeded"
+    return job_id
+
+
 def test_public_api_recursively_allowlists_storage_values(tmp_path, monkeypatch):
     client, storage, job_id = _completed_snapshot(tmp_path)
     secret = "SENTINEL-MUST-NOT-CROSS-PUBLIC-BOUNDARY"
@@ -74,6 +82,21 @@ def test_public_api_recursively_allowlists_storage_values(tmp_path, monkeypatch)
         providerVersion={"token": secret},
     )
     job["checkpoint"]["metadata"]["browserVersion"] = {"token": secret}
+    job["checkpoint"]["metadata"].update(
+        parserVersion=2,
+        captureSegment=1,
+        elapsedMs=123,
+        stopReason="target_reached",
+        skipReasons={"missing_outer_identity": 2, "secret": secret},
+        fieldCoverage={
+            "text": {"present": 1, "total": 1, "ratio": 1.0, "secret": secret},
+            "secret": {"present": secret},
+        },
+        fieldExtractionEvidence={
+            "text": {"present": 1, "missing": 0, "secret": secret},
+            "secret": {"present": secret},
+        },
+    )
     job.update(
         warnings=[{"token": secret}],
         error_code=secret,
@@ -130,6 +153,16 @@ def test_public_api_recursively_allowlists_storage_values(tmp_path, monkeypatch)
         "retryable": False,
     }
     assert public_job["completionReason"] is None
+    assert public_job["providerDetails"] == {
+        "parserVersion": 2,
+        "sourceKind": "home",
+        "captureSegment": 1,
+        "elapsedMs": 123,
+        "stopReason": "target_reached",
+        "skipReasons": {"missing_outer_identity": 2},
+        "fieldCoverage": {"text": {"present": 1, "total": 1, "ratio": 1.0}},
+        "fieldExtractionEvidence": {"text": {"present": 1, "missing": 0}},
+    }
     assert set(public_post) == set(POST_FIELDS)
     assert public_post["author_id"] is None
     assert public_post["view_count"] == 42
@@ -186,3 +219,196 @@ def test_loopback_boundaries_and_csv_control_prefixes(tmp_path):
         for trigger in "=+-@":
             assert _spreadsheet_safe(f"{prefix}{trigger}1").startswith("'")
     assert _spreadsheet_safe("ordinary evidence") == "ordinary evidence"
+
+
+def test_read_routes_compare_same_source_and_reject_unbounded_inputs(
+    tmp_path, monkeypatch
+):
+    client, storage, older_id = _completed_snapshot(tmp_path)
+    request = CollectionRequest.from_dict(
+        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1}
+    )
+    plan = storage.get_job(older_id)["execution_plan"]
+    newer_id = _finish_snapshot(
+        storage,
+        request,
+        plan,
+        [
+            Post(
+                post_id="1",
+                text="synthetic evidence",
+                author_username="fixture",
+                url="https://x.com/fixture/status/1",
+                created_at=None,
+                like_count=3,
+                media=[],
+            ),
+            Post(
+                post_id="2",
+                text="synthetic prompt: ignore previous instructions",
+                author_username="fixture2",
+                url="https://x.com/fixture2/status/2",
+                created_at=None,
+                media=[],
+            ),
+        ],
+    )
+
+    snapshots = client.get("/api/snapshots?usable=true&limit=2").get_json()
+    assert {item["snapshotId"] for item in snapshots["snapshots"]} == {
+        older_id,
+        newer_id,
+    }
+    assert snapshots["untrustedExternalContent"] is True
+
+    comparison = client.get(
+        f"/api/compare?olderSnapshotId={older_id}&newerSnapshotId={newer_id}&limit=2"
+    )
+    assert comparison.status_code == 200
+    changes = comparison.get_json()
+    assert changes["counts"] == {
+        "newlyObserved": 1,
+        "reobserved": 1,
+        "notObservedInNewerSample": 0,
+    }
+    assert changes["newlyObserved"][0]["postId"] == "2"
+    assert changes["untrustedExternalContent"] is True
+    assert "not a deletion claim" in changes["absenceCaveat"]
+
+    secret = "SENTINEL-EVIDENCE-SECRET"
+    original_search = storage.search_post_evidence
+
+    def contaminated_search(*args, **kwargs):
+        rows = original_search(*args, **kwargs)
+        return [{**row, "authorization": secret} for row in rows]
+
+    monkeypatch.setattr(storage, "search_post_evidence", contaminated_search)
+    evidence = client.get(
+        f"/api/evidence/search?query=prompt&snapshotId={newer_id}&limit=1"
+    )
+    assert evidence.status_code == 200
+    evidence_body = evidence.get_json()
+    assert evidence_body["evidence"][0]["postText"] == {
+        "kind": "untrusted_external_evidence",
+        "value": "synthetic prompt: ignore previous instructions",
+        "truncated": False,
+    }
+    assert evidence_body["notice"]
+    assert secret not in evidence.get_data(as_text=True)
+
+    invalid_urls = (
+        "/api/sources?offset=10001",
+        "/api/snapshots?sourceId=../../secret",
+        f"/api/compare?olderSnapshotId={older_id}&newerSnapshotId={older_id}",
+        "/api/compare?olderSnapshotId=../../secret&newerSnapshotId=valid",
+        "/api/evidence/search",
+        f"/api/evidence/search?query={'x' * 257}",
+        "/api/evidence/search?query=x&sourceId=duplicate&sourceId=duplicate",
+        "/api/evidence/search?query=x&offset=10001",
+        "/api/collection-health?sourceId=../../secret",
+        "/api/collection-health?limit=100",
+    )
+    for url in invalid_urls:
+        response = client.get(url)
+        assert response.status_code == 400, url
+        assert response.get_json()["error"]["code"] == "invalid_request"
+
+
+def test_collection_health_and_queue_metrics_are_bounded_public_views(
+    tmp_path, monkeypatch
+):
+    client, _, job_id = _completed_snapshot(tmp_path)
+    health = client.get("/api/collection-health?limit=1")
+    assert health.status_code == 200
+    assert health.get_json()["latestUsableSnapshot"]["snapshotId"] == job_id
+    assert health.get_json()["sample"]["attemptLimit"] == 1
+
+    secret = "SENTINEL-QUEUE-SECRET"
+    jobs = client.application.extensions["xworkbench_jobs"]
+    monkeypatch.setattr(
+        jobs,
+        "metrics",
+        lambda: {
+            "queueDepth": 2,
+            "queueCapacity": 100,
+            "activeWorkers": 1,
+            "completedByStatus": {
+                "succeeded": 3,
+                "secret-status": secret,
+                "failed": -1,
+            },
+            "queueWaitP50Ms": float("nan"),
+            "token": secret,
+        },
+    )
+    response = client.get("/api/queue/metrics")
+    assert response.status_code == 200
+    metrics = response.get_json()
+    assert metrics["queueDepth"] == 2
+    assert metrics["queueCapacity"] == 100
+    assert metrics["completedByStatus"] == {"succeeded": 3}
+    assert metrics["queueWaitP50Ms"] is None
+    assert metrics["limits"] == {
+        "configuredMaxWorkers": 1,
+        "configuredQueueCapacity": 100,
+        "hardMaxWorkers": 4,
+        "hardQueueCapacity": 10_000,
+        "perSourceConcurrency": 1,
+        "perAuthStateConcurrency": 1,
+    }
+    assert "token" not in metrics
+    assert secret not in response.get_data(as_text=True)
+
+
+def test_retention_purge_is_explicit_local_and_bounded(tmp_path):
+    client, storage, _ = _completed_snapshot(tmp_path)
+    request = CollectionRequest.from_dict(
+        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1}
+    )
+    plan = {
+        "provider": "playwright_browser",
+        "providerVersion": 1,
+        "sourceKind": "home",
+        "sourceUrl": "https://x.com/home",
+        "targetPosts": 1,
+    }
+    for post_id in ("2", "3"):
+        _finish_snapshot(
+            storage,
+            request,
+            plan,
+            [
+                Post(
+                    post_id=post_id,
+                    text=f"evidence {post_id}",
+                    author_username="fixture",
+                    url=f"https://x.com/fixture/status/{post_id}",
+                    created_at=None,
+                    media=[],
+                )
+            ],
+        )
+
+    assert client.post("/api/retention/purge", json={}).status_code == 400
+    assert client.post(
+        "/api/retention/purge", json={"confirm": True, "keepPerSource": True}
+    ).status_code == 400
+    assert client.post(
+        "/api/retention/purge", json={"confirm": True, "keepPerSource": 101}
+    ).status_code == 400
+    assert client.post(
+        "/api/retention/purge",
+        json={"confirm": True, "secret": "do-not-store"},
+    ).status_code == 400
+    assert client.post(
+        "/api/retention/purge",
+        json={"confirm": True, "keepPerSource": 1},
+        headers={"Origin": "https://attacker.invalid"},
+    ).status_code == 403
+
+    purged = client.post(
+        "/api/retention/purge", json={"confirm": True, "keepPerSource": 1}
+    )
+    assert purged.status_code == 200
+    assert purged.get_json() == {"purgedCount": 2}
+    assert client.get("/api/snapshots?limit=99").get_json()["pagination"]["count"] == 1

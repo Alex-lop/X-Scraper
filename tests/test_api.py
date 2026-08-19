@@ -211,6 +211,68 @@ def test_browser_is_default_and_does_not_require_api_token(tmp_path):
     assert "costEstimate" not in preview.get_json()
 
 
+def test_default_registry_honors_queue_config_with_isolated_workers(tmp_path):
+    settings = Settings(
+        tmp_path / "configured.db",
+        tmp_path / "auth" / "token",
+        max_workers=2,
+        queue_capacity=7,
+    )
+    app = create_app(settings, start_worker=False)
+    jobs = app.extensions["xworkbench_jobs"]
+    assert jobs.max_workers == 2
+    assert jobs.max_queue == 7
+    assert jobs._worker_registry() is not jobs._worker_registry()
+
+    custom_app = create_app(
+        Settings(
+            tmp_path / "custom" / "workbench.db",
+            tmp_path / "custom" / "auth" / "token",
+            max_workers=2,
+            queue_capacity=9,
+        ),
+        registry=ProviderRegistry([BrowserProvider()]),
+        start_worker=False,
+    )
+    custom_jobs = custom_app.extensions["xworkbench_jobs"]
+    assert custom_jobs.max_workers == 1
+    assert custom_jobs.max_queue == 9
+
+
+def test_full_configured_queue_returns_explicit_bounded_error(tmp_path):
+    settings = Settings(
+        tmp_path / "queue" / "workbench.db",
+        tmp_path / "queue" / "auth" / "token",
+        queue_capacity=1,
+    )
+    app = create_app(
+        settings,
+        registry=ProviderRegistry([BrowserProvider()]),
+        start_worker=False,
+    )
+    app.config.update(TESTING=True)
+    client = app.test_client()
+
+    for maximum, expected_status in ((1, 202), (2, 429)):
+        request = {
+            "provider": "playwright_browser",
+            "sourceType": "home",
+            "maxPosts": maximum,
+        }
+        preview = client.post("/api/collections/preview", json=request).get_json()
+        response = client.post(
+            "/api/jobs",
+            json={
+                **preview["request"],
+                "executionPlan": preview["executionPlan"],
+                "confirmBrowserCapture": True,
+            },
+        )
+        assert response.status_code == expected_status
+        if expected_status == 429:
+            assert response.get_json()["error"]["code"] == "queue_full"
+
+
 def test_create_requires_exact_preview_and_provider_confirmation(tmp_path):
     client, _ = make_client(tmp_path)
     request = {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 5}
@@ -232,6 +294,133 @@ def test_create_requires_exact_preview_and_provider_confirmation(tmp_path):
             "confirmBrowserCapture": True,
         },
     ).status_code == 400
+
+
+def test_saved_source_is_server_identified_and_exactly_bound_to_job(tmp_path):
+    client, app = make_client(tmp_path)
+    secret = "SENTINEL-SOURCE-SECRET"
+
+    rejected = client.post(
+        "/api/sources",
+        json={
+            "displayName": "Home research",
+            "provider": "playwright_browser",
+            "surface": "home",
+            "value": "home",
+            "token": secret,
+        },
+    )
+    assert rejected.status_code == 400
+    assert secret not in rejected.get_data(as_text=True)
+    assert client.post(
+        "/api/sources",
+        json={
+            "displayName": "Home research",
+            "provider": "playwright_browser",
+            "surface": "home",
+            "value": "home",
+        },
+        headers={"Origin": "https://attacker.invalid"},
+    ).status_code == 403
+
+    display_name = "Research <script>alert(1)</script>"
+    created = client.post(
+        "/api/sources",
+        json={
+            "displayName": display_name,
+            "provider": "playwright_browser",
+            "surface": "home",
+            "value": "home",
+        },
+    )
+    assert created.status_code == 201
+    source = created.get_json()["source"]
+    assert len(source["sourceId"]) == 32
+    assert all(character in "0123456789abcdef" for character in source["sourceId"])
+    assert source["displayName"] == display_name
+    assert datetime.fromisoformat(source["createdAt"]).utcoffset() is not None
+
+    listed = client.get("/api/sources?limit=1&offset=0").get_json()
+    assert listed["sources"] == [source]
+    assert listed["pagination"] == {
+        "limit": 1,
+        "offset": 0,
+        "count": 1,
+        "hasMore": False,
+        "nextOffset": None,
+    }
+    assert listed["untrustedExternalContent"] is True
+    assert client.get("/api/sources?limit=100").status_code == 400
+    assert client.get("/api/sources?limit=1%20OR%201=1").status_code == 400
+
+    duplicate = client.post(
+        "/api/sources",
+        json={
+            "displayName": "Duplicate name",
+            "provider": "playwright_browser",
+            "surface": "home",
+            "value": "home",
+        },
+    )
+    assert duplicate.status_code == 409
+
+    request = {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1}
+    preview = client.post("/api/collections/preview", json=request).get_json()
+    accepted = client.post(
+        "/api/jobs",
+        json={
+            **preview["request"],
+            "executionPlan": preview["executionPlan"],
+            "confirmBrowserCapture": True,
+            "sourceId": source["sourceId"],
+        },
+    )
+    assert accepted.status_code == 202
+    assert accepted.get_json()["sourceId"] == source["sourceId"]
+    stored = app.extensions["xworkbench_jobs"].storage.get_job(
+        accepted.get_json()["jobId"]
+    )
+    assert stored["source_id"] == source["sourceId"]
+
+    assert client.post(
+        "/api/jobs",
+        json={
+            **preview["request"],
+            "executionPlan": preview["executionPlan"],
+            "confirmBrowserCapture": True,
+            "sourceId": "../not-a-source",
+        },
+    ).status_code == 400
+    assert client.post(
+        "/api/jobs",
+        json={
+            **preview["request"],
+            "executionPlan": preview["executionPlan"],
+            "confirmBrowserCapture": True,
+            "sourceId": "valid-but-missing",
+        },
+    ).status_code == 400
+
+    profile = client.post(
+        "/api/sources",
+        json={
+            "displayName": "Other profile",
+            "provider": "playwright_browser",
+            "surface": "profile",
+            "value": "OpenAI",
+        },
+    ).get_json()["source"]
+    mismatch = client.post(
+        "/api/jobs",
+        json={
+            **preview["request"],
+            "executionPlan": preview["executionPlan"],
+            "confirmBrowserCapture": True,
+            "sourceId": profile["sourceId"],
+        },
+    )
+    assert mismatch.status_code == 400
+    assert "does not match" in mismatch.get_json()["error"]["message"]
 
 
 def test_browser_job_and_exports_omit_api_metadata_and_secrets(tmp_path):

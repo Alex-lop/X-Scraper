@@ -5,7 +5,9 @@ import io
 import ipaddress
 import json
 import math
+import sqlite3
 import unicodedata
+import uuid
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -14,10 +16,18 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from .config import Settings
 from .errors import CredentialError, InvalidRequestError
-from .jobs import ERROR_MESSAGES, JobService
-from .models import CollectionRequest, ProviderType
+from .jobs import ERROR_MESSAGES, JobService, QueueFullError
+from .models import (
+    SOURCE_ID_RE,
+    CollectionRequest,
+    ProviderType,
+    SourceDefinition,
+    source_fingerprint,
+    utc_now,
+)
 from .playwright_browser import PlaywrightBrowserProvider
 from .providers import ProviderRegistry
+from .read_service import ReadService
 from .storage import Storage
 from .x_api import UNIT_PRICES_USD, XApiProvider
 
@@ -27,6 +37,12 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted", "partial
 JOB_STATUSES = {*TERMINAL_STATUSES, "queued", "running", "waiting"}
 PUBLIC_STRING_LIMIT = 32_768
 PUBLIC_MEDIA_LIMIT = 25
+QUERY_LIMIT = 99
+QUERY_OFFSET_MAX = 10_000
+HARD_WORKER_MAXIMUM = 4
+HARD_QUEUE_CAPACITY = 10_000
+PER_SOURCE_CONCURRENCY = 1
+PER_AUTH_STATE_CONCURRENCY = 1
 
 COMMON_PROVENANCE_FIELDS = (
     "provider",
@@ -52,12 +68,40 @@ OFFICIAL_PROVENANCE_FIELDS = (
 )
 BROWSER_DETAIL_FIELDS = (
     "browserVersion",
+    "providerVersion",
+    "parserVersion",
     "sourceKind",
+    "sourceValue",
     "sourceUrl",
     "scanIterations",
     "scrollIterations",
+    "captureSegment",
+    "segmentScanIterations",
     "observedAt",
+    "visibleCards",
+    "parsedCards",
+    "duplicatePostIds",
+    "skippedCards",
+    "elapsedMs",
+    "firstPostLatencyMs",
+    "lastProgressElapsedMs",
+    "scanDurationMs",
+    "stallDurationMs",
+    "stopReason",
 )
+BROWSER_EVIDENCE_FIELDS = (
+    "text",
+    "authorUsername",
+    "createdAt",
+    "likeCount",
+    "replyCount",
+    "repostCount",
+    "quoteCount",
+    "bookmarkCount",
+    "viewCount",
+    "media",
+)
+BROWSER_SKIP_REASONS = ("missing_status_identity", "missing_outer_identity")
 
 REQUEST_FIELDS = (
     "provider",
@@ -235,6 +279,55 @@ def _allowlist(source: Any, names: tuple[str, ...]) -> dict[str, Any]:
         if value is not None:
             result[name] = value
     return result
+
+
+def _public_browser_details(source: Any) -> dict[str, Any]:
+    source = source if isinstance(source, dict) else {}
+    details = _allowlist(source, BROWSER_DETAIL_FIELDS)
+    skip_reasons = {
+        name: _nonnegative_int(source.get("skipReasons", {}).get(name))
+        for name in BROWSER_SKIP_REASONS
+        if isinstance(source.get("skipReasons"), dict)
+        and name in source["skipReasons"]
+    }
+    if skip_reasons:
+        details["skipReasons"] = skip_reasons
+
+    coverage = source.get("fieldCoverage")
+    if isinstance(coverage, dict):
+        public_coverage = {}
+        for name in BROWSER_EVIDENCE_FIELDS:
+            item = coverage.get(name)
+            if not isinstance(item, dict):
+                continue
+            present = _nonnegative_int(item.get("present"))
+            total = _nonnegative_int(item.get("total"))
+            ratio = _public_scalar(item.get("ratio"))
+            public_coverage[name] = {
+                "present": min(present, total),
+                "total": total,
+                "ratio": (
+                    ratio
+                    if isinstance(ratio, int | float) and not isinstance(ratio, bool)
+                    else None
+                ),
+            }
+        if public_coverage:
+            details["fieldCoverage"] = public_coverage
+
+    evidence = source.get("fieldExtractionEvidence")
+    if isinstance(evidence, dict):
+        public_evidence = {}
+        for name in BROWSER_EVIDENCE_FIELDS:
+            item = evidence.get(name)
+            if not isinstance(item, dict):
+                continue
+            present = _nonnegative_int(item.get("present"))
+            missing = _nonnegative_int(item.get("missing"))
+            public_evidence[name] = {"present": present, "missing": missing}
+        if public_evidence:
+            details["fieldExtractionEvidence"] = public_evidence
+    return details
 
 
 def _public_request(value: Any) -> dict[str, Any]:
@@ -500,7 +593,7 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
         checkpoint = job.get("checkpoint") or {}
         metadata = checkpoint.get("metadata") if isinstance(checkpoint, dict) else {}
         metadata = metadata if isinstance(metadata, dict) else {}
-        details = _allowlist({**plan, **metadata}, BROWSER_DETAIL_FIELDS)
+        details = _public_browser_details({**plan, **metadata})
         public["providerDetails"] = details
 
     return public
@@ -508,6 +601,109 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
 
 def _error(code: str, message: str, status: int):
     return jsonify({"error": {"code": code, "message": message}}), status
+
+
+def _query_integer(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    value = request.args.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}.")
+    return parsed
+
+
+def _optional_boolean(name: str) -> bool | None:
+    value = request.args.get(name)
+    if value is None:
+        return None
+    if value not in {"true", "false"}:
+        raise ValueError(f"{name} must be true, false, or omitted.")
+    return value == "true"
+
+
+def _public_queue_metrics(
+    value: Any,
+    *,
+    configured_max_workers: int | None = None,
+    configured_queue_capacity: int | None = None,
+) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+
+    def number(name: str, *, integer: bool = True) -> int | float | None:
+        item = value.get(name)
+        valid = (
+            isinstance(item, int | float)
+            and not isinstance(item, bool)
+            and item >= 0
+            and (not isinstance(item, float) or math.isfinite(item))
+        )
+        if not valid or (integer and not isinstance(item, int)):
+            return None
+        return item
+
+    result = {
+        name: number(name)
+        for name in (
+            "queueDepth",
+            "queueCapacity",
+            "activeWorkers",
+            "maxWorkers",
+            "activeSources",
+            "activeAuthStates",
+            "submitted",
+            "deduplicated",
+            "rejected",
+            "started",
+            "finished",
+            "cancelRequests",
+            "cleanupFailures",
+            "persistenceActive",
+            "persistenceWaiting",
+            "maxPersistenceBacklog",
+        )
+    }
+    result.update(
+        {
+            name: number(name, integer=False)
+            for name in (
+                "queueWaitP50Ms",
+                "queueWaitP95Ms",
+                "throughputJobsPerSecond",
+                "cleanupSeconds",
+            )
+        }
+    )
+    raw_statuses = value.get("completedByStatus")
+    result["completedByStatus"] = {
+        name: item
+        for name, item in (raw_statuses.items() if isinstance(raw_statuses, dict) else [])
+        if name in JOB_STATUSES
+        and isinstance(item, int)
+        and not isinstance(item, bool)
+        and item >= 0
+    }
+    result["limits"] = {
+        "configuredMaxWorkers": configured_max_workers,
+        "configuredQueueCapacity": configured_queue_capacity,
+        "hardMaxWorkers": HARD_WORKER_MAXIMUM,
+        "hardQueueCapacity": HARD_QUEUE_CAPACITY,
+        "perSourceConcurrency": PER_SOURCE_CONCURRENCY,
+        "perAuthStateConcurrency": PER_AUTH_STATE_CONCURRENCY,
+    }
+    return result
+
+
+def _submit_with_source(
+    jobs: JobService,
+    collection_request: CollectionRequest,
+    execution_plan: dict[str, Any],
+    source_id: str | None,
+) -> str:
+    return jobs.submit(collection_request, execution_plan, source_id=source_id)
 
 
 def _request_body(body: Any) -> CollectionRequest:
@@ -518,6 +714,7 @@ def _request_body(body: Any) -> CollectionRequest:
         "confirmBrowserCapture",
         "compiledRequest",
         "executionPlan",
+        "sourceId",
     }
     return CollectionRequest.from_dict(
         {key: value for key, value in body.items() if key not in controls}
@@ -559,15 +756,30 @@ def create_app(
     storage.initialize()
     if registry is not None and provider is not None:
         raise ValueError("Pass registry or provider, not both.")
+    custom_registry = registry is not None or provider is not None
     registry = registry or (
         ProviderRegistry([provider]) if provider else _default_registry(settings)
     )
-    jobs = JobService(storage, registry, start_worker=start_worker)
+    max_workers = 1 if custom_registry else settings.max_workers
+    jobs = JobService(
+        storage,
+        registry,
+        start_worker=start_worker,
+        max_workers=max_workers,
+        max_queue=settings.queue_capacity,
+        provider_factory=(
+            (lambda: _default_registry(settings))
+            if not custom_registry and max_workers > 1
+            else None
+        ),
+    )
+    reader = ReadService(storage)
 
     app = Flask(__name__, static_folder="static", static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
     app.extensions["xworkbench_jobs"] = jobs
     app.extensions["xworkbench_registry"] = registry
+    app.extensions["xworkbench_read_service"] = reader
 
     @app.before_request
     def require_local_host_and_json_mutations():
@@ -623,6 +835,169 @@ def create_app(
     @app.get("/api/health")
     def health():
         return jsonify({"status": "ok"})
+
+    @app.get("/api/sources")
+    def list_sources():
+        try:
+            return jsonify(
+                reader.list_sources(
+                    limit=_query_integer("limit", 25, minimum=1, maximum=QUERY_LIMIT),
+                    offset=_query_integer(
+                        "offset", 0, minimum=0, maximum=QUERY_OFFSET_MAX
+                    ),
+                )
+            )
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+
+    @app.post("/api/sources")
+    def create_source():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return _error("invalid_request", "Request body must be a JSON object.", 400)
+        allowed = {"displayName", "provider", "surface", "value"}
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            return _error(
+                "invalid_request",
+                f"Unknown source field(s): {', '.join(unknown)}.",
+                400,
+            )
+        try:
+            source = SourceDefinition.from_dict(
+                {
+                    "id": uuid.uuid4().hex,
+                    "displayName": body.get("displayName"),
+                    "provider": body.get("provider"),
+                    "surface": body.get("surface"),
+                    "value": body.get("value"),
+                    "createdAt": utc_now(),
+                }
+            )
+            saved = storage.save_source(source)
+        except InvalidRequestError as exc:
+            return _error(exc.code, str(exc), 400)
+        except (sqlite3.IntegrityError, ValueError):
+            return _error("source_conflict", "That source is already saved.", 409)
+        return (
+            jsonify(
+                {
+                    "source": {
+                        "sourceId": saved["id"],
+                        "displayName": saved["display_name"],
+                        "provider": saved["provider"],
+                        "surface": saved["surface"],
+                        "query": saved["normalized_value"],
+                        "sourceFingerprint": saved["source_fingerprint"],
+                        "createdAt": saved["created_at"],
+                        "lastStatus": saved["last_status"],
+                    }
+                }
+            ),
+            201,
+        )
+
+    @app.get("/api/snapshots")
+    def list_snapshots():
+        try:
+            return jsonify(
+                reader.list_snapshots(
+                    source_id=request.args.get("sourceId"),
+                    limit=_query_integer("limit", 25, minimum=1, maximum=QUERY_LIMIT),
+                    offset=_query_integer(
+                        "offset", 0, minimum=0, maximum=QUERY_OFFSET_MAX
+                    ),
+                    usable=_optional_boolean("usable"),
+                )
+            )
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+
+    @app.get("/api/compare")
+    def compare_snapshots():
+        try:
+            return jsonify(
+                reader.compare_snapshots(
+                    request.args.get("olderSnapshotId"),
+                    request.args.get("newerSnapshotId"),
+                    limit=_query_integer("limit", 25, minimum=1, maximum=QUERY_LIMIT),
+                )
+            )
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+
+    @app.get("/api/evidence/search")
+    def search_evidence():
+        source_ids = request.args.getlist("sourceId") or None
+        snapshot_ids = request.args.getlist("snapshotId") or None
+        try:
+            return jsonify(
+                reader.search_post_evidence(
+                    request.args.get("query"),
+                    source_ids=source_ids,
+                    snapshot_ids=snapshot_ids,
+                    start_time=request.args.get("startTime"),
+                    end_time=request.args.get("endTime"),
+                    limit=_query_integer("limit", 25, minimum=1, maximum=QUERY_LIMIT),
+                    offset=_query_integer(
+                        "offset", 0, minimum=0, maximum=QUERY_OFFSET_MAX
+                    ),
+                )
+            )
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+
+    @app.get("/api/collection-health")
+    def collection_health():
+        try:
+            return jsonify(
+                reader.get_collection_health(
+                    source_id=request.args.get("sourceId"),
+                    limit=_query_integer("limit", 25, minimum=1, maximum=QUERY_LIMIT),
+                )
+            )
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+
+    @app.get("/api/queue/metrics")
+    def queue_metrics():
+        return jsonify(
+            _public_queue_metrics(
+                jobs.metrics(),
+                configured_max_workers=jobs.max_workers,
+                configured_queue_capacity=jobs.max_queue,
+            )
+        )
+
+    @app.post("/api/retention/purge")
+    def purge_snapshots():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return _error("invalid_request", "Request body must be a JSON object.", 400)
+        unknown = sorted(set(body) - {"confirm", "keepPerSource"})
+        if unknown:
+            return _error(
+                "invalid_request",
+                f"Unknown purge field(s): {', '.join(unknown)}.",
+                400,
+            )
+        if body.get("confirm") is not True:
+            return _error("confirmation_required", "confirm must be true.", 400)
+        keep_per_source = body.get(
+            "keepPerSource", settings.retention_keep_per_source
+        )
+        if (
+            isinstance(keep_per_source, bool)
+            or not isinstance(keep_per_source, int)
+            or not 0 <= keep_per_source <= 100
+        ):
+            return _error(
+                "invalid_request",
+                "keepPerSource must be between 0 and 100.",
+                400,
+            )
+        purged_count = storage.purge_snapshots(keep_per_source=keep_per_source)
+        return jsonify({"purgedCount": purged_count})
 
     @app.get("/api/connection")
     def connection():
@@ -748,12 +1123,35 @@ def create_app(
                     else "confirmBrowserCapture must be true to start a browser capture."
                 )
                 raise InvalidRequestError(message)
+            source_id = body.get("sourceId")
+            if source_id is not None:
+                if not isinstance(source_id, str) or not SOURCE_ID_RE.fullmatch(source_id):
+                    raise InvalidRequestError("sourceId is invalid.")
+                saved_source = storage.get_source(source_id)
+                if saved_source is None:
+                    raise InvalidRequestError("sourceId was not found.")
+                if saved_source.get("source_fingerprint") != source_fingerprint(
+                    collection_request
+                ):
+                    raise InvalidRequestError(
+                        "sourceId does not match this collection request."
+                    )
         except CredentialError as exc:
             return _error("connection_missing", str(exc), 409)
         except InvalidRequestError as exc:
             return _error(exc.code, str(exc), 400)
-        job_id = jobs.submit(collection_request, execution_plan)
-        return jsonify({"jobId": job_id, "status": "queued"}), 202
+        try:
+            job_id = _submit_with_source(
+                jobs, collection_request, execution_plan, source_id
+            )
+        except QueueFullError as exc:
+            return _error(exc.code, str(exc), 429)
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+        return (
+            jsonify({"jobId": job_id, "status": "queued", "sourceId": source_id}),
+            202,
+        )
 
     @app.get("/api/jobs")
     def list_jobs():
