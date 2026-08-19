@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
 import importlib.metadata
 import importlib.util
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import threading
 import webbrowser
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -24,9 +26,10 @@ from .api import BROWSER_PROVIDER, create_app
 from .config import Settings, SettingsError, validate_token
 from .errors import CollectionError
 from .jobs import JobService
-from .models import CollectionRequest, Post
+from .models import CollectionRequest, Post, SourceDefinition
 from .playwright_browser import PlaywrightBrowserProvider, authenticate_interactively
 from .providers import ProviderRegistry
+from .read_service import ReadService
 from .storage import SCHEMA_FAMILY, SCHEMA_VERSION, Storage
 
 EXIT_PRECONDITION = 2
@@ -119,7 +122,9 @@ def _database_ready(path: Path) -> tuple[bool, str]:
     if details.st_size == 0:
         return True, f"new database will be created at {path}"
     try:
-        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as connection:
+        with closing(
+            sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        ) as connection:
             connection.row_factory = sqlite3.Row
             metadata = dict(connection.execute("SELECT key, value FROM schema_meta"))
             version = metadata.get("schema_version")
@@ -127,6 +132,7 @@ def _database_ready(path: Path) -> tuple[bool, str]:
             if metadata.get("schema_family") == SCHEMA_FAMILY and version in {
                 "1",
                 "2",
+                "3",
                 SCHEMA_VERSION,
             }:
                 checker = Storage(path)._schema_is_compatible
@@ -173,6 +179,23 @@ def _chromium_available() -> tuple[bool, str]:
         executable.parent.name,
     )
     return True, f"Playwright Chromium is installed and launches ({revision})"
+
+
+def _local_mcp_read(
+    storage: Storage, tool_name: str, arguments: dict
+) -> tuple[list[str], dict]:
+    from .mcp_server import build_mcp_server
+
+    async def read() -> tuple[list[str], dict]:
+        server = build_mcp_server(ReadService(storage))
+        tools = await server.list_tools()
+        result = await server.call_tool(tool_name, arguments)
+        payload = result.structured_content
+        if result.is_error or not isinstance(payload, dict):
+            raise RuntimeError("Local MCP read failed.")
+        return [tool.name for tool in tools], payload
+
+    return asyncio.run(read())
 
 
 def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
@@ -241,6 +264,35 @@ def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
         message,
         None if ready and database_exists else "Run: xworkbench setup",
     )
+    try:
+        mcp_package = importlib.util.find_spec("mcp.server") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        mcp_package = False
+    if not mcp_package:
+        result(
+            "WARN",
+            "local MCP",
+            "MCP support is not installed",
+            'Run: python -m pip install -e ".[mcp]"',
+        )
+    elif not database_exists:
+        result("WARN", "local MCP", "database is not initialized", "Run: xworkbench setup")
+    else:
+        try:
+            from .mcp_server import _ReadOnlyStorage
+
+            tools, _ = _local_mcp_read(
+                _ReadOnlyStorage(settings.database_path), "list_sources", {"limit": 1}
+            )
+        except (OSError, RuntimeError, ValueError, SystemExit):
+            result(
+                "WARN",
+                "local MCP",
+                "read-only database check requires the current schema",
+                "Run: xworkbench setup",
+            )
+        else:
+            result("PASS", "local MCP", f"read-only database access; {len(tools)} tools")
 
     browser_status = PlaywrightBrowserProvider(settings).connection_status()
     browser_state = str(browser_status.get("status", "unavailable"))
@@ -341,7 +393,7 @@ def _setup(settings: Settings) -> int:
     storage = Storage(settings.database_path)
     storage.initialize()
     try:
-        with sqlite3.connect(settings.database_path, timeout=0) as connection:
+        with closing(sqlite3.connect(settings.database_path, timeout=0)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.rollback()
     except sqlite3.OperationalError as exc:
@@ -368,80 +420,198 @@ def _config(settings: Settings, command: str) -> int:
     return 0
 
 
-def _seed_offline_demo(storage: Storage) -> str:
+def _demo_posts(post_numbers: range, *, observed_at: str, follow_up: bool) -> list[Post]:
+    authors = (
+        "demo_gardener",
+        "demo_ecologist",
+        "demo_rooftop",
+        "demo_mapper",
+        "demo_volunteer",
+        "demo_librarian",
+        "demo_observer",
+    )
+    notes = (
+        "moonflower plots held moisture after the simulated overnight mist",
+        "the west planter logged three fictional bee visits before noon",
+        "shade cloth reduced the modeled surface temperature by four degrees",
+        "volunteers mapped a pretend pollen corridor between roofs B and C",
+        "the paper sensor card recorded a fictional amber reading",
+    )
+    created_base = datetime(2026, 8, 17, 8, tzinfo=UTC)
+    posts = []
+    for number in post_numbers:
+        post_id = f"glasswing-{number:03d}"
+        author = (
+            f"demo_newcomer_{number % 2 + 1}"
+            if number >= 30
+            else authors[(number - 1) % len(authors)]
+        )
+        phase = "follow-up" if number > 25 else "baseline"
+        text = (
+            f"[FICTIONAL DEMO] Project Glasswing {phase} field note {number:02d}: "
+            f"{notes[(number - 1) % len(notes)]}. #ProjectGlasswing"
+            f"{' #NewObservation' if number > 25 else ''}"
+        )
+        increment = 7 if follow_up and number <= 25 else 0
+        posts.append(
+            Post(
+                post_id=post_id,
+                text=text,
+                author_username=author,
+                author_id=f"fictional-{author}",
+                url=f"offline://project-glasswing/posts/{post_id}",
+                created_at=(created_base + timedelta(minutes=11 * number)).isoformat(),
+                observed_at=observed_at,
+                language="en",
+                conversation_id=f"glasswing-thread-{(number - 1) // 5 + 1:02d}",
+                in_reply_to_post_id=(
+                    f"glasswing-{number - 1:03d}" if number % 7 == 0 else None
+                ),
+                like_count=12 + number * 3 + increment,
+                reply_count=number % 5 + (1 if increment else 0),
+                repost_count=2 + number % 7 + (2 if increment else 0),
+                quote_count=number % 3 + (1 if increment else 0),
+                bookmark_count=None if number % 6 == 0 else 4 + number % 9 + increment,
+                view_count=None if number % 4 == 0 else 120 + number * 19 + increment * 20,
+                is_reply=number % 7 == 0,
+                is_repost=False,
+                is_quote=number % 9 == 0,
+                has_media=number % 5 == 0,
+                source_position=number - 1,
+            )
+        )
+    return posts
+
+
+def _seed_offline_demo(storage: Storage) -> dict[str, str | int]:
     storage.initialize()
+    source_id = "demo-project-glasswing"
+    source_value = "Project Glasswing fictional pollinator corridor"
+    storage.save_source(
+        SourceDefinition.from_dict(
+            {
+                "id": source_id,
+                "displayName": "DEMO — Project Glasswing (fictional topic)",
+                "provider": BROWSER_PROVIDER,
+                "surface": "search",
+                "value": source_value,
+                "createdAt": "2026-08-17T08:00:00+00:00",
+            }
+        )
+    )
     request = CollectionRequest.from_dict(
         {
             "provider": BROWSER_PROVIDER,
-            "sourceType": "home",
-            "maxPosts": 3,
+            "sourceType": "search",
+            "sourceValue": source_value,
+            "maxPosts": 25,
         }
     )
-    now = datetime.now(UTC).replace(microsecond=0)
     plan = {
         "provider": BROWSER_PROVIDER,
         "providerVersion": PlaywrightBrowserProvider.provider_version,
-        "sourceKind": "home",
-        "sourceUrl": "offline://synthetic-home",
-        "targetPosts": 3,
-        "preparedAt": now.isoformat(),
+        "parserVersion": "offline-demo-v1",
+        "sourceKind": "search",
+        "sourceValue": source_value,
+        "sourceUrl": "offline://project-glasswing/search",
+        "targetPosts": 25,
+        "preparedAt": "2026-08-18T09:00:00+00:00",
         "browserHeadless": True,
         "jobTimeoutSeconds": 0,
         "pageTimeoutMs": 0,
         "noProgressLimit": 0,
     }
-    posts = [
-        Post(
-            "demo-1",
-            "[DEMO DATA] A human-approved feed capture becomes a durable local snapshot.",
-            "demo_analyst",
-            "https://example.invalid/demo-1",
-            (now - timedelta(minutes=12)).isoformat(),
-            like_count=42,
-            reply_count=5,
-            repost_count=9,
+    coverage = {
+        name: {"present": present, "total": 25, "ratio": present / 25}
+        for name, present in {
+            "text": 25,
+            "authorUsername": 25,
+            "createdAt": 25,
+            "likeCount": 25,
+            "replyCount": 25,
+            "repostCount": 25,
+            "quoteCount": 25,
+            "bookmarkCount": 21,
+            "viewCount": 19,
+            "media": 25,
+        }.items()
+    }
+    extraction = {
+        name: {"present": item["present"], "missing": 25 - item["present"]}
+        for name, item in coverage.items()
+    }
+    snapshots = (
+        (
+            range(1, 26),
+            "2026-08-18T09:02:00+00:00",
+            False,
+            31,
+            4,
         ),
-        Post(
-            "demo-2",
-            "[DEMO DATA] Agents inspect completed evidence through a read-only MCP surface.",
-            "demo_researcher",
-            "https://example.invalid/demo-2",
-            (now - timedelta(minutes=8)).isoformat(),
-            quote_count=3,
-            bookmark_count=7,
+        (
+            range(11, 36),
+            "2026-08-19T09:02:00+00:00",
+            True,
+            34,
+            6,
         ),
-        Post(
-            "demo-3",
-            "[DEMO DATA] Partial snapshots remain useful without another X request.",
-            "demo_operator",
-            "https://example.invalid/demo-3",
-            (now - timedelta(minutes=4)).isoformat(),
-            in_reply_to_post_id="demo-1",
-            is_reply=True,
-            has_media=True,
-        ),
-    ]
-    job_id = storage.create_job(request, plan)
-    storage.claim_job(job_id)
-    storage.add_posts(
-        job_id,
-        posts,
-        None,
-        {
+    )
+    snapshot_ids = []
+    for numbers, observed_at, partial, visible_cards, duplicates in snapshots:
+        snapshot_id = storage.create_job(
+            request,
+            plan,
+            source_id=source_id,
+            stale_after_seconds=315_360_000,
+        )
+        snapshot_ids.append(snapshot_id)
+        if storage.claim_job(snapshot_id) is None:
+            raise RuntimeError("Offline demo snapshot could not start.")
+        posts = _demo_posts(numbers, observed_at=observed_at, follow_up=partial)
+        metadata = {
             "browserVersion": "offline-demo",
-            "sourceKind": "home",
-            "sourceUrl": "offline://synthetic-home",
-            "scanIterations": 1,
-            "scrollIterations": 0,
-            "observedAt": now.isoformat(),
-        },
-    )
-    storage.finish_job(
-        job_id,
-        ["Synthetic offline demo; no X request was made."],
-        completion_reason="offline_demo_seeded",
-    )
-    return job_id
+            "parserVersion": "offline-demo-v1",
+            "sourceKind": "search",
+            "sourceValue": source_value,
+            "sourceUrl": "offline://project-glasswing/search",
+            "scanIterations": 5 if partial else 4,
+            "scrollIterations": 4 if partial else 3,
+            "observedAt": observed_at,
+            "visibleCards": visible_cards,
+            "parsedCards": 25,
+            "duplicatePostIds": duplicates,
+            "skippedCards": 3 if partial else 2,
+            "elapsedMs": 4_600 if partial else 3_900,
+            "firstPostLatencyMs": 180,
+            "lastProgressElapsedMs": 4_050 if partial else 3_500,
+            "scanDurationMs": 3_700 if partial else 3_100,
+            "stallDurationMs": 550 if partial else 400,
+            "stopReason": "offline_demo_bounded_sample",
+            "truncated": partial,
+            "fieldCoverage": coverage,
+            "fieldExtractionEvidence": extraction,
+        }
+        if storage.add_posts(snapshot_id, posts, None, metadata) != 25:
+            raise RuntimeError("Offline demo snapshot did not store all synthetic Posts.")
+        warnings = ["Fictional offline evidence; no X request was made."]
+        if partial:
+            warnings.append(
+                "Newest sample is intentionally partial to demonstrate uncertainty."
+            )
+        if storage.finish_job(
+            snapshot_id,
+            warnings,
+            completion_reason="offline_demo_seeded",
+            partial=partial,
+        ) is None:
+            raise RuntimeError("Offline demo snapshot could not finish.")
+    return {
+        "sourceId": source_id,
+        "olderSnapshotId": snapshot_ids[0],
+        "newerSnapshotId": snapshot_ids[1],
+        "olderPosts": 25,
+        "newerPosts": 25,
+    }
 
 
 def _is_loopback(host: str) -> bool:
@@ -480,12 +650,63 @@ def _run_demo(*, port: int, open_browser: bool) -> int:
         root = Path(temporary)
         demo_settings = Settings(root / "demo.db", root / "no-token", allow_environment_token=False)
         storage = Storage(demo_settings.database_path)
-        _seed_offline_demo(storage)
-        print("OFFLINE DEMO: synthetic data only; no X requests.")
+        seeded = _seed_offline_demo(storage)
         app = create_app(
             demo_settings,
             storage=storage,
+            registry=ProviderRegistry([]),
+            start_worker=False,
             collection_enabled=False,
+        )
+        newer_snapshot_id = str(seeded["newerSnapshotId"])
+        with app.test_client() as client:
+            searched = client.get(
+                "/api/evidence/search",
+                query_string={"query": "moonflower", "snapshotId": newer_snapshot_id},
+            ).get_json()
+            exported_json = client.get(
+                f"/api/jobs/{newer_snapshot_id}/export?format=json"
+            ).get_json()
+            exported_csv = client.get(
+                f"/api/jobs/{newer_snapshot_id}/export?format=csv"
+            ).get_data(as_text=True)
+        tools, comparison = _local_mcp_read(
+            storage,
+            "compare_snapshots",
+            {
+                "older_snapshot_id": seeded["olderSnapshotId"],
+                "newer_snapshot_id": newer_snapshot_id,
+                "limit": 25,
+            },
+        )
+        counts = comparison.get("counts")
+        search_count = len(searched.get("evidence", [])) if isinstance(searched, dict) else 0
+        json_count = (
+            len(exported_json.get("posts", [])) if isinstance(exported_json, dict) else 0
+        )
+        csv_count = max(0, len(exported_csv.splitlines()) - 1)
+        if counts != {
+            "newlyObserved": 10,
+            "reobserved": 15,
+            "notObservedInNewerSample": 10,
+        } or (search_count, json_count, csv_count) != (5, 25, 25):
+            raise RuntimeError("Offline demo verification failed.")
+        print("OFFLINE DEMO: fictional synthetic data only; no X request or network read.")
+        print(
+            "SOURCE: DEMO — Project Glasswing (fictional topic); "
+            "two immutable 25-Post snapshots"
+        )
+        print(
+            "CHANGES: 10 newly observed, 15 reobserved with comparable deltas, "
+            "10 not observed in the intentionally partial newer sample"
+        )
+        print(f"SEARCH: moonflower returned {search_count} stored evidence records via FTS")
+        print(
+            f"MCP: direct local compare_snapshots read succeeded; {len(tools)} tools available"
+        )
+        print(
+            "EXPORTS: JSON and CSV each contain 25 Posts at "
+            f"/api/jobs/{newer_snapshot_id}/export"
         )
         return _run_server(app, "127.0.0.1", port, open_browser=open_browser)
 

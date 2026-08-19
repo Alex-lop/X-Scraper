@@ -162,11 +162,13 @@ def test_offline_demo_is_preseeded_isolated_and_blocks_live_collection(monkeypat
         connection = client.get("/api/connection").get_json()
         assert connection["demoMode"] == "offline"
         jobs = client.get("/api/jobs").get_json()["jobs"]
+        assert len(jobs) == 2
         assert jobs[0]["provider"] == "playwright_browser"
         assert "cost" not in jobs[0] and "resourcesReturned" not in jobs[0]
         posts = client.get(f"/api/jobs/{jobs[0]['id']}/posts").get_json()["posts"]
-        assert len(posts) == 3
-        assert all(post["text"].startswith("[DEMO DATA]") for post in posts)
+        assert len(posts) == 25
+        assert all(post["text"].startswith("[FICTIONAL DEMO]") for post in posts)
+        assert all(post["url"].startswith("offline://") for post in posts)
         assert client.post(
             "/api/collections/preview",
             json={"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1},

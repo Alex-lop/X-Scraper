@@ -136,20 +136,39 @@ def test_setup_does_not_chmod_an_unsafe_existing_parent(tmp_path):
     assert stat.S_IMODE(parent.stat().st_mode) == 0o755
 
 
-def test_doctor_reports_v2_database_as_ready_for_v3_migration(tmp_path, monkeypatch):
+@pytest.mark.parametrize("version", ["1", "2", "3"])
+def test_doctor_reports_each_legacy_database_as_ready_for_v4_migration(
+    tmp_path, monkeypatch, version
+):
     database = tmp_path / "legacy.db"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
         connection.executemany(
             "INSERT INTO schema_meta VALUES (?, ?)",
-            (("schema_family", SCHEMA_FAMILY), ("schema_version", "2")),
+            (("schema_family", SCHEMA_FAMILY), ("schema_version", version)),
         )
     monkeypatch.setattr(Storage, "_schema_is_compatible", lambda *_args, **_kwargs: True)
 
     ready, message = _database_ready(database)
 
     assert ready is True
-    assert "v2 ready for protected migration" in message
+    assert f"v{version} ready for protected migration" in message
+
+
+def test_repeated_database_readiness_checks_close_connections(tmp_path):
+    resource = pytest.importorskip("resource")
+    database = tmp_path / "current.db"
+    Storage(database).initialize()
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    lowered = min(soft, 64)
+    if lowered < 32:
+        pytest.skip("The process file-descriptor limit is already too low for this test.")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (lowered, hard))
+    try:
+        for _ in range(256):
+            assert _database_ready(database)[0] is True
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 def test_doctor_is_read_only_and_does_not_expose_invalid_state(
