@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data:; style-src 'unsafe-inline'"
+    >
+    <title>Sanitized synthetic card shapes</title>
+    <style>
+      article {
+        display: block;
+        width: 420px;
+        min-height: 64px;
+        margin: 8px;
+        border: 1px solid #999;
+      }
+      [hidden] { display: none; }
+      .visibility-hidden { visibility: hidden; }
+    </style>
+  </head>
+  <body>
+    <main aria-label="Synthetic timeline">
+      <article data-testid="tweet" data-card-kind="original">
+        <div data-testid="User-Name">Original Fixture @fixture_orig</div>
+        <a href="https://x.com/fixture_orig/status/1001">
+          <time datetime="2026-08-18T10:01:00Z">10:01</time>
+        </a>
+        <div data-testid="tweetText">Synthetic original card.</div>
+        <button data-testid="reply" aria-label="1.2K Replies"></button>
+        <button data-testid="retweet" aria-label="2.5M reposts"></button>
+        <button data-testid="like" aria-label="3B Likes"></button>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="reply">
+        <div data-testid="User-Name">Reply Fixture @fixture_reply</div>
+        <a href="https://x.com/fixture_reply/status/1002">
+          <time datetime="2026-08-18T10:02:00Z">10:02</time>
+        </a>
+        <div>Replying to @fixture_topic</div>
+        <div data-testid="tweetText">Synthetic reply card.</div>
+        <button data-testid="reply" aria-label="2 Replies"></button>
+        <button data-testid="retweet" aria-label="3 reposts"></button>
+        <button data-testid="like" aria-label="4 Likes"></button>
+        <button data-testid="bookmark" aria-label="5 Bookmarks"></button>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="repost">
+        <div data-testid="socialContext">Fixture User reposted</div>
+        <div data-testid="User-Name">Repost Fixture @fixture_repost</div>
+        <a href="https://x.com/fixture_repost/status/1003">
+          <time datetime="2026-08-18T10:03:00Z">10:03</time>
+        </a>
+        <div data-testid="tweetText">Synthetic repost card.</div>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="quote">
+        <div data-testid="User-Name">Quote Fixture @fixture_quote</div>
+        <a href="https://x.com/fixture_quote/status/1004">
+          <time datetime="2026-08-18T10:04:00Z">10:04</time>
+        </a>
+        <div data-testid="tweetText">Synthetic outer quote text.</div>
+        <div data-testid="quoteTweet">
+          <article data-testid="tweet" data-card-kind="nested-quote">
+            <div data-testid="User-Name">Nested Fixture @fixture_nested</div>
+            <a href="https://x.com/fixture_nested/status/1904">
+              <time datetime="2026-08-18T09:04:00Z">09:04</time>
+            </a>
+            <div data-testid="tweetText">Synthetic nested quote text.</div>
+          </article>
+        </div>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="media-only">
+        <div data-testid="User-Name">Media Fixture @fixture_media</div>
+        <a href="https://x.com/fixture_media/status/1005">
+          <time datetime="2026-08-18T10:05:00Z">10:05</time>
+        </a>
+        <div data-testid="tweetPhoto">
+          <img
+            alt="Synthetic four-pixel fixture"
+            src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3C/svg%3E"
+          >
+        </div>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="promoted-like">
+        <div data-testid="socialContext">Promoted</div>
+        <div data-testid="User-Name">Promotion Fixture @fixture_promo</div>
+        <a href="https://x.com/fixture_promo/status/1006">
+          <time datetime="2026-08-18T10:06:00Z">10:06</time>
+        </a>
+        <div data-testid="tweetText">Synthetic promoted-like card.</div>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="missing-fields">
+        <a href="https://x.com/i/web/status/1007">Synthetic identity only</a>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="schema-drift">
+        <div data-testid="UserLabelV2">Drift Fixture @fixture_drift</div>
+        <a data-post-link="1008" href="https://x.com/fixture_drift/post/1008">Drifted link</a>
+        <div data-testid="postTextV2">Synthetic deliberately drifted card.</div>
+      </article>
+
+      <article data-testid="tweet" data-card-kind="hidden" hidden>
+        <a href="https://x.com/fixture_hidden/status/1009">Hidden synthetic card</a>
+      </article>
+      <article
+        class="visibility-hidden"
+        data-testid="tweet"
+        data-card-kind="visibility-hidden"
+      >
+        <a href="https://x.com/fixture_hidden/status/1010">Visibility-hidden synthetic card</a>
+      </article>
+      <section data-testid="tweet-v2" data-card-kind="selector-drift">
+        <a href="https://x.com/fixture_drift/status/1011">Changed article selector</a>
+      </section>
+    </main>
+  </body>
+</html>

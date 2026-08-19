@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+    >
+    <link rel="icon" href="data:,">
+    <title>Sanitized virtualized timeline</title>
+    <style>
+      body { margin: 0; }
+      #timeline { min-height: 180px; }
+      article {
+        display: block;
+        width: 420px;
+        min-height: 72px;
+        margin: 8px;
+        border: 1px solid #999;
+      }
+      #scroll-space { height: 5000px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section id="timeline" aria-label="Synthetic virtualized timeline"></section>
+      <div id="scroll-space" aria-hidden="true"></div>
+    </main>
+    <script>
+      const batches = [
+        ["2001", "2001"],
+        ["2001", "2002", "2002"],
+        ["2002", "2003"],
+        ["2003", "2004"],
+      ];
+      const timeline = document.querySelector("#timeline");
+      let loading = false;
+      let nextBatch = 1;
+      let lastTriggeredY = 0;
+
+      function card(postId, duplicateIndex) {
+        const article = document.createElement("article");
+        article.dataset.testid = "tweet";
+        article.dataset.syntheticPostId = postId;
+        article.innerHTML = `
+          <div data-testid="User-Name">Timeline Fixture @fixture_timeline</div>
+          <a href="https://x.com/fixture_timeline/status/${postId}">
+            <time datetime="2026-08-18T12:${postId.slice(-2)}:00Z">synthetic time</time>
+          </a>
+          <div data-testid="tweetText">Delayed synthetic post ${postId}, copy ${duplicateIndex}.</div>
+          <button data-testid="like" aria-label="${duplicateIndex + 1} Likes"></button>
+        `;
+        return article;
+      }
+
+      function render(batchIndex) {
+        timeline.replaceChildren(...batches[batchIndex].map(card));
+        timeline.dataset.renderedBatch = String(batchIndex);
+      }
+
+      render(0);
+      addEventListener("scroll", () => {
+        if (scrollY - lastTriggeredY < 300 || loading || nextBatch >= batches.length) return;
+        lastTriggeredY = scrollY;
+        loading = true;
+        const batchIndex = nextBatch++;
+        setTimeout(() => {
+          render(batchIndex);
+          loading = false;
+        }, 75);
+      });
+    </script>
+  </body>
+</html>
