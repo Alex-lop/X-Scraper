@@ -3,15 +3,19 @@ from __future__ import annotations
 import atexit
 import logging
 import os
-import queue
 import threading
 import traceback
 import uuid
+from collections import defaultdict, deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from .errors import CollectionCancelled, CollectionError, RateLimitWaiting
-from .models import CollectionRequest, JobStatus
+from .models import CollectionRequest, JobStatus, source_fingerprint
 from .providers import CollectionProvider, ProviderRegistry
 from .storage import Storage
 
@@ -34,6 +38,7 @@ ERROR_MESSAGES = {
     "manual_action_required": "The browser requires manual action before another approved job.",
     "network_failure": "The provider could not be reached.",
     "provider_error": "The collection provider failed.",
+    "queue_full": "The local collection queue is full.",
     "rate_limited": "The collection was rate-limited. Start a new approved job later.",
     "resume_incompatible": "The saved checkpoint is incompatible with this collection.",
     "schema_mismatch": "The provider response could not be parsed safely.",
@@ -58,6 +63,21 @@ class StorageCallbackError(CollectionError):
     retryable = True
 
 
+class QueueFullError(CollectionError):
+    code = "queue_full"
+    retryable = True
+
+
+@dataclass(slots=True)
+class _QueuedJob:
+    job_id: str
+    priority: int
+    sequence: int
+    source_id: str
+    auth_id: str
+    enqueued_at: float
+
+
 class JobService:
     def __init__(
         self,
@@ -65,12 +85,52 @@ class JobService:
         providers: ProviderRegistry | CollectionProvider,
         *,
         start_worker: bool = True,
+        max_workers: int = 1,
+        max_queue: int = 100,
+        provider_factory: Callable[[], ProviderRegistry | CollectionProvider] | None = None,
+        lease_seconds: int = 30,
     ):
+        if isinstance(max_workers, bool) or not 1 <= max_workers <= 4:
+            raise ValueError("max_workers must be between 1 and 4.")
+        if isinstance(max_queue, bool) or not 1 <= max_queue <= 10_000:
+            raise ValueError("max_queue must be between 1 and 10,000.")
+        if max_workers > 1 and provider_factory is None:
+            raise ValueError("max_workers above 1 requires an isolated provider_factory.")
+        if isinstance(lease_seconds, bool) or not 1 <= lease_seconds <= 300:
+            raise ValueError("lease_seconds must be between 1 and 300.")
         self.storage = storage
         self.registry = (
             providers if isinstance(providers, ProviderRegistry) else ProviderRegistry([providers])
         )
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self.max_workers = max_workers
+        self.max_queue = max_queue
+        self.lease_seconds = lease_seconds
+        self._provider_factory = provider_factory
+        self._condition = threading.Condition()
+        # ponytail: serialize SQLite callbacks until Storage owns queue backpressure/leases.
+        self._storage_lock = threading.Lock()
+        self._pending: dict[int, dict[str, deque[_QueuedJob]]] = defaultdict(dict)
+        self._source_order: dict[int, deque[str]] = defaultdict(deque)
+        self._pending_jobs: dict[str, _QueuedJob] = {}
+        self._active_jobs: dict[str, _QueuedJob] = {}
+        self._active_sources: set[str] = set()
+        self._active_auth: set[str] = set()
+        self._sequence = 0
+        self._started_at = monotonic()
+        self._submitted = 0
+        self._deduplicated = 0
+        self._rejected = 0
+        self._started = 0
+        self._finished = 0
+        self._cancelled = 0
+        self._queue_waits: deque[float] = deque(maxlen=1_000)
+        self._completed_by_status: dict[str, int] = defaultdict(int)
+        self._cleanup_seconds = 0.0
+        self._cleanup_failures = 0
+        self._persistence_active = 0
+        self._persistence_waiting = 0
+        self._max_persistence_backlog = 0
+        self._threads: list[threading.Thread] = []
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self.worker_id = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
@@ -112,50 +172,327 @@ class JobService:
         self._lock_owned = False
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if any(thread.is_alive() for thread in self._threads):
             return
+        if self._shutdown:
+            raise RuntimeError("Job service is shutting down.")
         self._acquire_process_lock()
         try:
-            recovered = self.storage.recover_jobs()
-            self._thread = threading.Thread(
-                target=self._worker, name="xworkbench-worker", daemon=True
-            )
-            self._thread.start()
+            with self._storage_lock:
+                self.storage.recover_jobs()
+                queued = self.storage.list_queued_jobs()
+            with self._condition:
+                for job in queued:
+                    self._enqueue_locked(
+                        job["id"],
+                        job["priority"],
+                        job["source_id"],
+                        job["auth_state_id"],
+                        job["enqueue_sequence"],
+                    )
+            registries = [self._worker_registry() for _ in range(self.max_workers)]
+            if len({id(registry) for registry in registries}) != len(registries):
+                raise ValueError("provider_factory must return a new registry for each worker.")
+            self._threads = [
+                threading.Thread(
+                    target=self._worker,
+                    args=(registry,),
+                    name=f"xworkbench-worker-{index + 1}",
+                    daemon=True,
+                )
+                for index, registry in enumerate(registries)
+            ]
+            self._thread = self._threads[0]
+            for thread in self._threads:
+                thread.start()
         except Exception:
+            self._shutdown = True
+            self._stop_event.set()
+            with self._condition:
+                self._condition.notify_all()
+            for thread in self._threads:
+                thread.join(timeout=1)
             self._release_process_lock()
             raise
-        for job_id in recovered:
-            self.enqueue(job_id)
 
     def shutdown(self) -> None:
         if self._shutdown:
             return
+        started = monotonic()
         self._shutdown = True
         self._stop_event.set()
-        self._queue.put(None)
-        if self._thread:
-            self._thread.join(timeout=5)
-        if not self._thread or not self._thread.is_alive():
+        with self._condition:
+            self._condition.notify_all()
+        deadline = monotonic() + 5
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - monotonic()))
+        alive = sum(thread.is_alive() for thread in self._threads)
+        with self._condition:
+            self._cleanup_seconds = monotonic() - started
+            self._cleanup_failures = alive
+        if not alive:
             self._release_process_lock()
 
-    def submit(self, request: CollectionRequest, execution_plan: dict[str, Any]) -> str:
+    def _worker_registry(self) -> ProviderRegistry:
+        if self._provider_factory is None:
+            return self.registry
+        providers = self._provider_factory()
+        return (
+            providers if isinstance(providers, ProviderRegistry) else ProviderRegistry([providers])
+        )
+
+    @staticmethod
+    def _identifier(value: str | None, default: str, name: str) -> str:
+        value = default if value is None else value
+        if not isinstance(value, str) or not value or len(value) > 128 or not value.isprintable():
+            raise ValueError(f"{name} must contain 1 to 128 printable characters.")
+        return value
+
+    @staticmethod
+    def _default_deadline(execution_plan: dict[str, Any]) -> datetime:
+        raw = execution_plan.get("preparedAt", execution_plan.get("compiledAt"))
+        try:
+            prepared = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if prepared.utcoffset() is None:
+                raise ValueError
+        except ValueError:
+            prepared = datetime.now(UTC)
+        return prepared.astimezone(UTC) + timedelta(hours=1)
+
+    def submit(
+        self,
+        request: CollectionRequest,
+        execution_plan: dict[str, Any],
+        *,
+        priority: int = 0,
+        source_id: str | None = None,
+        auth_state_id: str | None = None,
+        idempotency_key: str | None = None,
+        batch_id: str | None = None,
+        approval: dict[str, Any] | None = None,
+        limits: dict[str, Any] | None = None,
+        deadline_at: str | datetime | None = None,
+    ) -> str:
         if self._shutdown:
             raise RuntimeError("Job service is shutting down.")
-        job_id = self.storage.create_job(request, execution_plan)
-        self.enqueue(job_id)
-        return job_id
+        if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 100:
+            raise ValueError("priority must be between 0 and 100.")
+        routing_source = source_id or source_fingerprint(request)
+        if source_id is not None:
+            source_id = self._identifier(source_id, "", "source_id")
+        auth_state_id = self._identifier(
+            auth_state_id,
+            f"provider:{request.provider.value}",
+            "auth_state_id",
+        )
+        if idempotency_key is not None:
+            idempotency_key = self._identifier(idempotency_key, "", "idempotency_key")
+        if batch_id is not None:
+            batch_id = self._identifier(batch_id, "", "batch_id")
+        with self._storage_lock:
+            admitted = self.storage.admit_job(
+                request,
+                execution_plan,
+                queue_capacity=self.max_queue,
+                priority=priority,
+                source_id=source_id,
+                auth_state_id=auth_state_id,
+                batch_id=batch_id,
+                idempotency_key=idempotency_key,
+                approval=approval or {},
+                limits=limits or {},
+                deadline_at=deadline_at or self._default_deadline(execution_plan),
+            )
+            job_id = admitted["job_id"]
+        with self._condition:
+            known_locally = bool(
+                job_id and (str(job_id) in self._pending_jobs or str(job_id) in self._active_jobs)
+            )
+        with self._storage_lock:
+            existing = (
+                self.storage.get_job(str(job_id))
+                if admitted["result"] == "existing" and job_id and not known_locally
+                else None
+            )
+        with self._condition:
+            if admitted["result"] == "queue_full" or not job_id:
+                self._rejected += 1
+                raise QueueFullError(ERROR_MESSAGES["queue_full"])
+            should_enqueue = admitted["result"] == "created" or bool(
+                existing and existing["status"] == JobStatus.QUEUED.value
+            )
+            if (
+                should_enqueue
+                and str(job_id) not in self._pending_jobs
+                and str(job_id) not in self._active_jobs
+            ):
+                should_enqueue = True
+            else:
+                should_enqueue = False
+            if should_enqueue:
+                self._enqueue_locked(str(job_id), priority, routing_source, auth_state_id)
+            if admitted["result"] == "existing":
+                self._deduplicated += 1
+            else:
+                self._submitted += 1
+            self._condition.notify_all()
+            return str(job_id)
 
-    def enqueue(self, job_id: str) -> None:
-        self._queue.put(job_id)
+    def _job_routing(self, job_id: str) -> tuple[str, str]:
+        try:
+            with self._storage_lock:
+                job = self.storage.get_job(job_id)
+            request = CollectionRequest.from_dict(job["request"]) if job else None
+        except (CollectionError, KeyError, TypeError):
+            request = None
+        return (
+            source_fingerprint(request) if request else job_id,
+            request.provider.value if request else "unknown",
+        )
+
+    def _enqueue_locked(
+        self,
+        job_id: str,
+        priority: int,
+        source_id: str,
+        auth_id: str,
+        enqueue_sequence: int | None = None,
+    ) -> bool:
+        if job_id in self._pending_jobs or job_id in self._active_jobs:
+            return False
+        if len(self._pending_jobs) >= self.max_queue:
+            self._rejected += 1
+            raise QueueFullError(ERROR_MESSAGES["queue_full"])
+        sequence = self._sequence if enqueue_sequence is None else enqueue_sequence
+        item = _QueuedJob(job_id, priority, sequence, source_id, auth_id, monotonic())
+        self._sequence = max(self._sequence, sequence + 1)
+        source_jobs = self._pending[priority].setdefault(source_id, deque())
+        if not source_jobs:
+            self._source_order[priority].append(source_id)
+        source_jobs.append(item)
+        self._pending_jobs[job_id] = item
+        return True
+
+    def enqueue(
+        self,
+        job_id: str,
+        *,
+        priority: int = 0,
+        enqueue_sequence: int | None = None,
+        source_id: str | None = None,
+        auth_id: str | None = None,
+    ) -> None:
+        with self._condition:
+            if job_id in self._pending_jobs or job_id in self._active_jobs:
+                return
+        if source_id is None or auth_id is None:
+            routed_source, routed_auth = self._job_routing(job_id)
+            source_id = source_id or routed_source
+            auth_id = auth_id or routed_auth
+        with self._condition:
+            if self._enqueue_locked(job_id, priority, source_id, auth_id, enqueue_sequence):
+                self._condition.notify_all()
 
     def cancel(self, job_id: str) -> bool:
-        return self.storage.request_cancel(job_id)
+        with self._storage_lock:
+            cancelled = self.storage.request_cancel(job_id)
+        if cancelled:
+            with self._condition:
+                if self._remove_pending_locked(job_id):
+                    self._finished += 1
+                    self._completed_by_status[JobStatus.CANCELLED.value] += 1
+                self._cancelled += 1
+                self._condition.notify_all()
+        return cancelled
 
     def resume(self, job_id: str) -> bool:
-        if not self.storage.resume_job(job_id):
+        with self._condition:
+            if len(self._pending_jobs) >= self.max_queue:
+                return False
+        with self._storage_lock:
+            resumed = self.storage.resume_job(job_id)
+        if not resumed:
             return False
-        self.enqueue(job_id)
+        source_id, auth_id = self._job_routing(job_id)
+        with self._condition:
+            self._enqueue_locked(job_id, 0, source_id, auth_id)
+            self._condition.notify_all()
         return True
+
+    def _remove_pending_locked(self, job_id: str) -> bool:
+        item = self._pending_jobs.pop(job_id, None)
+        if item is None:
+            return False
+        source_jobs = self._pending[item.priority][item.source_id]
+        source_jobs.remove(item)
+        if not source_jobs:
+            del self._pending[item.priority][item.source_id]
+            self._source_order[item.priority].remove(item.source_id)
+        if not self._pending[item.priority]:
+            del self._pending[item.priority]
+            del self._source_order[item.priority]
+        return True
+
+    def _next_job_locked(self) -> _QueuedJob | None:
+        for priority in sorted(self._pending, reverse=True):
+            sources = self._source_order[priority]
+            for _ in range(len(sources)):
+                source_id = sources.popleft()
+                source_jobs = self._pending[priority][source_id]
+                item = source_jobs[0]
+                if source_id in self._active_sources or item.auth_id in self._active_auth:
+                    sources.append(source_id)
+                    continue
+                source_jobs.popleft()
+                if source_jobs:
+                    sources.append(source_id)
+                else:
+                    del self._pending[priority][source_id]
+                if not self._pending[priority]:
+                    del self._pending[priority]
+                    del self._source_order[priority]
+                self._pending_jobs.pop(item.job_id)
+                self._active_jobs[item.job_id] = item
+                self._active_sources.add(item.source_id)
+                self._active_auth.add(item.auth_id)
+                self._started += 1
+                self._queue_waits.append(monotonic() - item.enqueued_at)
+                return item
+        return None
+
+    @staticmethod
+    def _percentile(samples: deque[float], percentile: float) -> float | None:
+        if not samples:
+            return None
+        ordered = sorted(samples)
+        return ordered[round((len(ordered) - 1) * percentile)] * 1_000
+
+    def metrics(self) -> dict[str, Any]:
+        with self._condition:
+            uptime = max(monotonic() - self._started_at, 0.000_001)
+            return {
+                "queueDepth": len(self._pending_jobs),
+                "queueCapacity": self.max_queue,
+                "activeWorkers": len(self._active_jobs),
+                "maxWorkers": self.max_workers,
+                "activeSources": len(self._active_sources),
+                "activeAuthStates": len(self._active_auth),
+                "submitted": self._submitted,
+                "deduplicated": self._deduplicated,
+                "rejected": self._rejected,
+                "started": self._started,
+                "finished": self._finished,
+                "cancelRequests": self._cancelled,
+                "completedByStatus": dict(self._completed_by_status),
+                "queueWaitP50Ms": self._percentile(self._queue_waits, 0.50),
+                "queueWaitP95Ms": self._percentile(self._queue_waits, 0.95),
+                "throughputJobsPerSecond": self._finished / uptime,
+                "cleanupSeconds": self._cleanup_seconds,
+                "cleanupFailures": self._cleanup_failures,
+                "persistenceActive": self._persistence_active,
+                "persistenceWaiting": self._persistence_waiting,
+                "maxPersistenceBacklog": self._max_persistence_backlog,
+            }
 
     @staticmethod
     def _log_exception(job_id: str, stage: str, exc: Exception) -> None:
@@ -179,49 +516,63 @@ class JobService:
         code: str,
         *,
         retryable: bool,
+        lease_owner: str | None = None,
     ) -> None:
         for _ in range(2):
             try:
-                self.storage.fail_job(
-                    job_id,
-                    status,
-                    code,
-                    ERROR_MESSAGES[code],
-                    retryable,
-                )
+                with self._storage_lock:
+                    self.storage.fail_job(
+                        job_id,
+                        status,
+                        code,
+                        ERROR_MESSAGES[code],
+                        retryable,
+                        worker_id=lease_owner,
+                    )
                 return
             except Exception as exc:
                 self._log_exception(job_id, "terminal transition", exc)
 
     def _failure_status(self, job_id: str) -> JobStatus:
         try:
-            current = self.storage.get_job(job_id)
+            with self._storage_lock:
+                current = self.storage.get_job(job_id)
         except Exception as exc:
             self._log_exception(job_id, "partial-result check", exc)
             return JobStatus.FAILED
-        return (
-            JobStatus.PARTIAL
-            if current and current["collected_count"] > 0
-            else JobStatus.FAILED
-        )
+        return JobStatus.PARTIAL if current and current["collected_count"] > 0 else JobStatus.FAILED
 
-    def _handle_collection_error(self, job_id: str, exc: CollectionError) -> None:
+    def _handle_collection_error(
+        self,
+        job_id: str,
+        exc: CollectionError,
+        *,
+        lease_owner: str | None = None,
+    ) -> None:
         if isinstance(exc, CollectionCancelled):
             status = JobStatus.INTERRUPTED if self._stop_event.is_set() else JobStatus.CANCELLED
-            self._fail_job(job_id, status, status.value, retryable=True)
+            self._fail_job(job_id, status, status.value, retryable=True, lease_owner=lease_owner)
             return
         if self._stop_event.is_set():
-            self._fail_job(job_id, JobStatus.INTERRUPTED, "interrupted", retryable=True)
+            self._fail_job(
+                job_id,
+                JobStatus.INTERRUPTED,
+                "interrupted",
+                retryable=True,
+                lease_owner=lease_owner,
+            )
             return
         if isinstance(exc, RateLimitWaiting):
             try:
-                self.storage.wait_job(
-                    job_id,
-                    exc.retry_at,
-                    exc.remaining,
-                    exc.reset,
-                    ERROR_MESSAGES["rate_limited"],
-                )
+                with self._storage_lock:
+                    self.storage.wait_job(
+                        job_id,
+                        exc.retry_at,
+                        exc.remaining,
+                        exc.reset,
+                        ERROR_MESSAGES["rate_limited"],
+                        worker_id=lease_owner,
+                    )
             except Exception as storage_exc:
                 self._log_exception(job_id, "rate-limit transition", storage_exc)
                 self._fail_job(
@@ -229,6 +580,7 @@ class JobService:
                     self._failure_status(job_id),
                     "storage_callback_failure",
                     retryable=True,
+                    lease_owner=lease_owner,
                 )
             return
         code = exc.code if exc.code in ERROR_MESSAGES else "provider_error"
@@ -237,11 +589,30 @@ class JobService:
             self._failure_status(job_id),
             code,
             retryable=bool(exc.retryable and code not in NO_RETRY_CODES),
+            lease_owner=lease_owner,
         )
 
-    def run_once(self, job_id: str) -> None:
+    def _lease_expiry(self) -> datetime:
+        return datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
+
+    def run_once(
+        self,
+        job_id: str,
+        registry: ProviderRegistry | None = None,
+        *,
+        lease_owner: str | None = None,
+    ) -> None:
         try:
-            job = self.storage.claim_job(job_id)
+            with self._storage_lock:
+                job = (
+                    self.storage.lease_job(
+                        job_id,
+                        worker_id=lease_owner,
+                        lease_expires_at=self._lease_expiry(),
+                    )
+                    if lease_owner
+                    else self.storage.claim_job(job_id)
+                )
         except Exception as exc:
             self._log_exception(job_id, "job claim", exc)
             self._fail_job(
@@ -259,21 +630,55 @@ class JobService:
                 JobStatus.FAILED,
                 "invalid_persisted_job",
                 retryable=False,
+                lease_owner=lease_owner,
             )
             return
 
         def on_batch(posts, provider_state, metadata):
+            activated = False
+            with self._condition:
+                self._persistence_waiting += 1
+                self._max_persistence_backlog = max(
+                    self._max_persistence_backlog,
+                    self._persistence_active + self._persistence_waiting,
+                )
             try:
-                return self.storage.add_posts(job_id, posts, provider_state, metadata)
+                with self._storage_lock:
+                    with self._condition:
+                        self._persistence_waiting -= 1
+                        self._persistence_active += 1
+                        activated = True
+                    try:
+                        return self.storage.add_posts(job_id, posts, provider_state, metadata)
+                    finally:
+                        with self._condition:
+                            self._persistence_active -= 1
             except Exception as exc:
+                with self._condition:
+                    if not activated:
+                        self._persistence_waiting -= 1
                 self._log_exception(job_id, "batch persistence", exc)
                 raise StorageCallbackError(ERROR_MESSAGES["storage_callback_failure"]) from exc
 
+        next_heartbeat = monotonic() + self.lease_seconds / 3
+
         def should_cancel() -> bool:
+            nonlocal next_heartbeat
             if self._stop_event.is_set():
                 return True
             try:
-                return self.storage.cancel_requested(job_id)
+                with self._storage_lock:
+                    if lease_owner and monotonic() >= next_heartbeat:
+                        if not self.storage.heartbeat_job(
+                            job_id,
+                            worker_id=lease_owner,
+                            lease_expires_at=self._lease_expiry(),
+                        ):
+                            if self.storage.cancel_requested(job_id):
+                                return True
+                            raise StorageCallbackError(ERROR_MESSAGES["storage_callback_failure"])
+                        next_heartbeat = monotonic() + self.lease_seconds / 3
+                    return self.storage.cancel_requested(job_id)
             except Exception as exc:
                 self._log_exception(job_id, "cancellation check", exc)
                 raise StorageCallbackError(ERROR_MESSAGES["storage_callback_failure"]) from exc
@@ -282,16 +687,18 @@ class JobService:
             request = CollectionRequest.from_dict(job["request"])
             if job["collected_count"] >= request.max_posts:
                 try:
-                    self.storage.finish_job(
-                        job_id, job["warnings"], completion_reason="target_reached"
-                    )
+                    with self._storage_lock:
+                        self.storage.finish_job(
+                            job_id,
+                            job["warnings"],
+                            completion_reason="target_reached",
+                            worker_id=lease_owner,
+                        )
                 except Exception as exc:
                     self._log_exception(job_id, "job completion", exc)
-                    raise StorageCallbackError(
-                        ERROR_MESSAGES["storage_callback_failure"]
-                    ) from exc
+                    raise StorageCallbackError(ERROR_MESSAGES["storage_callback_failure"]) from exc
                 return
-            provider = self.registry.get(request.provider)
+            provider = (registry or self.registry).get(request.provider)
             summary = provider.collect(
                 request,
                 execution_plan=job["execution_plan"],
@@ -300,12 +707,11 @@ class JobService:
                 should_cancel=should_cancel,
             )
             try:
-                current = self.storage.get_job(job_id)
+                with self._storage_lock:
+                    current = self.storage.get_job(job_id)
             except Exception as exc:
                 self._log_exception(job_id, "result persistence check", exc)
-                raise StorageCallbackError(
-                    ERROR_MESSAGES["storage_callback_failure"]
-                ) from exc
+                raise StorageCallbackError(ERROR_MESSAGES["storage_callback_failure"]) from exc
             if current and current["collected_count"] >= request.max_posts:
                 summary.completion_reason = "target_reached"
                 summary.partial = False
@@ -317,50 +723,63 @@ class JobService:
                 )
             persisted_warnings = current["warnings"] if current else job["warnings"]
             try:
-                self.storage.finish_job(
-                    job_id,
-                    list(dict.fromkeys([*persisted_warnings, *summary.warnings])),
-                    completion_reason=summary.completion_reason,
-                    partial=summary.partial,
-                )
+                with self._storage_lock:
+                    self.storage.finish_job(
+                        job_id,
+                        list(dict.fromkeys([*persisted_warnings, *summary.warnings])),
+                        completion_reason=summary.completion_reason,
+                        partial=summary.partial,
+                        worker_id=lease_owner,
+                    )
             except Exception as exc:
                 self._log_exception(job_id, "job completion", exc)
                 raise StorageCallbackError(ERROR_MESSAGES["storage_callback_failure"]) from exc
         except CollectionError as exc:
-            self._handle_collection_error(job_id, exc)
+            self._handle_collection_error(job_id, exc, lease_owner=lease_owner)
         except Exception as exc:
             self._log_exception(job_id, "collection", exc)
             status = (
-                JobStatus.INTERRUPTED
-                if self._stop_event.is_set()
-                else self._failure_status(job_id)
+                JobStatus.INTERRUPTED if self._stop_event.is_set() else self._failure_status(job_id)
             )
             code = "interrupted" if status is JobStatus.INTERRUPTED else "unexpected_error"
-            self._fail_job(job_id, status, code, retryable=True)
+            self._fail_job(job_id, status, code, retryable=True, lease_owner=lease_owner)
 
-    def _worker(self) -> None:
-        try:
-            while True:
-                try:
-                    job_id = self._queue.get(timeout=1)
-                except queue.Empty:
-                    if self._stop_event.is_set():
-                        return
-                    continue
-                if job_id is None or self._stop_event.is_set():
-                    self._queue.task_done()
+    def _worker(self, registry: ProviderRegistry | None = None) -> None:
+        registry = registry or self.registry
+        lease_owner = f"{self.worker_id}:{threading.get_ident()}"
+        while True:
+            with self._condition:
+                item = None
+                while not self._stop_event.is_set():
+                    item = self._next_job_locked()
+                    if item is not None:
+                        break
+                    self._condition.wait()
+                if item is None:
                     return
+            try:
+                self.run_once(item.job_id, registry, lease_owner=lease_owner)
+            except Exception as exc:
+                self._log_exception(item.job_id, "worker dispatch", exc)
+                self._fail_job(
+                    item.job_id,
+                    JobStatus.FAILED,
+                    "unexpected_error",
+                    retryable=True,
+                    lease_owner=lease_owner,
+                )
+            finally:
                 try:
-                    self.run_once(job_id)
+                    with self._storage_lock:
+                        job = self.storage.get_job(item.job_id)
+                    status = job["status"] if job else "missing"
                 except Exception as exc:
-                    self._log_exception(job_id, "worker dispatch", exc)
-                    self._fail_job(
-                        job_id,
-                        JobStatus.FAILED,
-                        "unexpected_error",
-                        retryable=True,
-                    )
-                finally:
-                    self._queue.task_done()
-        finally:
-            self._release_process_lock()
+                    self._log_exception(item.job_id, "worker metrics", exc)
+                    status = "unknown"
+                with self._condition:
+                    self._active_jobs.pop(item.job_id, None)
+                    self._active_sources.discard(item.source_id)
+                    self._active_auth.discard(item.auth_id)
+                    self._finished += 1
+                    self._completed_by_status[status] += 1
+                    self._condition.notify_all()
