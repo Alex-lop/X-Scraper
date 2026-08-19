@@ -103,7 +103,8 @@ jobs:
           lab_home="$RUNNER_TEMP/capability-lab-home"
           mkdir -p "$lab_home"
           sudo env \
-            LAB_USER="$(id -un)" \
+            LAB_UID="$(id -u)" \
+            LAB_GID="$(id -g)" \
             LAB_HOME="$lab_home" \
             LAB_PATH="$PATH" \
             LAB_PYTHON="$(command -v python)" \
@@ -111,7 +112,12 @@ jobs:
             unshare --net --fork bash -ceu '
               ip link set lo up
               test -z "$(ip route show default)"
-              exec runuser -u "$LAB_USER" -- env \
+              exec setpriv \
+                --reuid "$LAB_UID" \
+                --regid "$LAB_GID" \
+                --clear-groups \
+                --no-new-privs \
+                env \
                 HOME="$LAB_HOME" \
                 PATH="$LAB_PATH" \
                 PLAYWRIGHT_BROWSERS_PATH="$LAB_BROWSERS" \
