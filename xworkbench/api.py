@@ -4,6 +4,8 @@ import csv
 import io
 import ipaddress
 import json
+import math
+import unicodedata
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -12,7 +14,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from .config import Settings
 from .errors import CredentialError, InvalidRequestError
-from .jobs import JobService
+from .jobs import ERROR_MESSAGES, JobService
 from .models import CollectionRequest, ProviderType
 from .playwright_browser import PlaywrightBrowserProvider
 from .providers import ProviderRegistry
@@ -22,6 +24,9 @@ from .x_api import UNIT_PRICES_USD, XApiProvider
 OFFICIAL_PROVIDER = ProviderType.OFFICIAL_X_API.value
 BROWSER_PROVIDER = ProviderType.PLAYWRIGHT_BROWSER.value
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "interrupted", "partial"}
+JOB_STATUSES = {*TERMINAL_STATUSES, "queued", "running", "waiting"}
+PUBLIC_STRING_LIMIT = 32_768
+PUBLIC_MEDIA_LIMIT = 25
 
 COMMON_PROVENANCE_FIELDS = (
     "provider",
@@ -53,6 +58,93 @@ BROWSER_DETAIL_FIELDS = (
     "scrollIterations",
     "observedAt",
 )
+
+REQUEST_FIELDS = (
+    "provider",
+    "sourceType",
+    "sourceValue",
+    "searchMode",
+    "maxPosts",
+    "startDate",
+    "endDate",
+    "includeReplies",
+    "mediaOnly",
+)
+POST_FIELDS = (
+    "post_id",
+    "text",
+    "author_id",
+    "author_username",
+    "url",
+    "created_at",
+    "observed_at",
+    "language",
+    "conversation_id",
+    "in_reply_to_post_id",
+    "like_count",
+    "reply_count",
+    "repost_count",
+    "quote_count",
+    "bookmark_count",
+    "view_count",
+    "is_reply",
+    "is_repost",
+    "is_quote",
+    "has_media",
+    "source_position",
+    "snapshot_position",
+    "capture_segment",
+    "scan_ordinal",
+    "dom_position",
+    "media",
+)
+POST_STRING_FIELDS = (
+    "post_id",
+    "text",
+    "author_id",
+    "author_username",
+    "url",
+    "created_at",
+    "observed_at",
+    "language",
+    "conversation_id",
+    "in_reply_to_post_id",
+)
+POST_INTEGER_FIELDS = (
+    "like_count",
+    "reply_count",
+    "repost_count",
+    "quote_count",
+    "bookmark_count",
+    "view_count",
+    "source_position",
+    "snapshot_position",
+    "capture_segment",
+    "scan_ordinal",
+    "dom_position",
+)
+POST_BOOLEAN_FIELDS = ("is_reply", "is_repost", "is_quote", "has_media")
+MEDIA_STRING_FIELDS = (
+    "id",
+    "mediaKey",
+    "type",
+    "url",
+    "previewImageUrl",
+    "altText",
+)
+MEDIA_INTEGER_FIELDS = ("width", "height", "durationMs")
+COMPLETION_REASONS = {
+    *ERROR_MESSAGES,
+    "cursor_stalled",
+    "full_archive_exhausted",
+    "no_progress",
+    "offline_demo_seeded",
+    "post_resource_limit_reached",
+    "recent_search_exhausted",
+    "target_not_reached",
+    "target_reached",
+    "timeline_exhausted",
+}
 
 EXPORT_FIELDS = [
     "schema_version",
@@ -91,6 +183,7 @@ EXPORT_FIELDS = [
     "repost_count",
     "quote_count",
     "bookmark_count",
+    "view_count",
     "is_reply",
     "is_repost",
     "is_quote",
@@ -101,8 +194,15 @@ EXPORT_FIELDS = [
 
 
 def _provider_value(value: Any) -> str:
-    raw = str(value or OFFICIAL_PROVIDER)
-    return OFFICIAL_PROVIDER if raw == "x_api_search" else raw
+    if value is None:
+        raw = OFFICIAL_PROVIDER
+    elif not isinstance(value, str):
+        return "unknown"
+    else:
+        raw = value
+    if raw == "x_api_search":
+        return OFFICIAL_PROVIDER
+    return raw if raw in {OFFICIAL_PROVIDER, BROWSER_PROVIDER} else "unknown"
 
 
 def _execution_plan(job: dict[str, Any]) -> dict[str, Any]:
@@ -110,8 +210,182 @@ def _execution_plan(job: dict[str, Any]) -> dict[str, Any]:
     return plan if isinstance(plan, dict) else {}
 
 
-def _allowlist(source: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
-    return {name: source[name] for name in names if source.get(name) is not None}
+def _public_scalar(value: Any) -> str | int | float | bool | None:
+    if isinstance(value, str):
+        return value[:PUBLIC_STRING_LIMIT]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _nonnegative_int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _allowlist(source: Any, names: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    result = {}
+    for name in names:
+        value = _public_scalar(source.get(name))
+        if value is not None:
+            result[name] = value
+    return result
+
+
+def _public_request(value: Any) -> dict[str, Any]:
+    try:
+        return CollectionRequest.from_dict(_allowlist(value, REQUEST_FIELDS)).to_dict()
+    except InvalidRequestError:
+        return {}
+
+
+def _public_post(value: Any) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    post = {
+        **{
+            key: item[:PUBLIC_STRING_LIMIT] if isinstance((item := value.get(key)), str) else None
+            for key in POST_STRING_FIELDS
+        },
+        **{
+            key: item
+            if isinstance((item := value.get(key)), int)
+            and not isinstance(item, bool)
+            and item >= 0
+            else None
+            for key in POST_INTEGER_FIELDS
+        },
+        **{
+            key: item if isinstance((item := value.get(key)), bool) else None
+            for key in POST_BOOLEAN_FIELDS
+        },
+    }
+    media = value.get("media")
+    if isinstance(media, list):
+        public_media = []
+        for item in media[:PUBLIC_MEDIA_LIMIT]:
+            if not isinstance(item, dict):
+                continue
+            public_item = {
+                key: field[:PUBLIC_STRING_LIMIT]
+                for key in MEDIA_STRING_FIELDS
+                if isinstance((field := item.get(key)), str)
+            }
+            public_item.update(
+                {
+                    key: field
+                    for key in MEDIA_INTEGER_FIELDS
+                    if isinstance((field := item.get(key)), int)
+                    and not isinstance(field, bool)
+                    and field >= 0
+                }
+            )
+            if public_item:
+                public_media.append(public_item)
+        post["media"] = public_media
+    else:
+        post["media"] = None
+    return post
+
+
+def _spreadsheet_safe(value: str) -> str:
+    for character in value:
+        if character.isspace() or unicodedata.category(character)[0] in {"C", "Z"}:
+            continue
+        return f"'{value}" if character in "=+-@" else value
+    return value
+
+
+def _local_authority(value: Any) -> tuple[str, int | None] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = urlsplit(f"//{value}")
+        port = parsed.port
+    except ValueError:
+        return None
+    hostname = parsed.hostname
+    if (
+        not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if hostname.casefold() == "localhost":
+        return "localhost", port
+    if "%" in hostname:
+        return None
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return None
+    return (str(address), port) if address.is_loopback else None
+
+
+def _same_origin(origin: Any, host: tuple[str, int | None], scheme: str) -> bool:
+    if not isinstance(origin, str) or scheme not in {"http", "https"}:
+        return False
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.casefold() != scheme
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    authority = _local_authority(parsed.netloc)
+    if authority is None or authority[0] != host[0]:
+        return False
+    default_port = 80 if scheme == "http" else 443
+    return (authority[1] or default_port) == (host[1] or default_port)
+
+
+def _public_error(job: dict[str, Any]) -> dict[str, Any] | None:
+    raw_code = job.get("error_code")
+    if not raw_code:
+        return None
+    code = (
+        raw_code
+        if isinstance(raw_code, str) and raw_code in ERROR_MESSAGES
+        else "provider_error"
+    )
+    return {
+        "code": code,
+        "message": ERROR_MESSAGES[code],
+        "retryable": bool(job.get("error_retryable")),
+    }
+
+
+def _public_prices(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return UNIT_PRICES_USD
+    prices = {}
+    for name, fallback in UNIT_PRICES_USD.items():
+        price = value.get(name)
+        valid = (
+            isinstance(price, int | float)
+            and not isinstance(price, bool)
+            and 0 <= price <= 1_000_000
+            and (not isinstance(price, float) or math.isfinite(price))
+        )
+        prices[name] = (
+            float(price)
+            if valid
+            else fallback
+        )
+    return prices
 
 
 def _returned_list_price(resources: dict[str, int], prices: dict[str, float]) -> float:
@@ -127,68 +401,95 @@ def _public_job(job: dict[str, Any]) -> dict[str, Any]:
     plan = _execution_plan(job)
     provider = _provider_value(job.get("provider") or plan.get("provider"))
     provider_version = plan.get("providerVersion")
-    request_body = job.get("request") or {}
+    if not isinstance(provider_version, int) or isinstance(provider_version, bool):
+        provider_version = None
+    request_body = _public_request(job.get("request"))
     provenance = _allowlist(plan, COMMON_PROVENANCE_FIELDS)
     provenance["provider"] = provider
     if provider_version is not None:
         provenance["providerVersion"] = provider_version
     if provider == OFFICIAL_PROVIDER:
         provenance.update(_allowlist(plan, OFFICIAL_PROVENANCE_FIELDS))
+    raw_warnings = job.get("warnings")
+    warnings = raw_warnings if isinstance(raw_warnings, list) else []
+    raw_completion_reason = job.get("completion_reason")
+    completion_reason = (
+        raw_completion_reason
+        if isinstance(raw_completion_reason, str)
+        and raw_completion_reason in COMPLETION_REASONS
+        else None
+    )
+    raw_status = job.get("status")
+    status = (
+        raw_status
+        if isinstance(raw_status, str) and raw_status in JOB_STATUSES
+        else "failed"
+    )
+    collected_count = job.get("collected_count")
+    if (
+        not isinstance(collected_count, int)
+        or isinstance(collected_count, bool)
+        or collected_count < 0
+    ):
+        collected_count = 0
 
     public = {
-        "id": job["id"],
+        "id": _public_scalar(job.get("id")),
         "provider": provider,
         "providerVersion": provider_version,
         "request": request_body,
-        "status": job["status"],
-        "targetCount": request_body.get("maxPosts", plan.get("targetPosts", 0)),
-        "collectedCount": job.get("collected_count", 0),
-        "warnings": job.get("warnings") or [],
-        "error": (
-            {
-                "code": job["error_code"],
-                "message": job.get("error_message"),
-                "retryable": bool(job.get("error_retryable")),
-            }
-            if job.get("error_code")
-            else None
-        ),
-        "cancelRequested": bool(job.get("cancel_requested")),
-        "completionReason": job.get("completion_reason"),
-        "retryAt": job.get("retry_at"),
-        "provenance": provenance,
-        "isPartial": job["status"] == "partial"
+        "status": status,
+        "targetCount": request_body.get("maxPosts")
         or (
-            job.get("collected_count", 0) > 0
-            and job["status"] in {"failed", "cancelled", "interrupted"}
+            plan.get("targetPosts")
+            if isinstance(plan.get("targetPosts"), int)
+            and not isinstance(plan.get("targetPosts"), bool)
+            else 0
         ),
-        "createdAt": job.get("created_at"),
-        "startedAt": job.get("started_at"),
-        "finishedAt": job.get("finished_at"),
-        "updatedAt": job.get("updated_at"),
-        "capturedAt": job.get("finished_at") or job.get("updated_at"),
+        "collectedCount": collected_count,
+        "warnings": [
+            warning[:500]
+            for warning in warnings[:25]
+            if isinstance(warning, str)
+        ],
+        "error": _public_error(job),
+        "cancelRequested": bool(job.get("cancel_requested")),
+        "completionReason": completion_reason,
+        "retryAt": _public_scalar(job.get("retry_at")),
+        "provenance": provenance,
+        "isPartial": status == "partial"
+        or (
+            collected_count > 0 and status in {"failed", "cancelled", "interrupted"}
+        ),
+        "createdAt": _public_scalar(job.get("created_at")),
+        "startedAt": _public_scalar(job.get("started_at")),
+        "finishedAt": _public_scalar(job.get("finished_at")),
+        "updatedAt": _public_scalar(job.get("updated_at")),
+        "capturedAt": _public_scalar(job.get("finished_at") or job.get("updated_at")),
     }
 
     if provider == OFFICIAL_PROVIDER:
         resources = {
-            "posts": job.get("post_resource_count", 0),
-            "users": job.get("user_resource_count", 0),
-            "media": job.get("media_resource_count", 0),
+            "posts": _nonnegative_int(job.get("post_resource_count")),
+            "users": _nonnegative_int(job.get("user_resource_count")),
+            "media": _nonnegative_int(job.get("media_resource_count")),
         }
-        prices = plan.get("unitPricesUsd") or UNIT_PRICES_USD
+        prices = _public_prices(plan.get("unitPricesUsd"))
         public.update(
             resourcesReturned=resources,
             rateLimit={
-                "remaining": job.get("rate_limit_remaining"),
-                "reset": job.get("rate_limit_reset"),
+                "remaining": _public_scalar(job.get("rate_limit_remaining")),
+                "reset": _public_scalar(job.get("rate_limit_reset")),
             },
             cost={
                 "basis": "list_price_pre_dedup",
                 "unitPricesUsd": prices,
                 "returnedListPriceEstimateUsd": _returned_list_price(resources, prices),
-                "maximumPostResources": plan.get("maximumPostResources"),
-                "maximumPostListPriceUsd": plan.get("maximumPostListPriceUsd"),
-                "pricingAsOf": plan.get("pricingAsOf"),
+                "maximumPostResources": _public_scalar(plan.get("maximumPostResources")),
+                "maximumPostListPriceUsd": _public_scalar(
+                    plan.get("maximumPostListPriceUsd")
+                ),
+                "pricingAsOf": _public_scalar(plan.get("pricingAsOf")),
                 "note": (
                     "List-price estimate before X daily resource deduplication; "
                     "it is not an invoice total."
@@ -270,28 +571,32 @@ def create_app(
 
     @app.before_request
     def require_local_host_and_json_mutations():
-        hostname = urlsplit(f"//{request.host}").hostname
-        allowed = hostname == "localhost"
-        if hostname and not allowed:
-            try:
-                allowed = ipaddress.ip_address(hostname).is_loopback
-            except ValueError:
-                allowed = False
-        if not allowed:
+        host = _local_authority(request.host)
+        if host is None or request.scheme not in {"http", "https"}:
             return _error("local_only", "Only loopback hosts are accepted.", 403)
         remote = request.remote_addr
-        if remote:
-            try:
-                if not ipaddress.ip_address(remote).is_loopback:
-                    return _error("local_only", "Only loopback clients are accepted.", 403)
-            except ValueError:
-                return _error("local_only", "Only loopback clients are accepted.", 403)
+        try:
+            local_remote = bool(
+                remote and "%" not in remote and ipaddress.ip_address(remote).is_loopback
+            )
+        except ValueError:
+            local_remote = False
+        if not local_remote:
+            return _error("local_only", "Only loopback clients are accepted.", 403)
         if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not request.is_json:
             return _error(
                 "json_required",
                 "State-changing requests require Content-Type: application/json.",
                 415,
             )
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            origin = request.headers.get("Origin")
+            if origin and not _same_origin(origin, host, request.scheme):
+                return _error(
+                    "local_origin_required",
+                    "State-changing requests require the same loopback origin.",
+                    403,
+                )
 
     @app.after_request
     def secure_local_response(response: Response):
@@ -474,7 +779,10 @@ def create_app(
             offset = max(int(request.args.get("offset", "0")), 0)
         except ValueError:
             return _error("invalid_request", "Pagination must use integers.", 400)
-        posts = storage.get_job_posts(job_id, limit=limit, offset=offset)
+        posts = [
+            _public_post(post)
+            for post in storage.get_job_posts(job_id, limit=limit, offset=offset)
+        ]
         total = storage.count_job_posts(job_id)
         next_offset = offset + len(posts) if offset + len(posts) < total else None
         return jsonify(
@@ -519,15 +827,15 @@ def create_app(
         job = storage.get_job(job_id)
         if not job:
             return _error("not_found", "Job not found.", 404)
-        rows = storage.get_job_posts(job_id, limit=500)
+        rows = [_public_post(post) for post in storage.get_job_posts(job_id, limit=500)]
         export_format = request.args.get("format", "json").lower()
         public_job = _public_job(job)
         filename = f"x-snapshot-{job_id[:8]}-{job['status']}"
         headers = {
-            "X-Collection-Status": job["status"],
-            "X-Completion-Reason": job.get("completion_reason") or "",
+            "X-Collection-Status": public_job["status"],
+            "X-Completion-Reason": public_job.get("completionReason") or "",
             "X-Result-Count": str(len(rows)),
-            "X-Snapshot-At": job["updated_at"],
+            "X-Snapshot-At": str(public_job.get("updatedAt") or ""),
             "X-Provider": public_job["provider"],
             "X-Source-Kind": str(public_job["provenance"].get("sourceKind") or ""),
         }
@@ -555,9 +863,9 @@ def create_app(
                 row = {
                     "schema_version": 4,
                     "collection_id": job_id,
-                    "collection_status": job["status"],
-                    "completion_reason": job.get("completion_reason"),
-                    "warnings": json.dumps(job.get("warnings") or [], ensure_ascii=False),
+                    "collection_status": public_job["status"],
+                    "completion_reason": public_job.get("completionReason"),
+                    "warnings": json.dumps(public_job["warnings"], ensure_ascii=False),
                     "provider": public_job["provider"],
                     "provider_version": public_job.get("providerVersion"),
                     "source_kind": provenance.get("sourceKind"),
@@ -579,8 +887,8 @@ def create_app(
                 if row.get("media") is not None:
                     row["media"] = json.dumps(row["media"], ensure_ascii=False)
                 for field, value in row.items():
-                    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
-                        row[field] = f"'{value}"
+                    if isinstance(value, str):
+                        row[field] = _spreadsheet_safe(value)
                 writer.writerow(row)
             return Response(
                 stream.getvalue(),
