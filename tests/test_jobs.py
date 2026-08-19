@@ -1,4 +1,5 @@
 import queue
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -6,6 +7,11 @@ import pytest
 from xworkbench.errors import InvalidRequestError, RateLimitWaiting, SchemaDriftError
 from xworkbench.jobs import JobService
 from xworkbench.models import CollectionRequest, CollectionSummary, Post, ProviderType
+from xworkbench.playwright_browser import (
+    BrowserManualActionRequired,
+    BrowserRateLimitedError,
+    BrowserSessionExpiredError,
+)
 from xworkbench.providers import ProviderRegistry
 from xworkbench.storage import Storage
 from xworkbench.x_api import compile_request
@@ -78,16 +84,15 @@ def test_completion_persists_status_warnings_resources_and_page(tmp_path, mode, 
     assert storage.get_job_posts(job_id)[0]["text"] == "  persisted page\n"
 
 
-def test_rate_limit_wait_is_persisted_and_due_job_requeues_with_page_intact(tmp_path):
+def test_rate_limit_is_terminal_and_preserves_page_without_automatic_retry(tmp_path):
     storage, job_id = run(tmp_path, "wait")
     job = storage.get_job(job_id)
 
-    assert job["status"] == "waiting"
-    assert job["error_code"] == "rate_limited" and job["retry_at"]
+    assert job["status"] == "partial"
+    assert job["error_code"] == "rate_limited"
+    assert job["error_retryable"] is False
     assert job["rate_limit_remaining"] == 0 and job["rate_limit_reset"] == 123
     assert job["collected_count"] == 1 and storage.count_job_posts(job_id) == 1
-    assert storage.requeue_due_jobs() == [job_id]
-    assert storage.get_job(job_id)["status"] == "queued"
 
 
 def test_provider_failure_preserves_completed_page(tmp_path):
@@ -98,6 +103,29 @@ def test_provider_failure_preserves_completed_page(tmp_path):
     assert job["collected_count"] == job["post_resource_count"] == 1
     assert job["warnings"] == ["page warning"]
     assert storage.get_job_posts(job_id)[0]["post_id"] == "1"
+
+
+def test_storage_callback_failure_is_not_misclassified_or_leaked(tmp_path, monkeypatch, caplog):
+    sentinel = "storage-token-SENTINEL"
+    storage = Storage(tmp_path / "storage-callback.db")
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
+    )
+    job_id = storage.create_job(request, compile_request(request))
+    monkeypatch.setattr(
+        storage,
+        "add_posts",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(sentinel)),
+    )
+
+    JobService(storage, Provider("ok"), start_worker=False).run_once(job_id)
+
+    job = storage.get_job(job_id)
+    assert job["status"] == "failed"
+    assert job["error_code"] == "storage_callback_failure"
+    assert job["error_message"] == "The collection could not be saved."
+    assert sentinel not in caplog.text
 
 
 def test_false_target_reached_is_corrected_after_deduplication(tmp_path):
@@ -177,3 +205,117 @@ def test_worker_does_not_poll_storage_after_shutdown_begins(tmp_path, monkeypatc
     )
 
     service._worker()
+
+
+def test_corrupt_job_is_terminal_and_worker_runs_next_job(tmp_path):
+    storage = Storage(tmp_path / "corrupt-worker.db")
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
+    )
+    plan = compile_request(request)
+    corrupt_id = storage.create_job(request, plan)
+    valid_id = storage.create_job(request, plan)
+    with storage.connect() as connection:
+        connection.execute("UPDATE jobs SET request_json = '{' WHERE id = ?", (corrupt_id,))
+
+    service = JobService(storage, Provider("ok"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        with storage.connect() as connection:
+            statuses = dict(
+                connection.execute(
+                    "SELECT id, status FROM jobs WHERE id IN (?, ?)",
+                    (corrupt_id, valid_id),
+                )
+            )
+        if statuses == {corrupt_id: "failed", valid_id: "succeeded"}:
+            break
+        time.sleep(0.01)
+
+    worker_alive = bool(service._thread and service._thread.is_alive())
+    service.shutdown()
+    assert statuses == {corrupt_id: "failed", valid_id: "succeeded"}
+    assert worker_alive and not service._lock_path.exists()
+    with storage.connect() as connection:
+        corrupt_error = connection.execute(
+            "SELECT error_code, error_message FROM jobs WHERE id = ?", (corrupt_id,)
+        ).fetchone()
+    assert tuple(corrupt_error) == (
+        "invalid_persisted_job",
+        "The saved job is invalid and cannot be run.",
+    )
+
+
+def test_unexpected_exception_contents_never_reach_logs_or_job(tmp_path, caplog):
+    sentinel = "Bearer TOP-SECRET-SENTINEL"
+
+    class UnexpectedProvider(Provider):
+        def collect(self, *args, **kwargs):
+            raise RuntimeError(sentinel)
+
+    storage = Storage(tmp_path / "unexpected.db")
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
+    )
+    job_id = storage.create_job(request, compile_request(request))
+
+    JobService(storage, UnexpectedProvider("unused"), start_worker=False).run_once(job_id)
+
+    job = storage.get_job(job_id)
+    assert job["error_code"] == "unexpected_error"
+    assert job["error_message"] == "The collection failed unexpectedly."
+    assert sentinel not in caplog.text
+    assert "RuntimeError" in caplog.text and "test_jobs.py" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BrowserRateLimitedError("secret response"),
+        BrowserManualActionRequired("secret response"),
+        BrowserSessionExpiredError("secret response"),
+    ],
+)
+def test_browser_rate_and_session_stops_are_terminal_without_retry(tmp_path, error):
+    class StoppedProvider(Provider):
+        def collect(self, *args, **kwargs):
+            raise error
+
+    storage = Storage(tmp_path / f"{error.code}.db")
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
+    )
+    job_id = storage.create_job(request, compile_request(request))
+
+    JobService(storage, StoppedProvider("unused"), start_worker=False).run_once(job_id)
+
+    job = storage.get_job(job_id)
+    assert job["status"] == "failed"
+    assert job["error_code"] == error.code
+    assert job["error_retryable"] is False
+
+
+@pytest.mark.parametrize("mode", ["wait", "fail"])
+def test_cancellation_wins_rate_limit_and_provider_error_races(tmp_path, mode):
+    storage = Storage(tmp_path / f"cancel-{mode}.db")
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "tester", "maxPosts": 10}
+    )
+    job_id = storage.create_job(request, compile_request(request))
+
+    class CancellingProvider(Provider):
+        def collect(self, *args, **kwargs):
+            storage.request_cancel(job_id)
+            if self.mode == "wait":
+                raise RateLimitWaiting("secret response", datetime.now(UTC).isoformat(), 0, 1)
+            raise SchemaDriftError("secret response")
+
+    JobService(storage, CancellingProvider(mode), start_worker=False).run_once(job_id)
+
+    job = storage.get_job(job_id)
+    assert job["status"] == "cancelled"
+    assert job["error_code"] == job["completion_reason"] == "cancelled"
