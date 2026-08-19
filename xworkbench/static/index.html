@@ -34,22 +34,35 @@
       <div><strong>Synthetic offline demo</strong><p>Every visible Post is local demo data. No X request is available, made, or billed.</p></div>
     </section>
 
-    <nav aria-label="Workflow stages">
-      <ol class="steps">
-        <li id="step-1" class="current"><span>1</span> Choose and approve</li>
-        <li id="step-2"><span>2</span> Capture and monitor</li>
-        <li id="step-3"><span>3</span> Inspect and export</li>
-      </ol>
+    <nav class="product-nav" aria-label="Research workflow">
+      <a href="#sources" aria-current="page">Sources</a>
+      <a href="#capture">Capture</a>
+      <a href="#changes">Changes</a>
+      <a href="#evidence">Evidence</a>
+      <a href="#agent">Connect an agent</a>
     </nav>
 
-    <section id="stage-configure" class="panel" aria-labelledby="configure-title">
+    <section id="sources" class="panel workflow-section" aria-labelledby="sources-title">
       <div class="section-title">
-        <div><p class="eyebrow">Stage 1</p><h2 id="configure-title">Choose and approve</h2></div>
+        <div><p class="eyebrow">Sources</p><h2 id="sources-title">Research surfaces</h2></div>
+        <button id="refresh-sources" type="button">Refresh</button>
+      </div>
+      <p class="intro">Reopen a named Home, profile, or search surface without confusing it with a claim about all of X.</p>
+      <div id="source-list" class="source-list" aria-live="polite"><p class="empty">Loading saved sources…</p></div>
+      <p id="sources-note" class="fine"></p>
+    </section>
+
+    <section id="capture" class="panel workflow-section" aria-labelledby="configure-title">
+      <div class="section-title">
+        <div><p class="eyebrow">Capture</p><h2 id="configure-title">Name, bound, and approve</h2></div>
         <span id="scope-badge" class="pill neutral">Browser · Home</span>
       </div>
       <p class="intro">Collection starts only after you review this small, bounded request. Browser capture is experimental and may stop when X changes its DOM or requires manual action.</p>
 
       <form id="collection-form">
+        <label><span>Source name</span><input id="source-name" maxlength="100" autocomplete="off" placeholder="AI research watch"></label>
+        <label><span>Snapshot name</span><input id="snapshot-name" maxlength="100" autocomplete="off" placeholder="Morning check"></label>
+        <p class="field-note full">Names are local display labels. Snapshot IDs and Post URLs remain the evidence identifiers.</p>
         <fieldset class="segments full">
           <legend>Capture method</legend>
           <label><input type="radio" name="provider" value="playwright_browser" checked> Browser capture</label>
@@ -57,9 +70,18 @@
         </fieldset>
 
         <div id="browser-options" class="provider-options full">
-          <label>Source <input value="Home feed" readonly></label>
+          <fieldset class="segments full">
+            <legend>Browser surface</legend>
+            <label><input type="radio" name="browserSourceType" value="home" checked> Home</label>
+            <label><input type="radio" name="browserSourceType" value="profile"> Profile</label>
+            <label><input type="radio" name="browserSourceType" value="search"> Search</label>
+          </fieldset>
+          <label class="full"><span id="browser-source-label">Home feed</span>
+            <input id="browser-source-value" autocomplete="off" value="home" readonly aria-describedby="browser-source-help">
+            <small id="browser-source-help">The destination is fixed to your signed-in Home feed.</small>
+          </label>
           <label>Maximum Posts <input id="browser-max-posts" type="number" min="1" max="25" value="5" required></label>
-          <p class="field-note full">A real headed Chromium window opens <code>https://x.com/home</code>. You remain in control; challenges are never bypassed.</p>
+          <p class="field-note full">The exact X destination is shown in preview. You remain in control; challenges are never bypassed.</p>
           <div class="banner warning full">Experimental browser automation may conflict with X’s terms. Obtain appropriate authorization and follow applicable terms and law.</div>
         </div>
 
@@ -94,6 +116,7 @@
 
       <div id="preview-card" class="preview" hidden>
         <div class="section-title"><div><p id="preview-eyebrow" class="eyebrow">Human-approved capture</p><h3 id="preview-title">Review browser capture</h3></div><span id="preview-badge" class="pill neutral">Local · bounded</span></div>
+        <p id="preview-names" class="fine"></p>
         <dl id="browser-preview" class="preview-grid" hidden>
           <div><dt>Method</dt><dd>Headed Playwright Chromium</dd></div>
           <div><dt>Source</dt><dd id="browser-preview-source"></dd></div>
@@ -116,9 +139,9 @@
       </div>
     </section>
 
-    <section id="stage-collect" class="panel" aria-labelledby="collect-title">
+    <section id="stage-collect" class="panel workflow-section" aria-labelledby="collect-title">
       <div class="section-title">
-        <div><p class="eyebrow">Stage 2</p><h2 id="collect-title">Capture and monitor</h2></div>
+        <div><p class="eyebrow">Capture</p><h2 id="collect-title">Monitor and reopen</h2></div>
         <button id="refresh-history" type="button" aria-label="Refresh saved snapshots">Refresh</button>
       </div>
       <div class="collect-grid">
@@ -131,6 +154,10 @@
             <div id="browser-stats" class="stats" hidden>
               <div><span>Scan iterations</span><strong id="scan-count">—</strong></div>
               <div><span>Scroll iterations</span><strong id="scroll-count">—</strong></div>
+              <div><span>Visible / parsed</span><strong id="card-count">—</strong></div>
+              <div><span>Duplicates</span><strong id="duplicate-count">—</strong></div>
+              <div><span>Field coverage</span><strong id="coverage-count">—</strong></div>
+              <div><span>Stop reason</span><strong id="stop-reason">—</strong></div>
               <div><span>Observed</span><strong id="observation-time">—</strong></div>
             </div>
             <div id="api-stats" class="stats" hidden>
@@ -151,18 +178,43 @@
       </div>
     </section>
 
-    <section id="stage-inspect" class="panel" aria-labelledby="inspect-title" hidden>
+    <section id="changes" class="panel workflow-section" aria-labelledby="changes-title">
       <div class="section-title">
-        <div><p class="eyebrow">Stage 3</p><h2 id="inspect-title">Inspect and export</h2></div>
+        <div><p class="eyebrow">Changes</p><h2 id="changes-title">What changed?</h2></div>
+        <span class="pill neutral">Observed samples only</span>
+      </div>
+      <p class="intro">Compare two snapshots from the same source. “Not observed” means absent from the latest bounded sample, not deleted or false.</p>
+      <div class="comparison-controls">
+        <label>Earlier snapshot <select id="before-snapshot"><option value="">Choose a snapshot</option></select></label>
+        <label>Later snapshot <select id="after-snapshot"><option value="">Choose a snapshot</option></select></label>
+        <button id="compare-button" class="primary" type="button">Compare snapshots</button>
+      </div>
+      <div id="compare-error" class="banner error" role="alert" hidden></div>
+      <p id="compare-status" class="fine" aria-live="polite">Two usable snapshots are needed for a comparison.</p>
+      <div id="comparison-summary" class="summary-cards" hidden>
+        <div><span>Newly observed</span><strong id="new-count">0</strong></div>
+        <div><span>Reobserved</span><strong id="same-count">0</strong></div>
+        <div><span>Not observed later</span><strong id="missing-count">0</strong></div>
+        <div><span>Comparable deltas</span><strong id="delta-count">0</strong></div>
+      </div>
+      <div id="change-results" class="change-groups"><p class="empty">Choose two snapshots to build cited evidence.</p></div>
+    </section>
+
+    <section id="evidence" class="panel workflow-section" aria-labelledby="inspect-title">
+      <div class="section-title">
+        <div><p class="eyebrow">Evidence</p><h2 id="inspect-title">Inspect cited Posts</h2></div>
         <span id="snapshot-status" class="pill neutral"></span>
       </div>
       <p id="snapshot-meta" class="fine"></p>
       <div id="partial-notice" class="banner warning" role="status" hidden>Partial results are preserved. This snapshot may not represent the full requested capture.</div>
       <div id="quality-notice" class="banner warning" role="status" hidden></div>
-      <div class="actions export-actions" aria-label="Export snapshot">
+      <details class="raw-evidence">
+        <summary>Raw evidence and exports</summary>
+        <div class="actions export-actions" aria-label="Export snapshot">
         <a id="json-export" class="button" href="#">Export JSON</a>
         <a id="csv-export" class="button" href="#">Export CSV</a>
-      </div>
+        </div>
+      </details>
 
       <div class="summary-cards">
         <div><span>Posts</span><strong id="summary-total">0</strong></div>
@@ -192,6 +244,35 @@
         <div class="section-title"><h3 id="posts-title">Post evidence</h3><span id="result-count" class="pill neutral">0 Posts</span></div>
         <div id="posts-list" class="posts"><p class="empty">Open a terminal snapshot to inspect its Posts.</p></div>
       </section>
+    </section>
+
+    <section id="agent" class="panel workflow-section" aria-labelledby="agent-title">
+      <div class="section-title">
+        <div><p class="eyebrow">Connect an agent</p><h2 id="agent-title">Read local evidence over MCP</h2></div>
+        <span class="pill neutral">Read-only · local</span>
+      </div>
+      <p class="intro">Start the local MCP server, then register it in your client. It reads bounded snapshots; it cannot sign in or capture from X.</p>
+      <div class="agent-grid">
+        <div>
+          <h3>Local command</h3>
+          <pre><code>xworkbench mcp</code></pre>
+          <h3>Codex configuration</h3>
+          <pre><code>[mcp_servers.x_scraper]
+command = "xworkbench"
+args = ["mcp"]</code></pre>
+        </div>
+        <div>
+          <h3>Available read tools</h3>
+          <ul class="tool-list">
+            <li>list_sources</li><li>list_snapshots</li><li>get_latest_usable_snapshot</li>
+            <li>search_post_evidence</li><li>compare_snapshots</li><li>get_topic_activity</li>
+            <li>get_collection_health</li>
+          </ul>
+          <h3>Sample question</h3>
+          <p class="sample-prompt">What changed in this topic since the previous snapshot? Cite the Posts and state the sample limits.</p>
+          <p id="agent-test-result" class="fine">MCP test: not run from this dashboard. Run <code>xworkbench doctor</code> to verify startup and database access.</p>
+        </div>
+      </div>
     </section>
   </main>
   <script type="module" src="/app.js"></script>

@@ -1,4 +1,5 @@
 const METRIC_FIELDS = ["like_count", "reply_count", "repost_count", "quote_count", "bookmark_count"];
+const COMPARABLE_METRICS = [...METRIC_FIELDS, "view_count"];
 
 function metric(value) {
   return Number.isInteger(value) && value >= 0 ? value : null;
@@ -130,5 +131,48 @@ export function summarizePosts(posts) {
     topAuthors: [...authors.values()].filter((author) => author.engagement !== null)
       .sort((a, b) => b.engagement - a.engagement || b.posts - a.posts || a.author.localeCompare(b.author))
       .slice(0, 5),
+  };
+}
+
+function evidenceOrder(left, right) {
+  const position = (post) => Number.isInteger(post.snapshot_position)
+    ? post.snapshot_position
+    : Number.isInteger(post.source_position) ? post.source_position : Number.MAX_SAFE_INTEGER;
+  return position(left) - position(right)
+    || String(left.post_id).localeCompare(String(right.post_id));
+}
+
+export function compareSnapshotPosts(beforePosts, afterPosts, options = {}) {
+  const before = new Map(beforePosts.map((post) => [String(post.post_id), post]));
+  const after = new Map(afterPosts.map((post) => [String(post.post_id), post]));
+  const newlyObserved = [...after].filter(([id]) => !before.has(id)).map(([, post]) => post)
+    .sort(evidenceOrder);
+  const reobserved = [...after].filter(([id]) => before.has(id)).map(([, post]) => post)
+    .sort(evidenceOrder);
+  const notObservedInLatest = [...before].filter(([id]) => !after.has(id)).map(([, post]) => post)
+    .sort(evidenceOrder);
+  const engagementDeltas = [];
+  for (const post of reobserved) {
+    const earlier = before.get(String(post.post_id));
+    const fields = {};
+    for (const field of COMPARABLE_METRICS) {
+      const first = metric(earlier[field]);
+      const latest = metric(post[field]);
+      if (first !== null && latest !== null) {
+        fields[field] = { before: first, after: latest, delta: latest - first };
+      }
+    }
+    if (Object.keys(fields).length) engagementDeltas.push({ post, fields });
+  }
+  return {
+    beforeSnapshotId: String(options.beforeSnapshotId || ""),
+    afterSnapshotId: String(options.afterSnapshotId || ""),
+    sample: { beforeCount: before.size, afterCount: after.size },
+    partial: Boolean(options.partial),
+    truncated: Boolean(options.truncated),
+    newlyObserved,
+    reobserved,
+    notObservedInLatest,
+    engagementDeltas,
   };
 }

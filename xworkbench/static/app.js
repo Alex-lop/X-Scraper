@@ -4,6 +4,7 @@ import {
   engagementDetails,
   filterAndSortPosts,
   formatMetric,
+  compareSnapshotPosts,
   postTypes,
   summarizePosts,
 } from "./analysis.js";
@@ -25,12 +26,36 @@ let pollTimer = null;
 let allPosts = [];
 let offlineDemo = false;
 let providerConnections = {};
+let snapshotCatalog = [];
+
+function savedNames() {
+  try {
+    const value = JSON.parse(localStorage.getItem("xworkbench-display-names") || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+const localNames = savedNames();
+
+function persistNames() {
+  try {
+    localStorage.setItem("xworkbench-display-names", JSON.stringify(localNames));
+  } catch {
+    // Display labels are optional; capture identity remains the server-issued snapshot ID.
+  }
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({ error: { message: `Request failed (${response.status})` } }));
-  if (!response.ok) throw new Error(data.error?.message || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(data.error?.message || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -90,10 +115,10 @@ function authorLabel(post) {
 }
 
 function setStage(stage) {
-  for (let index = 1; index <= 3; index += 1) {
-    const item = $(`#step-${index}`);
-    item.classList.toggle("current", index === stage);
-    item.classList.toggle("complete", index < stage);
+  const section = stage < 3 ? "capture" : "evidence";
+  for (const link of document.querySelectorAll(".product-nav a")) {
+    if (link.getAttribute("href") === `#${section}`) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
   }
 }
 
@@ -113,16 +138,20 @@ function selectedProvider() {
 
 function providerReady(provider) {
   const connection = providerConnections[provider]?.connection || {};
-  return connection.ready === true || connection.valid === true || ["ready", "configured"].includes(connection.status);
+  return provider === "playwright_browser"
+    ? connection.ready === true && connection.status === "verified_live"
+    : connection.valid === true && connection.status === "configured";
 }
 
 function requestPayload() {
   const data = new FormData(form);
   const provider = data.get("provider");
   if (provider === "playwright_browser") {
+    const sourceType = data.get("browserSourceType") || "home";
     return {
       provider,
-      sourceType: "home",
+      sourceType,
+      sourceValue: sourceType === "home" ? "home" : $("#browser-source-value").value,
       maxPosts: Number($("#browser-max-posts").value),
     };
   }
@@ -164,7 +193,30 @@ function updateRequestHelp() {
       : "Run xworkbench configure to add an optional token.");
   }
   if (browser) {
-    $("#scope-badge").textContent = "Browser · Home";
+    const surface = data.get("browserSourceType") || "home";
+    const sourceInput = $("#browser-source-value");
+    const sourceLabel = $("#browser-source-label");
+    const sourceHelp = $("#browser-source-help");
+    const capabilities = providerConnections.playwright_browser?.capabilities || {};
+    const supported = new Set(capabilities.sources || ["home"]);
+    for (const input of form.elements.browserSourceType || []) {
+      input.disabled = !supported.has(input.value);
+    }
+    if (!supported.has(surface)) {
+      form.elements.browserSourceType.value = "home";
+      return updateRequestHelp();
+    }
+    sourceInput.readOnly = surface === "home";
+    sourceInput.required = surface !== "home";
+    sourceInput.value = surface === "home" ? "home" : sourceInput.value === "home" ? "" : sourceInput.value;
+    sourceLabel.textContent = surface === "home" ? "Home feed" : surface === "profile" ? "Profile handle" : "Search query";
+    sourceInput.placeholder = surface === "profile" ? "@OpenAI" : surface === "search" ? "AI agents lang:en" : "home";
+    sourceHelp.textContent = surface === "home"
+      ? "The destination is fixed to your signed-in Home feed."
+      : supported.has(surface)
+        ? `The backend will preview the exact bounded ${surface} destination before capture.`
+        : `${titleCase(surface)} capture is unavailable in this backend version.`;
+    $("#scope-badge").textContent = `Browser · ${titleCase(surface)}`;
     return;
   }
   const archive = data.get("searchMode") === "fullArchive";
@@ -217,6 +269,12 @@ function expirePreview() {
 
 function renderPreview() {
   const browser = preview.provider === "playwright_browser";
+  const sourceName = $("#source-name").value.trim();
+  const snapshotName = $("#snapshot-name").value.trim();
+  $("#preview-names").textContent = [
+    sourceName ? `Source “${sourceName}”` : "Unnamed source",
+    snapshotName ? `snapshot “${snapshotName}”` : "unnamed snapshot",
+  ].join(" · ");
   $("#browser-preview").hidden = !browser;
   $("#api-preview").hidden = browser;
   $("#api-billing").hidden = browser;
@@ -308,12 +366,17 @@ $("#confirm-button").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...preview.request, executionPlan: preview.executionPlan, ...confirmation }),
     });
+    localNames[data.jobId] = {
+      source: $("#source-name").value.trim().slice(0, 100),
+      snapshot: $("#snapshot-name").value.trim().slice(0, 100),
+    };
+    persistNames();
     clearTimeout(previewTimer);
     preview = null;
     form.hidden = false;
     $("#preview-card").hidden = true;
     await openJob(data.jobId);
-    $("#stage-collect").scrollIntoView({ behavior: "smooth" });
+    $("#stage-collect").scrollIntoView();
   } catch (error) {
     banner($("#confirm-error"), error.message);
     button.disabled = false;
@@ -327,8 +390,104 @@ function isSyntheticJob(job) {
 }
 
 function jobLabel(job) {
-  if (job.provider === "playwright_browser") return `Home feed: ${job.id.slice(0, 8)}`;
-  return `${job.request?.sourceType || "collection"}: ${job.request?.sourceValue || job.id}`;
+  const id = snapshotId(job);
+  const source = job.source || job.request || {};
+  const named = job.displayName || job.name || localNames[id]?.snapshot || source.displayName;
+  if (named) return named;
+  if (job.provider === "playwright_browser") {
+    const surface = source.sourceType || source.surface || job.provenance?.sourceKind || "home";
+    const value = source.sourceValue || source.value || source.query;
+    return `${titleCase(surface)}${value && value !== "home" ? `: ${value}` : " feed"}: ${id.slice(0, 8)}`;
+  }
+  return `${source.sourceType || source.surface || "collection"}: ${source.sourceValue || source.value || source.query || id}`;
+}
+
+function sourceKey(value) {
+  return [value.provider, value.surface || value.sourceType, value.value || value.sourceValue]
+    .map((part) => String(part || "")).join("\u0000");
+}
+
+function derivedSources(jobs) {
+  const sources = new Map();
+  for (const job of jobs) {
+    const request = job.request || {};
+    const source = {
+      id: sourceKey({ provider: job.provider, sourceType: request.sourceType, sourceValue: request.sourceValue }),
+      displayName: localNames[job.id]?.source || `${titleCase(request.sourceType || "source")} · ${request.sourceValue || "home"}`,
+      provider: job.provider,
+      surface: request.sourceType,
+      value: request.sourceValue,
+      lastStatus: job.status,
+    };
+    if (!sources.has(sourceKey(source))) sources.set(sourceKey(source), source);
+  }
+  return [...sources.values()];
+}
+
+function chooseSource(source) {
+  const provider = source.provider || "playwright_browser";
+  const providerControl = [...form.querySelectorAll('[name="provider"]')]
+    .find((control) => control.value === provider);
+  if (!providerControl) return;
+  providerControl.checked = true;
+  const surface = source.surface || source.sourceType || "home";
+  if (provider === "playwright_browser") {
+    const surfaceControl = [...form.querySelectorAll('[name="browserSourceType"]')]
+      .find((control) => control.value === surface);
+    if (surfaceControl && !surfaceControl.disabled) surfaceControl.checked = true;
+    $("#browser-source-value").value = source.value || source.sourceValue || source.query || "home";
+  } else {
+    const surfaceControl = [...form.querySelectorAll('[name="sourceType"]')]
+      .find((control) => control.value === surface);
+    if (surfaceControl) surfaceControl.checked = true;
+    $("#source-value").value = source.value || source.sourceValue || source.query || "";
+  }
+  $("#source-name").value = source.displayName || source.name || "";
+  updateRequestHelp();
+  $("#capture").scrollIntoView();
+  $("#source-name").focus();
+}
+
+function renderSources(sources, note) {
+  const list = $("#source-list");
+  list.replaceChildren();
+  for (const source of sources) {
+    const item = node("article", "", "source-card");
+    item.append(
+      node("strong", source.displayName || source.name || "Unnamed source"),
+      node("span", `${titleCase(source.surface || source.sourceType)} · ${source.value || source.sourceValue || source.query || "home"}`),
+      node("small", `${titleCase(source.provider)} · last status ${titleCase(source.lastStatus || "unknown")}`),
+    );
+    const button = node("button", "Capture again");
+    button.type = "button";
+    button.addEventListener("click", () => chooseSource(source));
+    item.append(button);
+    list.append(item);
+  }
+  if (!sources.length) list.append(node("p", "No saved sources yet. Name one in Capture.", "empty"));
+  $("#sources-note").textContent = note;
+}
+
+async function loadSources(fallbackJobs = snapshotCatalog) {
+  try {
+    const data = await api("/api/sources");
+    renderSources(Array.isArray(data.sources) ? data.sources : [], "Loaded from the local saved-source catalog.");
+  } catch {
+    renderSources(derivedSources(fallbackJobs), "Saved-source API unavailable; showing sources derived from local snapshot history.");
+  }
+}
+
+async function loadSnapshotCatalog(fallbackJobs) {
+  try {
+    const data = await api("/api/snapshots?limit=50");
+    if (Array.isArray(data.snapshots)) {
+      return data.snapshots.filter((snapshot) => snapshot.usable !== false
+        && (snapshot.sample?.observedPosts ?? snapshot.collectedCount ?? 0) > 0);
+    }
+  } catch {
+    // Older backends expose snapshots as terminal jobs.
+  }
+  return fallbackJobs.filter((job) => terminalStatuses.has(job.status) && job.collectedCount > 0);
 }
 
 async function loadHistory({ openDemo = false } = {}) {
@@ -336,6 +495,7 @@ async function loadHistory({ openDemo = false } = {}) {
   try {
     const data = await api("/api/jobs?limit=25");
     const jobs = data.jobs || [];
+    snapshotCatalog = await loadSnapshotCatalog(jobs);
     list.replaceChildren();
     for (const job of jobs) {
       const button = node("button", "", "history-item");
@@ -351,6 +511,8 @@ async function loadHistory({ openDemo = false } = {}) {
     if (!jobs.length) list.append(node("p", "No stored snapshots yet.", "empty"));
     const demo = jobs.find(isSyntheticJob);
     if (demo) setOfflineDemo();
+    refreshComparisonOptions();
+    await loadSources(jobs);
     if (openDemo && demo && !activeJobId) await openJob(demo.id);
   } catch (error) {
     list.replaceChildren(node("p", error.message, "empty"));
@@ -376,6 +538,14 @@ function renderJob(job) {
     const details = job.providerDetails || {};
     $("#scan-count").textContent = count(details.scanIterations);
     $("#scroll-count").textContent = count(details.scrollIterations);
+    $("#card-count").textContent = `${count(details.visibleCards)} / ${count(details.parsedCards)}`;
+    $("#duplicate-count").textContent = count(details.duplicatePostIds);
+    const coverage = Object.values(details.fieldCoverage || {})
+      .map((field) => Number(field?.ratio)).filter(Number.isFinite);
+    $("#coverage-count").textContent = coverage.length
+      ? `${Math.round(coverage.reduce((total, value) => total + value, 0) / coverage.length * 100)}% avg`
+      : "—";
+    $("#stop-reason").textContent = titleCase(details.stopReason || job.completionReason || "pending");
     $("#observation-time").textContent = utc(details.observedAt);
   } else if (job.cost) {
     $("#post-resource-count").textContent = count(resources.posts);
@@ -413,7 +583,7 @@ async function openJob(jobId) {
   allPosts = [];
   resetFilters();
   clearTimeout(pollTimer);
-  $("#stage-inspect").hidden = true;
+  $("#posts-list").replaceChildren(node("p", "Loading snapshot evidence…", "empty"));
   await pollJob();
 }
 
@@ -474,7 +644,7 @@ $("#delete-button").addEventListener("click", async () => {
     allPosts = [];
     $("#collection-content").hidden = true;
     $("#collection-empty").hidden = false;
-    $("#stage-inspect").hidden = true;
+    $("#posts-list").replaceChildren(node("p", "Open a terminal snapshot to inspect its Posts.", "empty"));
     setStage(1);
     await loadHistory();
   } catch (error) {
@@ -491,6 +661,221 @@ async function loadAllPosts(jobId) {
     offset = page.pagination.nextOffset;
   }
   return posts;
+}
+
+function snapshotId(snapshot) {
+  return String(snapshot.id || snapshot.snapshotId || "");
+}
+
+function snapshotSource(snapshot) {
+  const request = snapshot.request || snapshot.source || {};
+  if (request.sourceFingerprint) return `fingerprint:${request.sourceFingerprint}`;
+  return sourceKey({
+    provider: snapshot.provider || request.provider,
+    sourceType: request.sourceType || request.surface,
+    sourceValue: request.sourceValue || request.value || request.query,
+  });
+}
+
+let defaultComparedKey = "";
+
+function refreshComparisonOptions() {
+  const before = $("#before-snapshot");
+  const after = $("#after-snapshot");
+  const oldBefore = before.value;
+  const oldAfter = after.value;
+  const options = snapshotCatalog.map((snapshot) => ({
+    value: snapshotId(snapshot),
+    label: `${jobLabel(snapshot)} · ${utc(snapshot.capturedAt || snapshot.finishedAt || snapshot.createdAt)}`,
+  })).filter((option) => option.value);
+  replaceOptions(before, "Choose an earlier snapshot", options);
+  replaceOptions(after, "Choose a later snapshot", options);
+  if (options.some((option) => option.value === oldBefore)) before.value = oldBefore;
+  if (options.some((option) => option.value === oldAfter)) after.value = oldAfter;
+  if (before.value && after.value) return;
+
+  for (let latestIndex = 0; latestIndex < snapshotCatalog.length; latestIndex += 1) {
+    const latest = snapshotCatalog[latestIndex];
+    const earlier = snapshotCatalog.slice(latestIndex + 1)
+      .find((candidate) => snapshotSource(candidate) === snapshotSource(latest));
+    if (!earlier) continue;
+    before.value = snapshotId(earlier);
+    after.value = snapshotId(latest);
+    const key = `${before.value}:${after.value}`;
+    if (key !== defaultComparedKey) {
+      defaultComparedKey = key;
+      void runComparison();
+    }
+    return;
+  }
+}
+
+function comparisonPayload(value) {
+  const result = value?.comparison || value;
+  const listNames = ["newlyObserved", "reobserved", "notObservedInLatest", "engagementDeltas"];
+  if (result && listNames.every((name) => Array.isArray(result[name]))) return result;
+  if (!result || !Array.isArray(result.newlyObserved)
+      || !Array.isArray(result.reobserved)
+      || !Array.isArray(result.notObservedInNewerSample)) return null;
+  const asPost = (evidence) => ({
+    post_id: evidence?.postId,
+    text: evidence?.postText?.value,
+    url: evidence?.originalUrl,
+    created_at: evidence?.createdAt,
+    observed_at: evidence?.observedAt,
+    author_id: evidence?.author?.id,
+    author_username: evidence?.author?.username,
+  });
+  const reobserved = result.reobserved.map((item) => asPost(item.evidence));
+  return {
+    beforeSnapshotId: result.olderSnapshot?.snapshotId,
+    afterSnapshotId: result.newerSnapshot?.snapshotId,
+    sample: {
+      beforeCount: result.sample?.olderPostsScanned,
+      afterCount: result.sample?.newerPostsScanned,
+    },
+    partial: Boolean(result.partial),
+    truncated: Boolean(result.truncated),
+    newlyObserved: result.newlyObserved.map(asPost),
+    reobserved,
+    notObservedInLatest: result.notObservedInNewerSample.map(asPost),
+    engagementDeltas: result.reobserved
+      .filter((item) => Object.keys(item.engagementDelta || {}).length)
+      .map((item) => ({
+        post: asPost(item.evidence),
+        fields: Object.fromEntries(Object.entries(item.engagementDelta)
+          .map(([field, delta]) => [field, { delta }])),
+      })),
+    counts: {
+      newlyObserved: result.counts?.newlyObserved,
+      reobserved: result.counts?.reobserved,
+      notObservedInLatest: result.counts?.notObservedInNewerSample,
+    },
+  };
+}
+
+function comparisonEvidence(post, snapshot, label, detail = "") {
+  const article = node("article", "", "change-card");
+  const heading = node("div", "", "post-top");
+  heading.append(node("strong", label), node("span", `Snapshot ${snapshot.slice(0, 12)}`));
+  article.append(heading);
+  const text = String(post.text ?? "[Post text unavailable]");
+  article.append(node("p", `External Post evidence: “${text}”`, "post-text"));
+  const metadata = node("p", `Post ${post.post_id || "unknown"} · observed ${utc(post.observed_at || post.created_at)}${detail ? ` · ${detail}` : ""}`, "fine");
+  article.append(metadata);
+  const actions = node("div", "", "actions");
+  const snapshotButton = node("button", "Open snapshot evidence");
+  snapshotButton.type = "button";
+  snapshotButton.addEventListener("click", async () => {
+    await openJob(snapshot);
+    const target = document.getElementById(postAnchor(post.post_id));
+    if (target) {
+      target.tabIndex = -1;
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ block: "start" });
+    } else {
+      $("#evidence").scrollIntoView({ block: "start" });
+    }
+  });
+  actions.append(snapshotButton);
+  const href = safeUrl(post.url);
+  if (href) {
+    const link = node("a", "Open original Post ↗", "button");
+    link.href = href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    actions.append(link);
+  }
+  article.append(actions);
+  return article;
+}
+
+function deltaLabel(fields) {
+  return Object.entries(fields || {}).map(([field, values]) => {
+    const sign = values.delta > 0 ? "+" : "";
+    return values.before === undefined || values.after === undefined
+      ? `${titleCase(field)} ${sign}${values.delta}`
+      : `${titleCase(field)} ${count(values.before)} → ${count(values.after)} (${sign}${values.delta})`;
+  }).join("; ");
+}
+
+function comparisonGroup(title, explanation, values, snapshot, label, detail = () => "", total = values.length) {
+  const section = node("section", "", "change-group");
+  section.append(node("h3", `${title} (${count(total)})`), node("p", explanation, "fine"));
+  const list = node("div", "", "posts");
+  list.append(...values.slice(0, 100).map((value) => {
+    const post = value.post || value;
+    return comparisonEvidence(post, snapshot, label, detail(value));
+  }));
+  if (!values.length) list.append(node("p", "No evidence in this category.", "empty"));
+  if (values.length > 100) list.append(node("p", `Showing the first 100 of ${count(values.length)} evidence rows.`, "fine"));
+  section.append(list);
+  return section;
+}
+
+function renderComparison(comparison, origin) {
+  const beforeId = String(comparison.beforeSnapshotId || $("#before-snapshot").value);
+  const afterId = String(comparison.afterSnapshotId || $("#after-snapshot").value);
+  const categoryCounts = comparison.counts || {};
+  $("#new-count").textContent = count(categoryCounts.newlyObserved ?? comparison.newlyObserved.length);
+  $("#same-count").textContent = count(categoryCounts.reobserved ?? comparison.reobserved.length);
+  $("#missing-count").textContent = count(categoryCounts.notObservedInLatest ?? comparison.notObservedInLatest.length);
+  $("#delta-count").textContent = count(comparison.engagementDeltas.length);
+  $("#comparison-summary").hidden = false;
+  const sample = comparison.sample || {};
+  $("#compare-status").textContent = `${origin} Earlier sample ${count(sample.beforeCount)} Posts; later sample ${count(sample.afterCount)} Posts.${comparison.partial ? " At least one snapshot is partial." : ""}${comparison.truncated ? " Results are truncated." : ""}`;
+  $("#change-results").replaceChildren(
+    comparisonGroup("Newly observed", "Present in the later bounded sample and absent from the earlier sample.", comparison.newlyObserved, afterId, "Newly observed", undefined, categoryCounts.newlyObserved),
+    comparisonGroup("Reobserved", "Present in both bounded samples.", comparison.reobserved, afterId, "Reobserved", undefined, categoryCounts.reobserved),
+    comparisonGroup("Not observed later", "Present earlier but absent from the later sample; this does not establish deletion.", comparison.notObservedInLatest, beforeId, "Not observed in later sample", undefined, categoryCounts.notObservedInLatest),
+    comparisonGroup("Comparable metric changes", "Only fields present in both observations are compared.", comparison.engagementDeltas, afterId, "Metric delta", (value) => deltaLabel(value.fields)),
+  );
+}
+
+async function runComparison() {
+  const button = $("#compare-button");
+  const beforeId = $("#before-snapshot").value;
+  const afterId = $("#after-snapshot").value;
+  banner($("#compare-error"), "");
+  if (!beforeId || !afterId || beforeId === afterId) {
+    banner($("#compare-error"), "Choose two different snapshots.");
+    return;
+  }
+  const beforeSnapshot = snapshotCatalog.find((item) => snapshotId(item) === beforeId);
+  const afterSnapshot = snapshotCatalog.find((item) => snapshotId(item) === afterId);
+  if (beforeSnapshot && afterSnapshot && snapshotSource(beforeSnapshot) !== snapshotSource(afterSnapshot)) {
+    banner($("#compare-error"), "Choose snapshots from the same source.");
+    return;
+  }
+  button.disabled = true;
+  $("#compare-status").textContent = "Building bounded comparison evidence…";
+  try {
+    let comparison = null;
+    try {
+      const query = new URLSearchParams({ olderSnapshotId: beforeId, newerSnapshotId: afterId });
+      comparison = comparisonPayload(await api(`/api/compare?${query}`));
+    } catch {
+      // Fall back to the existing bounded snapshot/Post API.
+    }
+    if (comparison) {
+      renderComparison(comparison, "Loaded from the shared comparison service.");
+    } else {
+      const [beforePosts, afterPosts] = await Promise.all([
+        loadAllPosts(beforeId), loadAllPosts(afterId),
+      ]);
+      renderComparison(compareSnapshotPosts(beforePosts, afterPosts, {
+        beforeSnapshotId: beforeId,
+        afterSnapshotId: afterId,
+        partial: Boolean(beforeSnapshot?.isPartial || afterSnapshot?.isPartial),
+        truncated: beforePosts.length >= 500 || afterPosts.length >= 500,
+      }), "Shared comparison endpoint unavailable; computed locally from stored Posts.");
+    }
+  } catch (error) {
+    banner($("#compare-error"), error.message);
+    $("#compare-status").textContent = "Comparison unavailable; stored snapshots were not changed.";
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function resetFilters() {
@@ -601,8 +986,10 @@ function postCard(post) {
 
   const details = engagementDetails(post);
   const foot = node("div", "", "post-foot");
-  const names = { like_count: "Likes", reply_count: "Replies", repost_count: "Reposts", quote_count: "Quotes", bookmark_count: "Bookmarks" };
-  for (const [field, label] of Object.entries(names)) foot.append(node("span", `${label}: ${formatMetric(details.metrics[field])}`));
+  const names = { like_count: "Likes", reply_count: "Replies", repost_count: "Reposts", quote_count: "Quotes", bookmark_count: "Bookmarks", view_count: "Views" };
+  for (const [field, label] of Object.entries(names)) {
+    foot.append(node("span", `${label}: ${formatMetric(field === "view_count" ? post[field] : details.metrics[field])}`));
+  }
   const href = safeUrl(post.url);
   if (href) {
     const link = node("a", "Open original ↗");
@@ -637,7 +1024,6 @@ async function loadSnapshot(jobId, job) {
   const posts = await loadAllPosts(jobId);
   if (jobId !== activeJobId) return;
   allPosts = posts;
-  $("#stage-inspect").hidden = false;
   $("#snapshot-status").textContent = job.isPartial ? "Partial snapshot" : titleCase(job.status);
   $("#snapshot-status").className = `pill ${job.status}`;
   $("#partial-notice").hidden = !job.isPartial;
@@ -652,6 +1038,15 @@ async function loadSnapshot(jobId, job) {
   renderSummary();
   renderFilteredPosts();
   setStage(3);
+}
+
+$("#compare-button").addEventListener("click", runComparison);
+$("#refresh-sources").addEventListener("click", () => loadSources());
+for (const link of document.querySelectorAll(".product-nav a")) {
+  link.addEventListener("click", () => {
+    for (const item of document.querySelectorAll(".product-nav a")) item.removeAttribute("aria-current");
+    link.setAttribute("aria-current", "page");
+  });
 }
 
 updateRequestHelp();

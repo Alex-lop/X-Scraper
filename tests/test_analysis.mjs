@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const source = await readFile(new URL("../xworkbench/static/analysis.js", import.meta.url), "utf8");
+const [source, appSource, htmlSource, cssSource] = await Promise.all([
+  "analysis.js", "app.js", "index.html", "styles.css",
+].map((name) => readFile(new URL(`../xworkbench/static/${name}`, import.meta.url), "utf8")));
 const analysis = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 
 const posts = [
@@ -48,4 +50,43 @@ test("classifies unknown types honestly and summarizes the local snapshot", () =
   assert.equal(summary.types.unclassified, 1);
   assert.equal(summary.postsWithMissingMetrics, 4);
   assert.deepEqual(summary.dailyVolume.map(({ count }) => count), [1, 2]);
+});
+
+test("compares bounded snapshots without treating missing metrics as zero", () => {
+  const before = [
+    { post_id: "same", snapshot_position: 0, like_count: 2, view_count: null },
+    { post_id: "old", snapshot_position: 1, like_count: 9 },
+  ];
+  const after = [
+    { post_id: "same", snapshot_position: 1, like_count: 5, view_count: 20 },
+    { post_id: "new", snapshot_position: 0, like_count: 1 },
+  ];
+  const comparison = analysis.compareSnapshotPosts(before, after, {
+    beforeSnapshotId: "snapshot-a", afterSnapshotId: "snapshot-b", partial: true,
+  });
+
+  assert.deepEqual(comparison.newlyObserved.map((post) => post.post_id), ["new"]);
+  assert.deepEqual(comparison.reobserved.map((post) => post.post_id), ["same"]);
+  assert.deepEqual(comparison.notObservedInLatest.map((post) => post.post_id), ["old"]);
+  assert.deepEqual(comparison.engagementDeltas[0].fields.like_count, { before: 2, after: 5, delta: 3 });
+  assert.equal(comparison.engagementDeltas[0].fields.view_count, undefined);
+  assert.deepEqual(comparison.sample, { beforeCount: 2, afterCount: 2 });
+  assert.equal(comparison.partial, true);
+});
+
+test("keeps the product loop CSP-safe, keyboard-native, and motion-safe", () => {
+  for (const unsafe of ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"]) {
+    assert.equal(appSource.includes(unsafe), false);
+  }
+  for (const label of ["Sources", "Capture", "Changes", "Evidence", "Connect an agent"]) {
+    assert.match(htmlSource, new RegExp(`>${label}<`));
+  }
+  assert.match(htmlSource, /href="#sources" aria-current="page"/);
+  assert.match(htmlSource, /id="compare-error"[^>]*role="alert"/);
+  assert.match(htmlSource, /id="compare-status"[^>]*aria-live="polite"/);
+  assert.equal(/<(?:script|link)[^>]+https?:\/\//i.test(htmlSource), false);
+  assert.equal(htmlSource.includes("<img"), false);
+  assert.equal(appSource.includes('behavior: "smooth"'), false);
+  assert.equal(cssSource.includes("scroll-behavior: smooth"), false);
+  assert.match(cssSource, /prefers-reduced-motion: reduce/);
 });
