@@ -578,7 +578,7 @@ class PlaywrightBrowserProvider:
         seen = {
             str(value)
             for value in prior.get("seenPostIds", [])
-            if isinstance(value, (str, int))
+            if isinstance(value, str | int)
         }
         scans = _as_int(prior.get("scanIterations"))
         scrolls = _as_int(prior.get("scrollIterations"))

@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: "22"
       - run: pip install -r requirements.lock
-      - run: pip install -e ".[browser,mcp]"
+      - run: pip install -e . --no-deps
       - run: playwright install --with-deps chromium
       - run: ruff check .
       - run: pytest
