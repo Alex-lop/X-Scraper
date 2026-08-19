@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import sync_playwright
 
 from xworkbench.config import Settings
@@ -89,9 +90,11 @@ def test_production_dom_projection_in_real_chromium_covers_sanitized_cards():
 class _FixturePlaywright:
     def __init__(self, html):
         self.html = html
+        self.destination = HOME_URL
         self.served = []
         self.blocked = []
         self.closed = set()
+        self.metadata = []
 
     def __enter__(self):
         self._manager = sync_playwright()
@@ -108,7 +111,7 @@ class _FixturePlaywright:
 
     def route(self, route):
         request = route.request
-        if request.is_navigation_request() and request.url == HOME_URL:
+        if request.is_navigation_request() and request.url == self.destination:
             self.served.append(request.url)
             route.fulfill(status=200, content_type="text/html", body=self.html)
         else:
@@ -178,7 +181,7 @@ class _FixturePage:
             self._fixture.closed.add("page")
 
 
-def _collect_timeline(tmp_path, target):
+def _collect_timeline(tmp_path, target, source_type="home", source_value=None):
     state_path = tmp_path / "auth" / "playwright.json"
     state_path.parent.mkdir(parents=True, mode=0o700)
     state_path.parent.chmod(0o700)
@@ -196,23 +199,35 @@ def _collect_timeline(tmp_path, target):
     _record_status(configured, "verified_live")
     fixture = _FixturePlaywright(TIMELINE.read_text(encoding="utf-8"))
     provider = PlaywrightBrowserProvider(configured, _playwright_factory=lambda: fixture)
-    request = CollectionRequest.from_dict(
-        {"provider": "playwright_browser", "sourceType": "home", "maxPosts": target}
-    )
+    request_body = {
+        "provider": "playwright_browser",
+        "sourceType": source_type,
+        "maxPosts": target,
+    }
+    if source_value is not None:
+        request_body["sourceValue"] = source_value
+    request = CollectionRequest.from_dict(request_body)
+    plan = provider.prepare(request)
+    fixture.destination = plan["sourceUrl"]
     batches = []
     states = []
 
-    def save(posts, state, _metadata):
+    def save(posts, state, metadata):
         batches.append([post.post_id for post in posts])
         states.append(state)
+        fixture.metadata.append(metadata)
         return len(posts)
 
     started = time.monotonic()
     try:
         summary = provider.collect(
             request,
-            execution_plan=provider.prepare(request),
-            checkpoint={"providerState": None, "storedCount": 0, "metadata": {}},
+            execution_plan=plan,
+            checkpoint={
+                "providerState": None,
+                "storedCount": 0,
+                "metadata": {"captureSegment": 0},
+            },
             on_batch=save,
             should_cancel=lambda: False,
         )
@@ -224,7 +239,7 @@ def _collect_timeline(tmp_path, target):
 def test_dynamic_real_chromium_reaches_exact_target_without_duplicates_and_cleans_up(tmp_path):
     summary, batches, state, fixture, elapsed = _collect_timeline(tmp_path, 4)
 
-    assert batches == [["2001"], ["2002"], ["2003"], ["2004"]]
+    assert batches == [["2001"], ["2002"], ["2003"], ["2004"], []]
     assert state == {
         "seenPostIds": ["2001", "2002", "2003", "2004"],
         "scanIterations": 4,
@@ -233,6 +248,7 @@ def test_dynamic_real_chromium_reaches_exact_target_without_duplicates_and_clean
         "segmentScanIterations": 4,
     }
     assert summary.completion_reason == "target_reached" and summary.partial is False
+    assert fixture.metadata[-1]["stopReason"] == "target_reached"
     assert elapsed < 10
     assert fixture.served == [HOME_URL] and fixture.blocked == []
     assert fixture.closed == {"page", "context", "browser"}
@@ -241,7 +257,7 @@ def test_dynamic_real_chromium_reaches_exact_target_without_duplicates_and_clean
 def test_dynamic_real_chromium_stall_is_bounded_and_cleans_up(tmp_path):
     summary, batches, state, fixture, elapsed = _collect_timeline(tmp_path, 6)
 
-    assert batches == [["2001"], ["2002"], ["2003"], ["2004"], [], []]
+    assert batches == [["2001"], ["2002"], ["2003"], ["2004"], [], [], []]
     assert state == {
         "seenPostIds": ["2001", "2002", "2003", "2004"],
         "scanIterations": 6,
@@ -250,6 +266,42 @@ def test_dynamic_real_chromium_stall_is_bounded_and_cleans_up(tmp_path):
         "segmentScanIterations": 6,
     }
     assert summary.completion_reason == "no_progress" and summary.partial is True
+    assert fixture.metadata[-1]["stopReason"] == "no_progress"
     assert elapsed < 10
     assert fixture.served == [HOME_URL] and fixture.blocked == []
     assert fixture.closed == {"page", "context", "browser"}
+
+
+@pytest.mark.parametrize(
+    ("source_type", "source_value", "normalized", "destination"),
+    [
+        ("profile", "https://x.com/OpenAI", "openai", "https://x.com/openai"),
+        (
+            "search",
+            "  cafe\u0301\n OR\tTea  ",
+            "café OR Tea",
+            "https://x.com/search?q=caf%C3%A9+OR+Tea&src=typed_query&f=live",
+        ),
+    ],
+)
+def test_real_chromium_uses_only_derived_profile_and_latest_search_destinations(
+    tmp_path, source_type, source_value, normalized, destination
+):
+    summary, batches, _state, fixture, elapsed = _collect_timeline(
+        tmp_path, 1, source_type, source_value
+    )
+
+    assert batches == [["2001"], []]
+    assert summary.completion_reason == "target_reached"
+    assert elapsed < 10
+    assert fixture.served == [destination] and fixture.blocked == []
+    assert fixture.closed == {"page", "context", "browser"}
+    assert {
+        key: fixture.metadata[-1][key]
+        for key in ("sourceKind", "sourceValue", "sourceUrl", "stopReason")
+    } == {
+        "sourceKind": source_type,
+        "sourceValue": normalized,
+        "sourceUrl": destination,
+        "stopReason": "target_reached",
+    }

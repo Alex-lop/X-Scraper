@@ -1,4 +1,5 @@
 import stat
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from xml.etree import ElementTree
@@ -41,6 +42,17 @@ def request(max_posts=2):
         {
             "provider": "playwright_browser",
             "sourceType": "home",
+            "maxPosts": max_posts,
+        }
+    )
+
+
+def source_request(source_type, source_value, max_posts=1):
+    return CollectionRequest.from_dict(
+        {
+            "provider": "playwright_browser",
+            "sourceType": source_type,
+            "sourceValue": source_value,
             "maxPosts": max_posts,
         }
     )
@@ -337,6 +349,7 @@ def test_prepare_and_passive_session_states(tmp_path):
     assert "maximumPostResources" not in plan
     assert provider.prepare(request(), plan) is plan
     assert provider.capabilities()["limits"]["maximum"] == 25
+    assert provider.capabilities()["sources"] == ["home", "profile", "search"]
     assert provider.connection_status()["status"] == "verified_live"
     _record_status(configured, "expired")
     assert provider.connection_status()["status"] == "expired"
@@ -346,6 +359,60 @@ def test_prepare_and_passive_session_states(tmp_path):
     assert provider.connection_status()["status"] == "missing"
     with pytest.raises(InvalidRequestError, match="does not match"):
         provider.prepare(request(), {**plan, "sourceUrl": "https://example.invalid"})
+
+
+@pytest.mark.parametrize(
+    ("source_type", "source_value", "normalized", "destination"),
+    [
+        ("profile", "https://x.com/OpenAI", "openai", "https://x.com/openai"),
+        (
+            "search",
+            "  cafe\u0301\n OR\tTea  ",
+            "café OR Tea",
+            "https://x.com/search?q=caf%C3%A9+OR+Tea&src=typed_query&f=live",
+        ),
+    ],
+)
+def test_profile_and_latest_search_use_only_derived_destinations(
+    tmp_path, source_type, source_value, normalized, destination
+):
+    lifecycle = FakeLifecycle([[article("1")]])
+    provider, _ = ready_provider(tmp_path, lifecycle)
+    collection = source_request(source_type, source_value)
+    plan = provider.prepare(collection)
+    captured = []
+
+    summary = provider.collect(
+        collection,
+        execution_plan=plan,
+        checkpoint={
+            "providerState": None,
+            "storedCount": 0,
+            "metadata": {"captureSegment": 0},
+        },
+        on_batch=lambda posts, state, metadata: (
+            captured.append((posts, state, metadata)) or len(posts)
+        ),
+        should_cancel=lambda: False,
+    )
+
+    assert plan["sourceValue"] == normalized
+    assert plan["sourceUrl"] == destination
+    assert lifecycle.page.url == destination
+    assert summary.completion_reason == "target_reached"
+    assert captured[-1][2]["stopReason"] == "target_reached"
+    assert {
+        key: captured[-1][2][key] for key in ("sourceKind", "sourceValue", "sourceUrl")
+    } == {
+        "sourceKind": source_type,
+        "sourceValue": normalized,
+        "sourceUrl": destination,
+    }
+
+    with pytest.raises(InvalidRequestError):
+        provider.prepare(collection, {**plan, "sourceUrl": "https://x.com/i/account"})
+    with pytest.raises(InvalidRequestError):
+        provider.prepare(replace(collection, source_value="https://x.com/i/account"))
 
 
 def test_virtualized_scans_deduplicate_and_persist_each_batch(tmp_path):
@@ -365,7 +432,11 @@ def test_virtualized_scans_deduplicate_and_persist_each_batch(tmp_path):
         should_cancel=lambda: False,
     )
 
-    assert [[post.post_id for post in batch[0]] for batch in batches] == [["1"], ["2"]]
+    assert [[post.post_id for post in batch[0]] for batch in batches] == [
+        ["1"],
+        ["2"],
+        [],
+    ]
     assert batches[-1][1]["seenPostIds"] == ["1", "2"]
     assert batches[-1][2]["scanIterations"] == 2
     assert lifecycle.page.scrolls == 1 and summary.completion_reason == "target_reached"
@@ -375,15 +446,21 @@ def test_no_progress_stops_after_immediate_empty_batches(tmp_path):
     lifecycle = FakeLifecycle([[article("1")]])
     provider, _ = ready_provider(tmp_path, lifecycle, no_progress_limit=2)
     sizes = []
+    metadata = []
     summary = provider.collect(
         request(3),
         execution_plan=provider.prepare(request(3)),
         checkpoint=checkpoint(),
-        on_batch=lambda posts, *_args: sizes.append(len(posts)) or len(posts),
+        on_batch=lambda posts, _state, item: (
+            sizes.append(len(posts)) or metadata.append(item) or len(posts)
+        ),
         should_cancel=lambda: False,
     )
 
-    assert sizes == [1, 0, 0]
+    assert sizes == [1, 0, 0, 0]
+    assert metadata[-1]["stopReason"] == "no_progress"
+    assert metadata[-1]["lastProgressElapsedMs"] is not None
+    assert metadata[-1]["stallDurationMs"] >= 0
     assert summary.partial and summary.completion_reason == "no_progress"
 
 

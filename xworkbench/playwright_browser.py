@@ -13,7 +13,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from .config import Settings
 from .errors import CollectionCancelled, CollectionError, CredentialError, InvalidRequestError
@@ -29,6 +29,8 @@ STATE_SCHEMA_VERSION = 1
 MAX_STATE_BYTES = 2 * 1024 * 1024
 PROGRESS_POLL_MS = 100
 PROGRESS_WAIT_MS = 2_000
+SYNC_CALL_MAX_MS = 5_000
+TELEMETRY_COUNT_MAX = 100_000
 BOUND_STATUSES = {
     "verified_live",
     "expired",
@@ -160,6 +162,19 @@ def _as_int(value: Any, default: int = 0) -> int:
     except (TypeError, ValueError):
         return default
     return result if result >= 0 else default
+
+
+def _source_url(request: CollectionRequest) -> str:
+    if request.source_type is SourceType.HOME:
+        return HOME_URL
+    if request.source_type is SourceType.PROFILE:
+        return f"https://x.com/{request.source_value}"
+    if request.source_type is SourceType.SEARCH:
+        query = urlencode(
+            (("q", request.source_value), ("src", "typed_query"), ("f", "live"))
+        )
+        return f"https://x.com/search?{query}"
+    raise InvalidRequestError("Browser capture source is unsupported.")
 
 
 def _status_identity(href: Any) -> tuple[str, str, str | None] | None:
@@ -641,7 +656,7 @@ class PlaywrightBrowserProvider:
             "provider": self.provider_id.value,
             "providerVersion": self.provider_version,
             "parserVersion": self.parser_version,
-            "sources": [SourceType.HOME.value],
+            "sources": [source.value for source in SourceType],
             "limits": {"minimum": 1, "default": 5, "maximum": 25},
             "confirmation": {"field": "confirmBrowserCapture", "kind": "browser_capture"},
             "headed": not self.settings.browser_headless,
@@ -703,12 +718,17 @@ class PlaywrightBrowserProvider:
         request: CollectionRequest,
         supplied_plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if (
-            request.provider is not self.provider_id
-            or request.source_type is not SourceType.HOME
-            or not 1 <= request.max_posts <= 25
-        ):
-            raise InvalidRequestError("Browser capture supports 1–25 Home-feed posts only.")
+        if request.provider is not self.provider_id or not 1 <= request.max_posts <= 25:
+            raise InvalidRequestError("Browser capture supports 1–25 visible posts only.")
+        try:
+            normalized_request = CollectionRequest.from_dict(request.to_dict())
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InvalidRequestError("Browser capture request is invalid.") from exc
+        if normalized_request != request:
+            raise InvalidRequestError(
+                "Browser capture requires a validated, normalized source."
+            )
+        source_url = _source_url(request)
         prepared_at = supplied_plan.get("preparedAt") if supplied_plan else utc_now()
         if not isinstance(prepared_at, str) or not prepared_at:
             raise InvalidRequestError("Browser execution plan is missing preparedAt.")
@@ -721,8 +741,9 @@ class PlaywrightBrowserProvider:
             "provider": self.provider_id.value,
             "providerVersion": self.provider_version,
             "parserVersion": self.parser_version,
-            "sourceKind": SourceType.HOME.value,
-            "sourceUrl": HOME_URL,
+            "sourceKind": request.source_type.value,
+            "sourceValue": request.source_value,
+            "sourceUrl": source_url,
             "targetPosts": request.max_posts,
             "preparedAt": prepared_at,
             "browserHeadless": self.settings.browser_headless,
@@ -791,7 +812,7 @@ class PlaywrightBrowserProvider:
         if "rate limit exceeded" in body or "you are over the rate limit" in body:
             return BrowserRateLimitedError("X rate-limited this browser capture.")
         if "something went wrong. try reloading" in body or "this page isn’t available" in body:
-            return BrowserUnavailableError("The X Home feed is currently unavailable.")
+            return BrowserUnavailableError("The X capture surface is currently unavailable.")
         return None
 
     def _raise_page_failure(self, page: Any) -> None:
@@ -804,13 +825,20 @@ class PlaywrightBrowserProvider:
             _record_status(self.settings, "manual_action_required")
         raise failure
 
-    def _project(self, page: Any) -> list[dict[str, Any]]:
+    def _project(
+        self,
+        page: Any,
+        should_cancel: Callable[[], bool],
+        deadline: float,
+        page_timeout: int,
+    ) -> list[dict[str, Any]]:
+        self._set_page_timeout(page, should_cancel, deadline, page_timeout)
         try:
             result = page.locator(ARTICLE_SELECTOR).evaluate_all(DOM_PROJECTION)
         except Exception as exc:
-            raise BrowserSchemaError("Visible Home-feed articles could not be read.") from exc
+            raise BrowserSchemaError("Visible X timeline articles could not be read.") from exc
         if not isinstance(result, list):
-            raise BrowserSchemaError("The X Home-feed article schema changed.")
+            raise BrowserSchemaError("The X timeline article schema changed.")
         return [item for item in result if isinstance(item, dict)]
 
     def _selector_drift_report(self, page: Any) -> dict[str, Any]:
@@ -882,6 +910,19 @@ class PlaywrightBrowserProvider:
         remaining = max(1, int((deadline - self._monotonic()) * 1_000))
         return min(remaining, cap) if cap is not None else remaining
 
+    def _set_page_timeout(
+        self,
+        page: Any,
+        should_cancel: Callable[[], bool],
+        deadline: float,
+        page_timeout: int,
+    ) -> int:
+        timeout = self._remaining_ms(
+            should_cancel, deadline, min(page_timeout, SYNC_CALL_MAX_MS)
+        )
+        page.set_default_timeout(timeout)
+        return timeout
+
     def _wait_for_first_article(
         self,
         page: Any,
@@ -905,7 +946,7 @@ class PlaywrightBrowserProvider:
             self._raise_page_failure(page)
         report = self._selector_drift_report(page)
         raise BrowserSchemaError(
-            "No visible Home-feed posts appeared before the bounded timeout. "
+            "No visible X timeline posts appeared before the bounded timeout. "
             f"Sanitized selector drift report: {json.dumps(report, separators=(',', ':'))}"
         ) from last_error
 
@@ -927,7 +968,7 @@ class PlaywrightBrowserProvider:
             budget -= interval
             self._check_stop(should_cancel, deadline)
             self._raise_page_failure(page)
-            projected = self._project(page)
+            projected = self._project(page, should_cancel, deadline, page_timeout)
             if self._projection_signature(projected) != previous:
                 return projected
         return projected
@@ -963,6 +1004,9 @@ class PlaywrightBrowserProvider:
                 "Saved browser state changed after preview; run xworkbench auth again."
             )
         loaded_digest = str(session["digest"])
+        source_kind = request.source_type.value
+        source_value = request.source_value
+        source_url = _source_url(request)
 
         prior = checkpoint.get("providerState")
         prior = prior if isinstance(prior, dict) else {}
@@ -973,8 +1017,13 @@ class PlaywrightBrowserProvider:
         }
         scans = _as_int(prior.get("scanIterations"))
         scrolls = _as_int(prior.get("scrollIterations"))
-        prior_segment = prior.get("captureSegment")
-        segment = _as_int(prior_segment) + 1 if prior_segment is not None else 0
+        checkpoint_metadata = checkpoint.get("metadata")
+        checkpoint_metadata = (
+            checkpoint_metadata if isinstance(checkpoint_metadata, dict) else {}
+        )
+        segment = min(
+            _as_int(checkpoint_metadata.get("captureSegment")), TELEMETRY_COUNT_MAX
+        )
         segment_scans = 0
         stored = _as_int(checkpoint.get("storedCount"))
         if stored >= request.max_posts:
@@ -983,7 +1032,9 @@ class PlaywrightBrowserProvider:
         timeout = max(1.0, float(self.settings.job_timeout_seconds))
         page_timeout = max(1, self.settings.page_timeout_ms)
         no_progress_limit = max(1, self.settings.no_progress_limit)
-        deadline = self._monotonic() + timeout
+        started_at = self._monotonic()
+        deadline = started_at + timeout
+        maximum_elapsed_ms = min(int(timeout * 1_000), 3_600_000)
         browser = context = page = None
         no_progress = 0
         callback_failure = None
@@ -1002,35 +1053,120 @@ class PlaywrightBrowserProvider:
             "media": 0,
         }
         drift_report = None
+        first_post_latency_ms = None
+        last_progress_elapsed_ms = None
+        scan_duration_ms = 0
+
+        def elapsed_ms() -> int:
+            return min(
+                maximum_elapsed_ms,
+                max(0, int((self._monotonic() - started_at) * 1_000)),
+            )
+
+        def bounded_count(value: int) -> int:
+            return min(max(0, value), TELEMETRY_COUNT_MAX)
+
+        def capture_metadata(stop_reason: str | None = None) -> dict[str, Any]:
+            elapsed = elapsed_ms()
+            last_progress = last_progress_elapsed_ms
+            evidence = {
+                field: {
+                    "present": bounded_count(present),
+                    "missing": bounded_count(max(0, parsed_cards - present)),
+                }
+                for field, present in coverage_fields.items()
+            }
+            metadata = {
+                "browserVersion": browser_version,
+                "providerVersion": self.provider_version,
+                "parserVersion": self.parser_version,
+                "sourceKind": source_kind,
+                "sourceValue": source_value,
+                "sourceUrl": source_url,
+                "scanIterations": bounded_count(scans),
+                "scrollIterations": bounded_count(scrolls),
+                "captureSegment": segment,
+                "segmentScanIterations": bounded_count(segment_scans),
+                "observedAt": observed_at,
+                "elapsedMs": elapsed,
+                "firstPostLatencyMs": first_post_latency_ms,
+                "lastProgressElapsedMs": last_progress,
+                "scanDurationMs": min(scan_duration_ms, maximum_elapsed_ms),
+                "stallDurationMs": min(
+                    max(0, elapsed - (last_progress if last_progress is not None else 0)),
+                    maximum_elapsed_ms,
+                ),
+                "stopReason": stop_reason,
+                "visibleCards": bounded_count(visible_cards),
+                "parsedCards": bounded_count(parsed_cards),
+                "duplicatePostIds": bounded_count(duplicate_ids),
+                "skippedCards": bounded_count(skipped_cards),
+                "skipReasons": {
+                    reason: bounded_count(count)
+                    for reason, count in sorted(skip_reasons.items())
+                },
+                "fieldCoverage": {
+                    field: {
+                        "present": evidence[field]["present"],
+                        "total": bounded_count(parsed_cards),
+                        "ratio": round(present / parsed_cards, 3)
+                        if parsed_cards
+                        else None,
+                    }
+                    for field, present in coverage_fields.items()
+                },
+                "fieldExtractionEvidence": evidence,
+            }
+            if drift_report and drift_report["candidates"]:
+                metadata["selectorDriftReport"] = drift_report
+            return metadata
+
+        def persist_batch(
+            posts: list[Post], state: dict[str, Any], metadata: dict[str, Any]
+        ) -> int:
+            nonlocal callback_failure
+            try:
+                return _as_int(on_batch(posts, state, metadata))
+            except Exception as exc:
+                callback_failure = exc
+                raise
+
         try:
             with (self._playwright_factory or _sync_playwright)() as playwright:
                 browser = playwright.chromium.launch(
                     headless=self.settings.browser_headless,
-                    timeout=self._remaining_ms(should_cancel, deadline),
+                    timeout=self._remaining_ms(
+                        should_cancel,
+                        deadline,
+                        min(page_timeout, SYNC_CALL_MAX_MS),
+                    ),
                 )
                 self._check_stop(should_cancel, deadline)
                 browser_version = str(getattr(browser, "version", "unknown"))
                 context = browser.new_context(storage_state=str(state_path))
                 self._check_stop(should_cancel, deadline)
                 page = context.new_page()
-                page.set_default_timeout(
-                    self._remaining_ms(should_cancel, deadline, page_timeout)
+                navigation_timeout = self._set_page_timeout(
+                    page, should_cancel, deadline, page_timeout
                 )
                 page.goto(
-                    HOME_URL,
+                    source_url,
                     wait_until="domcontentloaded",
-                    timeout=self._remaining_ms(should_cancel, deadline, page_timeout),
+                    timeout=navigation_timeout,
                 )
                 self._check_stop(should_cancel, deadline)
                 self._raise_page_failure(page)
                 self._wait_for_first_article(
                     page, should_cancel, deadline, page_timeout
                 )
-                projected = self._project(page)
+                projected = self._project(
+                    page, should_cancel, deadline, page_timeout
+                )
 
                 while stored < request.max_posts:
                     self._check_stop(should_cancel, deadline)
                     self._raise_page_failure(page)
+                    scan_started_at = self._monotonic()
                     observed_at = utc_now()
                     scans += 1
                     segment_scans += 1
@@ -1071,6 +1207,14 @@ class PlaywrightBrowserProvider:
                         if stored + len(posts) >= request.max_posts:
                             break
 
+                    now_elapsed_ms = elapsed_ms()
+                    scan_duration_ms = min(
+                        maximum_elapsed_ms,
+                        max(0, int((self._monotonic() - scan_started_at) * 1_000)),
+                    )
+                    if posts and first_post_latency_ms is None:
+                        first_post_latency_ms = now_elapsed_ms
+
                     if skipped_cards and drift_report is None:
                         drift_report = self._selector_drift_report(page)
 
@@ -1081,43 +1225,15 @@ class PlaywrightBrowserProvider:
                         "captureSegment": segment,
                         "segmentScanIterations": segment_scans,
                     }
-                    metadata = {
-                        "browserVersion": browser_version,
-                        "providerVersion": self.provider_version,
-                        "parserVersion": self.parser_version,
-                        "sourceKind": SourceType.HOME.value,
-                        "sourceUrl": HOME_URL,
-                        "scanIterations": scans,
-                        "scrollIterations": scrolls,
-                        "captureSegment": segment,
-                        "segmentScanIterations": segment_scans,
-                        "observedAt": observed_at,
-                        "visibleCards": visible_cards,
-                        "parsedCards": parsed_cards,
-                        "duplicatePostIds": duplicate_ids,
-                        "skippedCards": skipped_cards,
-                        "skipReasons": dict(sorted(skip_reasons.items())),
-                        "fieldCoverage": {
-                            field: {
-                                "present": present,
-                                "total": parsed_cards,
-                                "ratio": round(present / parsed_cards, 3)
-                                if parsed_cards
-                                else None,
-                            }
-                            for field, present in coverage_fields.items()
-                        },
-                    }
-                    if drift_report and drift_report["candidates"]:
-                        metadata["selectorDriftReport"] = drift_report
-                    try:
-                        added = _as_int(on_batch(posts, state, metadata))
-                    except Exception as exc:
-                        callback_failure = exc
-                        raise
+                    added = persist_batch(posts, state, capture_metadata())
                     stored += added
+                    if added:
+                        last_progress_elapsed_ms = elapsed_ms()
                     self._check_stop(should_cancel, deadline)
                     if stored >= request.max_posts:
+                        persist_batch(
+                            [], state, capture_metadata(stop_reason="target_reached")
+                        )
                         warning = self._refresh_state(context, state_path, loaded_digest)
                         return CollectionSummary(
                             warnings=[warning] if warning else [],
@@ -1126,6 +1242,7 @@ class PlaywrightBrowserProvider:
 
                     no_progress = 0 if posts and added else no_progress + 1
                     if no_progress >= no_progress_limit:
+                        persist_batch([], state, capture_metadata(stop_reason="no_progress"))
                         warnings = [
                             "Browser capture stopped after repeated scans found no new "
                             "unique post IDs."
@@ -1141,6 +1258,9 @@ class PlaywrightBrowserProvider:
                         )
                     self._check_stop(should_cancel, deadline)
                     scrolls += 1
+                    self._set_page_timeout(
+                        page, should_cancel, deadline, page_timeout
+                    )
                     page.evaluate(
                         "window.scrollBy(0, Math.max(400, window.innerHeight * 0.8))"
                     )

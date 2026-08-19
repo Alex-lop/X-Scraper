@@ -10,6 +10,7 @@ from xworkbench.config import Settings
 from xworkbench.errors import CollectionCancelled
 from xworkbench.models import CollectionRequest
 from xworkbench.playwright_browser import (
+    SYNC_CALL_MAX_MS,
     BrowserSessionInvalidError,
     PlaywrightBrowserProvider,
     _atomic_text,
@@ -247,6 +248,7 @@ class _Page:
         self.waits = []
         self.goto_timeout = None
         self.default_timeout = None
+        self.default_timeouts = []
         self.closed = False
 
     def locator(self, selector):
@@ -254,6 +256,7 @@ class _Page:
 
     def set_default_timeout(self, timeout):
         self.default_timeout = timeout
+        self.default_timeouts.append(timeout)
 
     def goto(self, _url, **kwargs):
         self.goto_timeout = kwargs["timeout"]
@@ -295,8 +298,8 @@ class _Lifecycle:
         return None
 
 
-def _ready_provider(tmp_path, lifecycle):
-    settings = _settings(tmp_path)
+def _ready_provider(tmp_path, lifecycle, **changes):
+    settings = _settings(tmp_path, **changes)
     _write_state(settings, {"cookies": [], "origins": []})
     _record_status(settings, "verified_live")
     return _provider(settings, lifecycle), settings
@@ -343,7 +346,12 @@ def test_progress_wait_is_cancel_aware_and_uses_bounded_polling(tmp_path):
 
 def test_collection_emits_segment_coverage_and_deadline_metadata(tmp_path):
     lifecycle = _Lifecycle()
-    provider, _ = _ready_provider(tmp_path, lifecycle)
+    provider, _ = _ready_provider(
+        tmp_path,
+        lifecycle,
+        job_timeout_seconds=60,
+        page_timeout_ms=30_000,
+    )
     request = _request()
     captured = []
 
@@ -351,7 +359,11 @@ def test_collection_emits_segment_coverage_and_deadline_metadata(tmp_path):
     summary = provider.collect(
         request,
         execution_plan=plan,
-        checkpoint={"providerState": {"captureSegment": 3}, "storedCount": 0},
+        checkpoint={
+            "providerState": {"captureSegment": 99},
+            "storedCount": 0,
+            "metadata": {"captureSegment": 4},
+        },
         on_batch=lambda posts, state, metadata: (
             captured.append((posts, state, metadata)) or len(posts)
         ),
@@ -359,6 +371,7 @@ def test_collection_emits_segment_coverage_and_deadline_metadata(tmp_path):
     )
 
     posts, state, metadata = captured[0]
+    terminal_metadata = captured[-1][2]
     assert summary.completion_reason == "target_reached"
     assert posts[0].like_count == 1_200 and posts[0].quote_count == 2_500
     assert posts[0].view_count == 3_000
@@ -370,9 +383,22 @@ def test_collection_emits_segment_coverage_and_deadline_metadata(tmp_path):
         "total": 1,
         "ratio": 1.0,
     }
+    assert metadata["fieldExtractionEvidence"]["viewCount"] == {
+        "present": 1,
+        "missing": 0,
+    }
     assert metadata["visibleCards"] == metadata["parsedCards"] == 1
-    assert 0 < lifecycle.launch_timeout <= 5_000
-    assert 0 < lifecycle.page.goto_timeout <= lifecycle.page.default_timeout <= 300
+    assert terminal_metadata["stopReason"] == "target_reached"
+    assert terminal_metadata["firstPostLatencyMs"] is not None
+    assert terminal_metadata["lastProgressElapsedMs"] is not None
+    assert all(
+        0 <= terminal_metadata[field] <= 60_000
+        for field in ("elapsedMs", "scanDurationMs", "stallDurationMs")
+    )
+    assert 0 < lifecycle.launch_timeout <= SYNC_CALL_MAX_MS
+    assert 0 < lifecycle.page.goto_timeout <= SYNC_CALL_MAX_MS
+    assert lifecycle.page.default_timeouts
+    assert all(0 < timeout <= SYNC_CALL_MAX_MS for timeout in lifecycle.page.default_timeouts)
 
 
 def test_selector_drift_report_is_sanitized_and_never_promoted(tmp_path):
