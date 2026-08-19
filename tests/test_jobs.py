@@ -408,6 +408,28 @@ class PersistenceProvider:
         return CollectionSummary(completion_reason="search_exhausted")
 
 
+class EventProvider:
+    provider_id = ProviderType.OFFICIAL_X_API
+    provider_version = 1
+
+    def collect(self, request, *, execution_plan, checkpoint, on_batch, should_cancel):
+        for post_id in ("event-1", "event-2"):
+            on_batch(
+                [
+                    Post(
+                        post_id,
+                        "event payload",
+                        "tester",
+                        f"https://x.com/tester/status/{post_id}",
+                        None,
+                    )
+                ],
+                None,
+                {},
+            )
+        return CollectionSummary(completion_reason="search_exhausted")
+
+
 def scheduled_plan(request, source, auth, label):
     return {
         **compile_request(request),
@@ -415,6 +437,35 @@ def scheduled_plan(request, source, auth, label):
         "schedulerAuth": auth,
         "schedulerLabel": label,
     }
+
+
+def prepared_batch_items(count, *, prefix="batch", same_route=False):
+    deadline = datetime.now(UTC) + timedelta(minutes=10)
+    handle = "".join(character for character in prefix if character.isalnum())[:10]
+    items = []
+    for index in range(count):
+        source = handle if same_route else f"{handle}{index % 5}"
+        auth = "batch-auth" if same_route else f"batch-auth-{index % 2}"
+        request = CollectionRequest.from_dict(
+            {"sourceType": "profile", "sourceValue": source, "maxPosts": 10}
+        )
+        items.append(
+            {
+                "request": request,
+                "execution_plan": scheduled_plan(request, source, auth, str(index)),
+                "priority": 0 if same_route else index % 3,
+                "auth_state_id": auth,
+                "idempotency_key": f"{prefix}-key-{index}",
+                "limits": {
+                    "maxPosts": 10,
+                    "deadlineSeconds": 600,
+                    "routeAlias": "direct",
+                    "maxConcurrency": 2,
+                },
+                "deadline_at": deadline,
+            }
+        )
+    return items
 
 
 def test_priority_fifo_and_round_robin_are_deterministic(tmp_path):
@@ -764,3 +815,143 @@ def test_queue_bound_and_isolated_factory_are_required(tmp_path):
 
     assert len(storage.list_jobs(100)) == 1
     assert service.metrics()["rejected"] == 1
+
+
+def test_batch_admission_retry_is_atomic_and_restart_drains_with_caps(tmp_path):
+    storage = Storage(tmp_path / "job-batch.db")
+    storage.initialize()
+    tracker = SchedulerTracker(delay=0.01)
+    items = prepared_batch_items(20)
+    admission = JobService(
+        storage,
+        SchedulingProvider(tracker),
+        start_worker=False,
+        max_workers=4,
+        max_queue=20,
+        provider_factory=lambda: SchedulingProvider(tracker),
+    )
+
+    job_ids = admission.submit_batch(items, batch_id="batch-20")
+    retried = admission.submit_batch(items, batch_id="batch-20")
+    metrics = admission.metrics()
+    admission.shutdown()
+
+    assert retried == job_ids
+    assert len(set(job_ids)) == len(storage.list_batch_jobs("batch-20")) == 20
+    assert metrics["submitted"] == metrics["deduplicated"] == 20
+
+    service = JobService(
+        storage,
+        SchedulingProvider(tracker),
+        start_worker=False,
+        max_workers=4,
+        max_queue=20,
+        provider_factory=lambda: SchedulingProvider(tracker),
+    )
+    service.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and service.metrics()["finished"] < 20:
+        threading.Event().wait(0.01)
+    assert service.metrics()["finished"] == 20
+    service.shutdown()
+    statuses = {job_id: storage.get_job(job_id)["status"] for job_id in job_ids}
+
+    assert set(statuses.values()) == {"succeeded"}
+    assert tracker.max_source == tracker.max_auth == 1
+    assert storage.queue_counts()["leased"] == 0
+
+
+def test_batch_queue_full_rolls_back_every_item(tmp_path):
+    storage = Storage(tmp_path / "batch-full.db")
+    storage.initialize()
+    service = JobService(
+        storage,
+        SchedulingProvider(SchedulerTracker()),
+        start_worker=False,
+        max_queue=2,
+    )
+
+    with pytest.raises(QueueFullError, match="queue is full"):
+        service.submit_batch(prepared_batch_items(3), batch_id="too-large")
+    metrics = service.metrics()
+    service.shutdown()
+
+    assert storage.list_batch_jobs("too-large") == []
+    assert metrics["queueDepth"] == metrics["submitted"] == 0
+    assert metrics["rejected"] == 3
+
+
+def test_cancel_remaining_batch_preserves_terminal_snapshot(tmp_path):
+    storage = Storage(tmp_path / "batch-cancel.db")
+    storage.initialize()
+    tracker = SchedulerTracker(delay=0.1)
+    service = JobService(
+        storage,
+        SchedulingProvider(tracker),
+        start_worker=False,
+        max_workers=2,
+        max_queue=5,
+        provider_factory=lambda: SchedulingProvider(tracker),
+    )
+    job_ids = service.submit_batch(
+        prepared_batch_items(5, prefix="cancel-batch", same_route=True),
+        batch_id="cancel-batch",
+    )
+    service.start()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if storage.get_job(job_ids[0])["status"] == "succeeded":
+            break
+        threading.Event().wait(0.005)
+    assert storage.get_job(job_ids[0])["status"] == "succeeded"
+
+    assert service.cancel_remaining("cancel-batch") == 4
+    statuses = wait_for_jobs(storage, job_ids)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.metrics()["finished"] < 5:
+        threading.Event().wait(0.005)
+    service.shutdown()
+
+    assert statuses[job_ids[0]] == "succeeded"
+    assert all(statuses[job_id] == "cancelled" for job_id in job_ids[1:])
+    assert storage.get_job(job_ids[0])["completion_reason"] == "search_exhausted"
+    assert service.metrics()["finished"] == 5
+
+
+def test_progress_events_are_bounded_coalesced_and_fall_back_to_durable_state(
+    tmp_path,
+):
+    storage = Storage(tmp_path / "events.db")
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "profile", "sourceValue": "events", "maxPosts": 10}
+    )
+    service = JobService(
+        storage,
+        EventProvider(),
+        start_worker=False,
+        event_capacity=3,
+    )
+    job_id = service.submit(request, compile_request(request))
+    service.start()
+    assert wait_for_jobs(storage, [job_id]) == {job_id: "succeeded"}
+    snapshot = service.events(0)
+    current = service.events(snapshot["lastSequence"])
+    metrics = service.metrics()
+    service.shutdown()
+
+    assert [event["sequence"] for event in snapshot["events"]] == [2, 4, 5]
+    assert [event["type"] for event in snapshot["events"]] == [
+        "started",
+        "persisted",
+        "terminal",
+    ]
+    assert snapshot["events"][1]["count"] == 2
+    assert snapshot["gap"] is True
+    assert snapshot["jobs"][0]["id"] == job_id
+    assert snapshot["jobs"][0]["status"] == "succeeded"
+    assert current["events"] == [] and current["gap"] is False
+    assert metrics["eventBufferCapacity"] == metrics["eventBufferSize"] == 3
+    assert metrics["eventLastSequence"] == 5
+    assert metrics["eventDropped"] == metrics["eventCoalesced"] == 1
+    assert all("event payload" not in repr(event) for event in snapshot["events"])

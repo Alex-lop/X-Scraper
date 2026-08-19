@@ -89,6 +89,7 @@ class JobService:
         max_queue: int = 100,
         provider_factory: Callable[[], ProviderRegistry | CollectionProvider] | None = None,
         lease_seconds: int = 30,
+        event_capacity: int = 1_000,
     ):
         if isinstance(max_workers, bool) or not 1 <= max_workers <= 4:
             raise ValueError("max_workers must be between 1 and 4.")
@@ -98,6 +99,8 @@ class JobService:
             raise ValueError("max_workers above 1 requires an isolated provider_factory.")
         if isinstance(lease_seconds, bool) or not 1 <= lease_seconds <= 300:
             raise ValueError("lease_seconds must be between 1 and 300.")
+        if isinstance(event_capacity, bool) or not 1 <= event_capacity <= 10_000:
+            raise ValueError("event_capacity must be between 1 and 10,000.")
         self.storage = storage
         self.registry = (
             providers if isinstance(providers, ProviderRegistry) else ProviderRegistry([providers])
@@ -130,6 +133,10 @@ class JobService:
         self._persistence_active = 0
         self._persistence_waiting = 0
         self._max_persistence_backlog = 0
+        self._event_buffer: deque[dict[str, Any]] = deque(maxlen=event_capacity)
+        self._event_sequence = 0
+        self._event_dropped = 0
+        self._event_coalesced = 0
         self._threads: list[threading.Thread] = []
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -304,39 +311,135 @@ class JobService:
                 deadline_at=deadline_at or self._default_deadline(execution_plan),
             )
             job_id = admitted["job_id"]
-        with self._condition:
-            known_locally = bool(
-                job_id and (str(job_id) in self._pending_jobs or str(job_id) in self._active_jobs)
-            )
-        with self._storage_lock:
+            with self._condition:
+                known_locally = bool(
+                    job_id
+                    and (str(job_id) in self._pending_jobs or str(job_id) in self._active_jobs)
+                )
             existing = (
                 self.storage.get_job(str(job_id))
                 if admitted["result"] == "existing" and job_id and not known_locally
                 else None
             )
-        with self._condition:
-            if admitted["result"] == "queue_full" or not job_id:
-                self._rejected += 1
-                raise QueueFullError(ERROR_MESSAGES["queue_full"])
-            should_enqueue = admitted["result"] == "created" or bool(
-                existing and existing["status"] == JobStatus.QUEUED.value
-            )
+            with self._condition:
+                if admitted["result"] == "queue_full" or not job_id:
+                    self._rejected += 1
+                    raise QueueFullError(ERROR_MESSAGES["queue_full"])
+                should_enqueue = admitted["result"] == "created" or bool(
+                    existing and existing["status"] == JobStatus.QUEUED.value
+                )
+                if should_enqueue:
+                    self._enqueue_locked(str(job_id), priority, routing_source, auth_state_id)
+                if admitted["result"] == "existing":
+                    self._deduplicated += 1
+                else:
+                    self._submitted += 1
+                    self._emit_locked("admitted", str(job_id), status=JobStatus.QUEUED.value)
+                self._condition.notify_all()
+                return str(job_id)
+
+    def submit_batch(self, items: list[dict[str, Any]], *, batch_id: str) -> list[str]:
+        if self._shutdown:
+            raise RuntimeError("Job service is shutting down.")
+        batch_id = self._identifier(batch_id, "", "batch_id")
+        if not isinstance(items, list) or not 1 <= len(items) <= 100:
+            raise ValueError("items must contain 1 to 100 prepared jobs.")
+        allowed = {
+            "request",
+            "execution_plan",
+            "priority",
+            "source_id",
+            "auth_state_id",
+            "idempotency_key",
+            "limits",
+            "deadline_at",
+        }
+        required = {
+            "request",
+            "execution_plan",
+            "idempotency_key",
+            "limits",
+            "deadline_at",
+        }
+        prepared = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or not required <= set(item) or not set(item) <= allowed:
+                raise ValueError(f"Batch item {index} has invalid fields.")
+            request = item["request"]
+            plan = item["execution_plan"]
+            if not isinstance(request, CollectionRequest) or not isinstance(plan, dict):
+                raise ValueError(f"Batch item {index} is not prepared.")
+            priority = item.get("priority", 0)
             if (
-                should_enqueue
-                and str(job_id) not in self._pending_jobs
-                and str(job_id) not in self._active_jobs
+                isinstance(priority, bool)
+                or not isinstance(priority, int)
+                or not 0 <= priority <= 100
             ):
-                should_enqueue = True
-            else:
-                should_enqueue = False
-            if should_enqueue:
-                self._enqueue_locked(str(job_id), priority, routing_source, auth_state_id)
-            if admitted["result"] == "existing":
-                self._deduplicated += 1
-            else:
-                self._submitted += 1
-            self._condition.notify_all()
-            return str(job_id)
+                raise ValueError(f"Batch item {index} priority must be between 0 and 100.")
+            source_id = item.get("source_id")
+            if source_id is not None:
+                source_id = self._identifier(source_id, "", "source_id")
+            auth_state_id = self._identifier(
+                item.get("auth_state_id"),
+                f"provider:{request.provider.value}",
+                "auth_state_id",
+            )
+            idempotency_key = item.get("idempotency_key")
+            if idempotency_key is None:
+                raise ValueError(f"Batch item {index} idempotency_key is required.")
+            idempotency_key = self._identifier(idempotency_key, "", "idempotency_key")
+            limits = item["limits"]
+            if not isinstance(limits, dict):
+                raise ValueError(f"Batch item {index} limits must be an object.")
+            prepared.append(
+                {
+                    "request": request,
+                    "plan": dict(plan),
+                    "priority": priority,
+                    "source_id": source_id,
+                    "auth_state_id": auth_state_id,
+                    "idempotency_key": idempotency_key,
+                    "limits": dict(limits),
+                    "deadline_at": item["deadline_at"],
+                }
+            )
+
+        with self._storage_lock:
+            preview = self.storage.batch_preview_fingerprint(prepared, batch_id)
+            admitted = self.storage.admit_batch(
+                prepared,
+                queue_capacity=self.max_queue,
+                batch_id=batch_id,
+                approval_manifest={
+                    "approvedAt": datetime.now(UTC).isoformat(),
+                    "confirmation": True,
+                    "previewFingerprint": preview,
+                    "batchId": batch_id,
+                },
+            )
+            with self._condition:
+                if admitted["result"] == "queue_full":
+                    self._rejected += len(prepared)
+                    raise QueueFullError(ERROR_MESSAGES["queue_full"])
+                job_ids = []
+                for job in admitted["jobs"]:
+                    job_id = str(job["job_id"])
+                    job_ids.append(job_id)
+                    if job["status"] == JobStatus.QUEUED.value:
+                        self._enqueue_locked(
+                            job_id,
+                            job["priority"],
+                            job["source_id"],
+                            job["auth_state_id"],
+                            job["enqueue_sequence"],
+                        )
+                    if job["result"] == "existing":
+                        self._deduplicated += 1
+                    else:
+                        self._submitted += 1
+                        self._emit_locked("admitted", job_id, status=JobStatus.QUEUED.value)
+                self._condition.notify_all()
+                return job_ids
 
     def _job_routing(self, job_id: str) -> tuple[str, str]:
         try:
@@ -402,6 +505,32 @@ class JobService:
                     self._finished += 1
                     self._completed_by_status[JobStatus.CANCELLED.value] += 1
                 self._cancelled += 1
+                self._emit_locked("cancelled", job_id, status=JobStatus.CANCELLED.value)
+                self._condition.notify_all()
+        return cancelled
+
+    def cancel_remaining(self, batch_id: str) -> int:
+        batch_id = self._identifier(batch_id, "", "batch_id")
+        with self._storage_lock:
+            candidates = {
+                job["id"]
+                for job in self.storage.list_batch_jobs(batch_id)
+                if job["status"]
+                in {
+                    JobStatus.QUEUED.value,
+                    JobStatus.RUNNING.value,
+                    JobStatus.WAITING.value,
+                }
+            }
+            cancelled = self.storage.cancel_batch(batch_id)
+        if cancelled:
+            with self._condition:
+                for job_id in candidates:
+                    if self._remove_pending_locked(job_id):
+                        self._finished += 1
+                        self._completed_by_status[JobStatus.CANCELLED.value] += 1
+                    self._emit_locked("cancelled", job_id, status=JobStatus.CANCELLED.value)
+                self._cancelled += cancelled
                 self._condition.notify_all()
         return cancelled
 
@@ -460,6 +589,67 @@ class JobService:
                 return item
         return None
 
+    def _emit_locked(
+        self,
+        event_type: str,
+        job_id: str,
+        *,
+        status: str | None = None,
+        count: int | None = None,
+    ) -> None:
+        self._event_sequence += 1
+        event: dict[str, Any] = {
+            "sequence": self._event_sequence,
+            "type": event_type,
+            "jobId": job_id,
+        }
+        if status is not None:
+            event["status"] = status
+        if count is not None:
+            event["count"] = count
+        if (
+            event_type == "persisted"
+            and self._event_buffer
+            and self._event_buffer[-1]["type"] == "persisted"
+            and self._event_buffer[-1]["jobId"] == job_id
+        ):
+            event["count"] = self._event_buffer[-1].get("count", 0) + (count or 0)
+            self._event_buffer[-1] = event
+            self._event_coalesced += 1
+            return
+        if len(self._event_buffer) == self._event_buffer.maxlen:
+            self._event_dropped += 1
+        self._event_buffer.append(event)
+
+    def events(self, after_sequence: int = 0) -> dict[str, Any]:
+        if (
+            isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or after_sequence < 0
+        ):
+            raise ValueError("after_sequence must be a nonnegative integer.")
+        with self._condition:
+            events = [
+                dict(event) for event in self._event_buffer if event["sequence"] > after_sequence
+            ]
+            last_sequence = self._event_sequence
+            previous = after_sequence
+            gap = False
+            for event in events:
+                if event["sequence"] != previous + 1:
+                    gap = True
+                previous = event["sequence"]
+            if after_sequence < last_sequence and not events:
+                gap = True
+        with self._storage_lock:
+            jobs = self.storage.list_jobs(100)
+        return {
+            "events": events,
+            "jobs": jobs,
+            "lastSequence": last_sequence,
+            "gap": gap,
+        }
+
     @staticmethod
     def _percentile(samples: deque[float], percentile: float) -> float | None:
         if not samples:
@@ -492,6 +682,11 @@ class JobService:
                 "persistenceActive": self._persistence_active,
                 "persistenceWaiting": self._persistence_waiting,
                 "maxPersistenceBacklog": self._max_persistence_backlog,
+                "eventBufferCapacity": self._event_buffer.maxlen,
+                "eventBufferSize": len(self._event_buffer),
+                "eventLastSequence": self._event_sequence,
+                "eventDropped": self._event_dropped,
+                "eventCoalesced": self._event_coalesced,
             }
 
     @staticmethod
@@ -624,6 +819,8 @@ class JobService:
             return
         if not job:
             return
+        with self._condition:
+            self._emit_locked("started", job_id, status=JobStatus.RUNNING.value)
         if not job.get("stored_metadata_valid", True):
             self._fail_job(
                 job_id,
@@ -649,7 +846,10 @@ class JobService:
                         self._persistence_active += 1
                         activated = True
                     try:
-                        return self.storage.add_posts(job_id, posts, provider_state, metadata)
+                        added = self.storage.add_posts(job_id, posts, provider_state, metadata)
+                        with self._condition:
+                            self._emit_locked("persisted", job_id, count=added)
+                        return added
                     finally:
                         with self._condition:
                             self._persistence_active -= 1
@@ -782,4 +982,12 @@ class JobService:
                     self._active_auth.discard(item.auth_id)
                     self._finished += 1
                     self._completed_by_status[status] += 1
+                    if status in {
+                        JobStatus.SUCCEEDED.value,
+                        JobStatus.FAILED.value,
+                        JobStatus.CANCELLED.value,
+                        JobStatus.INTERRUPTED.value,
+                        JobStatus.PARTIAL.value,
+                    }:
+                        self._emit_locked("terminal", item.job_id, status=status)
                     self._condition.notify_all()
