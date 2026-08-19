@@ -527,6 +527,47 @@ def source_definition(source_id="source-a", value="tester"):
     )
 
 
+def batch_items(count, *, prefix="batch", deadline=None):
+    deadline = deadline or datetime.now(UTC) + timedelta(minutes=10)
+    items = []
+    for index in range(count):
+        handle = f"{prefix.replace('-', '_')}{index}"[:15]
+        request = CollectionRequest.from_dict(
+            {
+                "sourceType": "profile",
+                "sourceValue": handle,
+                "maxPosts": 10,
+            }
+        )
+        items.append(
+            {
+                "request": request,
+                "plan": compile_request(request),
+                "priority": index % 3,
+                "source_id": None,
+                "auth_state_id": f"auth-{index}",
+                "idempotency_key": f"{prefix}-key-{index}",
+                "limits": {
+                    "maxPosts": 10,
+                    "deadlineSeconds": 600,
+                    "routeAlias": "direct",
+                    "maxConcurrency": 2,
+                },
+                "deadline_at": deadline,
+            }
+        )
+    return items
+
+
+def batch_manifest(storage, items, batch_id):
+    return {
+        "approvedAt": datetime.now(UTC).isoformat(),
+        "confirmation": True,
+        "previewFingerprint": storage.batch_preview_fingerprint(items, batch_id),
+        "batchId": batch_id,
+    }
+
+
 def completed_snapshot(storage, request=None, *, source_id=None, text="alpha evidence"):
     request = request or collection()
     plan = (
@@ -650,6 +691,154 @@ def test_fts_search_is_literal_isolated_time_bounded_and_purged_with_retention(t
     assert storage.get_snapshot(first) is None
     retained = storage.search_post_evidence("alpha", source_ids=[source_a.source_id])
     assert [row["snapshot_id"] for row in retained] == [second]
+
+
+def test_batch_preview_is_order_sensitive_and_dict_key_canonical(tmp_path):
+    storage = Storage(tmp_path / "batch-preview.db")
+    storage.initialize()
+    items = batch_items(2)
+    original = storage.batch_preview_fingerprint(items, "batch-preview")
+    reordered_keys = [dict(reversed(list(item.items()))) for item in items]
+    reordered_keys[0]["plan"] = dict(reversed(list(items[0]["plan"].items())))
+    reordered_keys[0]["limits"] = dict(reversed(list(items[0]["limits"].items())))
+
+    assert storage.batch_preview_fingerprint(reordered_keys, "batch-preview") == original
+    assert storage.batch_preview_fingerprint(list(reversed(items)), "batch-preview") != original
+    manifest = batch_manifest(storage, items, "batch-preview")
+    for change in (
+        {"confirmation": False},
+        {"approvedAt": "not-a-time"},
+        {"batchId": "wrong"},
+        {"previewFingerprint": "v1:" + "0" * 64},
+    ):
+        with pytest.raises(ValueError):
+            storage.admit_batch(
+                items,
+                queue_capacity=2,
+                batch_id="batch-preview",
+                approval_manifest={**manifest, **change},
+            )
+    assert storage.list_batch_jobs("batch-preview") == []
+
+
+def test_batch_admission_is_atomic_for_twenty_and_retry_idempotent(tmp_path):
+    storage = Storage(tmp_path / "batch.db")
+    storage.initialize()
+    items = batch_items(20)
+    manifest = batch_manifest(storage, items, "batch-20")
+
+    admitted = storage.admit_batch(
+        items,
+        queue_capacity=20,
+        batch_id="batch-20",
+        approval_manifest=manifest,
+    )
+    assert admitted["result"] == "admitted"
+    assert len(admitted["jobs"]) == 20
+    assert {job["result"] for job in admitted["jobs"]} == {"created"}
+    assert [job["enqueue_sequence"] for job in admitted["jobs"]] == list(range(1, 21))
+    assert all(job["status"] == "queued" and job["source_id"] for job in admitted["jobs"])
+
+    retry_manifest = {
+        **manifest,
+        "approvedAt": (
+            datetime.fromisoformat(manifest["approvedAt"]) + timedelta(seconds=1)
+        ).isoformat(),
+    }
+    retried = storage.admit_batch(
+        items,
+        queue_capacity=0,
+        batch_id="batch-20",
+        approval_manifest=retry_manifest,
+    )
+    assert [job["job_id"] for job in retried["jobs"]] == [
+        job["job_id"] for job in admitted["jobs"]
+    ]
+    assert {job["result"] for job in retried["jobs"]} == {"existing"}
+
+    rejected_items = batch_items(20, prefix="rejected")
+    rejected = storage.admit_batch(
+        rejected_items,
+        queue_capacity=39,
+        batch_id="batch-rejected",
+        approval_manifest=batch_manifest(storage, rejected_items, "batch-rejected"),
+    )
+    assert rejected == {"result": "queue_full", "jobs": []}
+    assert storage.list_batch_jobs("batch-rejected") == []
+
+
+def test_batch_validation_and_database_failure_roll_back_every_item(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "batch-rollback.db")
+    storage.initialize()
+    saved = source_definition()
+    storage.save_source(saved)
+    invalid = batch_items(2, prefix="invalid")
+    invalid[0]["request"] = collection()
+    invalid[0]["plan"] = compile_request(collection())
+    invalid[0]["source_id"] = saved.source_id
+    invalid[1]["source_id"] = saved.source_id
+    manifest = batch_manifest(storage, invalid, "invalid-batch")
+    with pytest.raises(ValueError, match="Saved source"):
+        storage.admit_batch(
+            invalid,
+            queue_capacity=10,
+            batch_id="invalid-batch",
+            approval_manifest=manifest,
+        )
+    assert storage.list_batch_jobs("invalid-batch") == []
+
+    duplicates = batch_items(2, prefix="duplicate")
+    duplicates[1]["idempotency_key"] = duplicates[0]["idempotency_key"]
+    with pytest.raises(ValueError, match="repeated with a different"):
+        storage.admit_batch(
+            duplicates,
+            queue_capacity=10,
+            batch_id="duplicate-batch",
+            approval_manifest=batch_manifest(storage, duplicates, "duplicate-batch"),
+        )
+    assert storage.list_batch_jobs("duplicate-batch") == []
+
+    identical = batch_items(1, prefix="identical")
+    identical.append(dict(identical[0]))
+    duplicate_result = storage.admit_batch(
+        identical,
+        queue_capacity=1,
+        batch_id="identical-batch",
+        approval_manifest=batch_manifest(storage, identical, "identical-batch"),
+    )
+    assert [job["result"] for job in duplicate_result["jobs"]] == [
+        "created",
+        "existing",
+    ]
+    assert len({job["job_id"] for job in duplicate_result["jobs"]}) == 1
+
+    items = batch_items(2, prefix="db-failure")
+    manifest = batch_manifest(storage, items, "db-failure")
+    original_insert = Storage._insert_admission
+    calls = 0
+
+    def fail_second(connection, prepared, *, job_id, sequence, now):
+        nonlocal calls
+        calls += 1
+        original_insert(
+            connection,
+            prepared,
+            job_id=job_id,
+            sequence=sequence,
+            now=now,
+        )
+        if calls == 2:
+            raise sqlite3.OperationalError("injected batch failure")
+
+    monkeypatch.setattr(Storage, "_insert_admission", staticmethod(fail_second))
+    with pytest.raises(sqlite3.OperationalError, match="injected batch failure"):
+        storage.admit_batch(
+            items,
+            queue_capacity=10,
+            batch_id="db-failure",
+            approval_manifest=manifest,
+        )
+    assert storage.list_batch_jobs("db-failure") == []
 
 
 def test_durable_admission_fair_leases_owner_scope_and_recovery(tmp_path):
@@ -776,6 +965,14 @@ def test_repeated_context_connections_close_under_a_low_fd_limit(tmp_path):
         pytest.skip("descriptor accounting is unavailable")
     storage = Storage(tmp_path / "fds.db")
     storage.initialize()
+    items = batch_items(1, prefix="fd-batch")
+    manifest = batch_manifest(storage, items, "fd-batch")
+    storage.admit_batch(
+        items,
+        queue_capacity=1,
+        batch_id="fd-batch",
+        approval_manifest=manifest,
+    )
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     baseline = len(list(descriptors.iterdir()))
     lowered = min(soft, max(64, baseline + 32))
@@ -784,6 +981,13 @@ def test_repeated_context_connections_close_under_a_low_fd_limit(tmp_path):
         for _ in range(100):
             _create_job(storage)
             storage.list_attempts(1)
+            retried = storage.admit_batch(
+                items,
+                queue_capacity=0,
+                batch_id="fd-batch",
+                approval_manifest=manifest,
+            )
+            assert retried["jobs"][0]["result"] == "existing"
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 

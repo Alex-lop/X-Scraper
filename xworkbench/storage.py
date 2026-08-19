@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -46,6 +47,16 @@ DEFAULT_STALE_AFTER_SECONDS = 86_400
 MAX_DEADLINE_SECONDS = 31_536_000
 APPROVAL_KEYS = {"approvedAt", "confirmation", "previewFingerprint", "batchId"}
 LIMIT_KEYS = {"maxPosts", "deadlineSeconds", "routeAlias", "maxConcurrency"}
+BATCH_ITEM_KEYS = {
+    "request",
+    "plan",
+    "priority",
+    "source_id",
+    "auth_state_id",
+    "idempotency_key",
+    "limits",
+    "deadline_at",
+}
 SECRET_KEY_PARTS = (
     "authorization",
     "bearer",
@@ -1026,12 +1037,20 @@ class Storage:
         ).fetchone()
         return int(row[0])
 
-    def _admit_job(
+    @staticmethod
+    def _validate_queue_capacity(queue_capacity: int) -> None:
+        if (
+            isinstance(queue_capacity, bool)
+            or not isinstance(queue_capacity, int)
+            or queue_capacity < 0
+        ):
+            raise ValueError("queue_capacity must be a nonnegative integer.")
+
+    def _prepare_admission(
         self,
         request: CollectionRequest,
         plan: dict[str, Any],
         *,
-        queue_capacity: int,
         priority: int,
         source_id: str | None,
         auth_state_id: str,
@@ -1041,13 +1060,9 @@ class Storage:
         limits: dict[str, Any],
         deadline_at: str | datetime,
         stale_after_seconds: int,
-    ) -> dict[str, str | None]:
-        if (
-            isinstance(queue_capacity, bool)
-            or not isinstance(queue_capacity, int)
-            or queue_capacity < 0
-        ):
-            raise ValueError("queue_capacity must be a nonnegative integer.")
+    ) -> dict[str, Any]:
+        if not isinstance(request, CollectionRequest):
+            raise ValueError("request must be a CollectionRequest.")
         if (
             isinstance(priority, bool)
             or not isinstance(priority, int)
@@ -1080,99 +1095,190 @@ class Storage:
         source_value = source_fingerprint(request)
         request_value = request_fingerprint(request)
         parser_version = self._plan_parser_version(plan)
-        identity = (
-            request_json,
-            plan_json,
-            source_id,
-            source_value,
-            request_value,
-            priority,
-            batch_id,
-            auth_state_id,
-            approval_json,
-            limits_json,
-            deadline,
-            stale_after_seconds,
+        return {
+            "request": request,
+            "request_json": request_json,
+            "plan_json": plan_json,
+            "source_id": source_id,
+            "source_fingerprint": source_value,
+            "request_fingerprint": request_value,
+            "parser_version": parser_version,
+            "stale_after_seconds": stale_after_seconds,
+            "reuse_eligible": int(request.source_type is not SourceType.HOME),
+            "priority": priority,
+            "batch_id": batch_id,
+            "idempotency_key": idempotency_key,
+            "auth_state_id": auth_state_id,
+            "approval_json": approval_json,
+            "limits_json": limits_json,
+            "deadline_at": deadline,
+        }
+
+    @staticmethod
+    def _admission_identity(prepared: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(
+            prepared[name]
+            for name in (
+                "request_json",
+                "plan_json",
+                "source_id",
+                "source_fingerprint",
+                "request_fingerprint",
+                "priority",
+                "batch_id",
+                "auth_state_id",
+                "approval_json",
+                "limits_json",
+                "deadline_at",
+                "stale_after_seconds",
+            )
         )
-        now = utc_now()
+
+    @staticmethod
+    def _row_admission_identity(row: sqlite3.Row) -> tuple[Any, ...]:
+        return tuple(
+            row[name]
+            for name in (
+                "request_json",
+                "compiled_request_json",
+                "source_id",
+                "source_fingerprint",
+                "request_fingerprint",
+                "queue_priority",
+                "batch_id",
+                "auth_state_id",
+                "approval_json",
+                "limits_json",
+                "deadline_at",
+                "stale_after_seconds",
+            )
+        )
+
+    def _existing_admission(
+        self, connection: sqlite3.Connection, prepared: dict[str, Any]
+    ) -> sqlite3.Row | None:
+        key = prepared["idempotency_key"]
+        if key is None:
+            return None
+        row = connection.execute(
+            "SELECT * FROM jobs WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        if row and self._row_admission_identity(row) != self._admission_identity(prepared):
+            raise ValueError("idempotency_key was already used for a different job.")
+        return row
+
+    @staticmethod
+    def _validate_admission_source(
+        connection: sqlite3.Connection, prepared: dict[str, Any]
+    ) -> None:
+        source_id = prepared["source_id"]
+        if source_id is None:
+            return
+        source = connection.execute(
+            "SELECT source_fingerprint FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()
+        if not source or source["source_fingerprint"] != prepared["source_fingerprint"]:
+            raise ValueError("Saved source does not match the collection request.")
+
+    @staticmethod
+    def _insert_admission(
+        connection: sqlite3.Connection,
+        prepared: dict[str, Any],
+        *,
+        job_id: str,
+        sequence: int,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                id, request_json, compiled_request_json, status,
+                source_id, source_fingerprint, request_fingerprint, parser_version,
+                stale_after_seconds, reuse_eligible, queue_priority,
+                enqueue_sequence, batch_id, idempotency_key, auth_state_id,
+                approval_json, limits_json, deadline_at, created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                job_id,
+                prepared["request_json"],
+                prepared["plan_json"],
+                prepared["source_id"],
+                prepared["source_fingerprint"],
+                prepared["request_fingerprint"],
+                prepared["parser_version"],
+                prepared["stale_after_seconds"],
+                prepared["reuse_eligible"],
+                prepared["priority"],
+                sequence,
+                prepared["batch_id"],
+                prepared["idempotency_key"],
+                prepared["auth_state_id"],
+                prepared["approval_json"],
+                prepared["limits_json"],
+                prepared["deadline_at"],
+                now,
+                now,
+            ),
+        )
+        if prepared["source_id"] is not None:
+            connection.execute(
+                "UPDATE sources SET last_status = 'queued' WHERE id = ?",
+                (prepared["source_id"],),
+            )
+
+    def _admit_job(
+        self,
+        request: CollectionRequest,
+        plan: dict[str, Any],
+        *,
+        queue_capacity: int,
+        priority: int,
+        source_id: str | None,
+        auth_state_id: str,
+        batch_id: str | None,
+        idempotency_key: str | None,
+        approval: dict[str, Any],
+        limits: dict[str, Any],
+        deadline_at: str | datetime,
+        stale_after_seconds: int,
+    ) -> dict[str, str | None]:
+        self._validate_queue_capacity(queue_capacity)
+        prepared = self._prepare_admission(
+            request,
+            plan,
+            priority=priority,
+            source_id=source_id,
+            auth_state_id=auth_state_id,
+            batch_id=batch_id,
+            idempotency_key=idempotency_key,
+            approval=approval,
+            limits=limits,
+            deadline_at=deadline_at,
+            stale_after_seconds=stale_after_seconds,
+        )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if idempotency_key is not None:
-                existing = connection.execute(
-                    "SELECT * FROM jobs WHERE idempotency_key = ?", (idempotency_key,)
-                ).fetchone()
-                if existing:
-                    existing_identity = (
-                        existing["request_json"],
-                        existing["compiled_request_json"],
-                        existing["source_id"],
-                        existing["source_fingerprint"],
-                        existing["request_fingerprint"],
-                        existing["queue_priority"],
-                        existing["batch_id"],
-                        existing["auth_state_id"],
-                        existing["approval_json"],
-                        existing["limits_json"],
-                        existing["deadline_at"],
-                        existing["stale_after_seconds"],
-                    )
-                    if existing_identity != identity:
-                        raise ValueError(
-                            "idempotency_key was already used for a different job."
-                        )
-                    return {"result": "existing", "job_id": existing["id"]}
+            existing = self._existing_admission(connection, prepared)
+            if existing:
+                return {"result": "existing", "job_id": existing["id"]}
             active = connection.execute(
                 "SELECT COUNT(*) FROM jobs "
                 "WHERE status IN ('queued', 'running', 'waiting')"
             ).fetchone()[0]
             if active >= queue_capacity:
                 return {"result": "queue_full", "job_id": None}
-            if source_id is not None:
-                source = connection.execute(
-                    "SELECT source_fingerprint FROM sources WHERE id = ?", (source_id,)
-                ).fetchone()
-                if not source or source["source_fingerprint"] != source_value:
-                    raise ValueError("Saved source does not match the collection request.")
+            self._validate_admission_source(connection, prepared)
             job_id = uuid.uuid4().hex
-            sequence = self._next_enqueue_sequence(connection)
-            connection.execute(
-                """
-                INSERT INTO jobs (
-                    id, request_json, compiled_request_json, status,
-                    source_id, source_fingerprint, request_fingerprint, parser_version,
-                    stale_after_seconds, reuse_eligible, queue_priority,
-                    enqueue_sequence, batch_id, idempotency_key, auth_state_id,
-                    approval_json, limits_json, deadline_at, created_at, updated_at
-                ) VALUES (
-                    ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                """,
-                (
-                    job_id,
-                    request_json,
-                    plan_json,
-                    source_id,
-                    source_value,
-                    request_value,
-                    parser_version,
-                    stale_after_seconds,
-                    int(request.source_type is not SourceType.HOME),
-                    priority,
-                    sequence,
-                    batch_id,
-                    idempotency_key,
-                    auth_state_id,
-                    approval_json,
-                    limits_json,
-                    deadline,
-                    now,
-                    now,
-                ),
+            self._insert_admission(
+                connection,
+                prepared,
+                job_id=job_id,
+                sequence=self._next_enqueue_sequence(connection),
+                now=utc_now(),
             )
-            if source_id is not None:
-                connection.execute(
-                    "UPDATE sources SET last_status = 'queued' WHERE id = ?", (source_id,)
-                )
         return {"result": "created", "job_id": job_id}
 
     def admit_job(
@@ -1204,6 +1310,245 @@ class Storage:
             deadline_at=deadline_at,
             stale_after_seconds=DEFAULT_STALE_AFTER_SECONDS,
         )
+
+    def _prepare_batch_items(
+        self, items: list[dict[str, Any]], *, batch_id: str
+    ) -> list[dict[str, Any]]:
+        if not isinstance(items, list) or not 1 <= len(items) <= 100:
+            raise ValueError("items must contain 1–100 batch jobs.")
+        prepared = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or set(item) != BATCH_ITEM_KEYS:
+                raise ValueError(f"Batch item {index} has invalid fields.")
+            request = item["request"]
+            limits = item["limits"]
+            if not isinstance(request, CollectionRequest):
+                raise ValueError(f"Batch item {index} request is invalid.")
+            if item["idempotency_key"] is None:
+                raise ValueError(f"Batch item {index} idempotency_key is required.")
+            if not isinstance(limits, dict) or set(limits) != LIMIT_KEYS:
+                raise ValueError(f"Batch item {index} limits must be exact.")
+            if limits["maxPosts"] != request.max_posts:
+                raise ValueError(f"Batch item {index} maxPosts does not match its request.")
+            deadline_seconds = limits["deadlineSeconds"]
+            if (
+                isinstance(deadline_seconds, bool)
+                or not isinstance(deadline_seconds, int)
+                or not 1 <= deadline_seconds <= MAX_DEADLINE_SECONDS
+            ):
+                raise ValueError(f"Batch item {index} deadlineSeconds is invalid.")
+            concurrency = limits["maxConcurrency"]
+            if (
+                isinstance(concurrency, bool)
+                or not isinstance(concurrency, int)
+                or not 1 <= concurrency <= 4
+            ):
+                raise ValueError(f"Batch item {index} maxConcurrency is invalid.")
+            route_alias = limits["routeAlias"]
+            if not isinstance(route_alias, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", route_alias
+            ):
+                raise ValueError(f"Batch item {index} routeAlias is invalid.")
+            prepared.append(
+                self._prepare_admission(
+                    request,
+                    item["plan"],
+                    priority=item["priority"],
+                    source_id=item["source_id"],
+                    auth_state_id=item["auth_state_id"],
+                    batch_id=batch_id,
+                    idempotency_key=item["idempotency_key"],
+                    approval={},
+                    limits=limits,
+                    deadline_at=item["deadline_at"],
+                    stale_after_seconds=DEFAULT_STALE_AFTER_SECONDS,
+                )
+            )
+        return prepared
+
+    @classmethod
+    def _batch_fingerprint(
+        cls, prepared: list[dict[str, Any]], *, batch_id: str
+    ) -> str:
+        identities = []
+        for item in prepared:
+            request = item["request"]
+            limits = json.loads(item["limits_json"])
+            identities.append(
+                {
+                    "request": json.loads(item["request_json"]),
+                    "plan": json.loads(item["plan_json"]),
+                    "sourceFingerprint": item["source_fingerprint"],
+                    "requestFingerprint": item["request_fingerprint"],
+                    "destination": {
+                        "savedSourceId": item["source_id"],
+                        "provider": request.provider.value,
+                        "surface": request.source_type.value,
+                        "value": request.source_value,
+                    },
+                    "postLimit": request.max_posts,
+                    "deadlineAt": item["deadline_at"],
+                    "staleAfterSeconds": item["stale_after_seconds"],
+                    "reuseEligible": bool(item["reuse_eligible"]),
+                    "routeAlias": limits["routeAlias"],
+                    "priority": item["priority"],
+                    "authStateId": item["auth_state_id"],
+                    "idempotencyKey": item["idempotency_key"],
+                    "limits": limits,
+                }
+            )
+        canonical = cls._canonical_json(
+            {
+                "kind": "batch_preview",
+                "version": 1,
+                "batchId": batch_id,
+                "items": identities,
+            }
+        )
+        return f"v1:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+    def batch_preview_fingerprint(
+        self, items: list[dict[str, Any]], batch_id: str
+    ) -> str:
+        batch_id = self._queue_identifier(
+            batch_id, label="batch_id"
+        )  # type: ignore[assignment]
+        return self._batch_fingerprint(
+            self._prepare_batch_items(items, batch_id=batch_id), batch_id=batch_id
+        )
+
+    def admit_batch(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        queue_capacity: int,
+        batch_id: str,
+        approval_manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._validate_queue_capacity(queue_capacity)
+        batch_id = self._queue_identifier(
+            batch_id, label="batch_id"
+        )  # type: ignore[assignment]
+        if not isinstance(approval_manifest, dict) or set(approval_manifest) != APPROVAL_KEYS:
+            raise ValueError("approval_manifest must contain exactly the public approval fields.")
+        approval_json = self._public_record(
+            approval_manifest, allowed=APPROVAL_KEYS, label="approval_manifest"
+        )
+        if approval_manifest["confirmation"] is not True:
+            raise ValueError("approval_manifest confirmation must be true.")
+        if approval_manifest["batchId"] != batch_id:
+            raise ValueError("approval_manifest batchId does not match batch_id.")
+        self._time_filter(approval_manifest["approvedAt"], label="approvedAt")
+        prepared = self._prepare_batch_items(items, batch_id=batch_id)
+        expected_preview = self._batch_fingerprint(prepared, batch_id=batch_id)
+        if approval_manifest["previewFingerprint"] != expected_preview:
+            raise ValueError("approval_manifest previewFingerprint does not match the batch.")
+        for item in prepared:
+            item["approval_json"] = approval_json
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            prior_manifests = connection.execute(
+                "SELECT DISTINCT approval_json FROM jobs WHERE batch_id = ?", (batch_id,)
+            ).fetchall()
+            if prior_manifests:
+                expected_core = {
+                    key: approval_manifest[key]
+                    for key in APPROVAL_KEYS
+                    if key != "approvedAt"
+                }
+                stored_approval_json = prior_manifests[0]["approval_json"]
+                for row in prior_manifests:
+                    stored, valid = self._decode_json(row["approval_json"], dict)
+                    stored_core = {
+                        key: stored.get(key)
+                        for key in APPROVAL_KEYS
+                        if key != "approvedAt"
+                    }
+                    if (
+                        not valid
+                        or set(stored) != APPROVAL_KEYS
+                        or stored_core != expected_core
+                        or row["approval_json"] != stored_approval_json
+                    ):
+                        raise ValueError(
+                            "batch_id was already used with a different manifest."
+                        )
+                for item in prepared:
+                    item["approval_json"] = stored_approval_json
+
+            seen: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+            new_tokens: list[dict[str, Any]] = []
+            results: list[tuple[dict[str, Any], str]] = []
+            for item in prepared:
+                self._validate_admission_source(connection, item)
+                key = item["idempotency_key"]
+                if key is not None and key in seen:
+                    original, token = seen[key]
+                    if self._admission_identity(original) != self._admission_identity(item):
+                        raise ValueError(
+                            "idempotency_key was repeated with a different batch item."
+                        )
+                    results.append((token, "existing"))
+                    continue
+                existing = self._existing_admission(connection, item)
+                if existing:
+                    token = {"prepared": item, "row": existing}
+                    result = "existing"
+                else:
+                    token = {
+                        "prepared": item,
+                        "job_id": uuid.uuid4().hex,
+                    }
+                    result = "created"
+                    new_tokens.append(token)
+                if key is not None:
+                    seen[key] = (item, token)
+                results.append((token, result))
+
+            active = connection.execute(
+                "SELECT COUNT(*) FROM jobs "
+                "WHERE status IN ('queued', 'running', 'waiting')"
+            ).fetchone()[0]
+            if new_tokens and active + len(new_tokens) > queue_capacity:
+                return {"result": "queue_full", "jobs": []}
+
+            sequence = self._next_enqueue_sequence(connection)
+            now = utc_now()
+            for token in new_tokens:
+                token["sequence"] = sequence
+                self._insert_admission(
+                    connection,
+                    token["prepared"],
+                    job_id=token["job_id"],
+                    sequence=sequence,
+                    now=now,
+                )
+                sequence += 1
+
+            jobs = []
+            for token, result in results:
+                row = token.get("row")
+                item = token["prepared"]
+                job_id = row["id"] if row else token["job_id"]
+                stored_source = row["source_id"] if row else item["source_id"]
+                source_value = row["source_fingerprint"] if row else item["source_fingerprint"]
+                jobs.append(
+                    {
+                        "result": result,
+                        "job_id": job_id,
+                        "status": row["status"] if row else JobStatus.QUEUED.value,
+                        "priority": row["queue_priority"] if row else item["priority"],
+                        "enqueue_sequence": (
+                            row["enqueue_sequence"] if row else token["sequence"]
+                        ),
+                        "source_id": stored_source or source_value or job_id,
+                        "auth_state_id": (
+                            row["auth_state_id"] if row else item["auth_state_id"]
+                        ),
+                    }
+                )
+        return {"result": "admitted", "jobs": jobs}
 
     def create_job(
         self,
