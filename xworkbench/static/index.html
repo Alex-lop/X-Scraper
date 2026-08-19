@@ -50,6 +50,43 @@
       <p class="intro">Reopen a named Home, profile, or search surface without confusing it with a claim about all of X.</p>
       <div id="source-list" class="source-list" aria-live="polite"><p class="empty">Loading saved sources…</p></div>
       <p id="sources-note" class="fine"></p>
+      <section class="batch-planner" aria-labelledby="batch-title">
+        <div class="section-title">
+          <div><h3 id="batch-title">Capture several saved sources</h3><p class="fine">Select 2–25 server-saved sources. Previewing does not contact X or add work to the queue.</p></div>
+          <span class="pill neutral">Explicit batch approval</span>
+        </div>
+        <form id="batch-form">
+          <fieldset class="full">
+            <legend>Saved sources</legend>
+            <div id="batch-source-options" class="batch-source-options"><p class="empty">Loading saved sources…</p></div>
+          </fieldset>
+          <label>Browser Posts per source <input id="batch-browser-posts" type="number" min="1" max="25" value="5" required></label>
+          <label>Official API Posts per source <input id="batch-api-posts" type="number" min="10" max="500" value="10" required></label>
+          <label>Deadline per capture (seconds) <input id="batch-deadline" type="number" min="60" max="3600" value="120" required></label>
+          <label>Priority <input id="batch-priority" type="number" min="0" max="100" value="0" required></label>
+          <label class="full">Freshness choice <select id="batch-freshness"><option value="capture_fresh">Capture fresh snapshots; do not reuse implicitly</option></select></label>
+          <div id="batch-error" class="banner error full" role="alert" hidden></div>
+          <button id="batch-preview-button" class="primary full" type="submit">Preview selected saved sources</button>
+        </form>
+        <div id="batch-preview" class="preview" hidden>
+          <div class="section-title"><div><p class="eyebrow">Server-canonical manifest</p><h3>Review every queued capture</h3></div><span id="batch-preview-count" class="pill neutral"></span></div>
+          <p id="batch-preview-note" class="fine" aria-live="polite"></p>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="Batch capture preview table">
+            <table>
+              <thead><tr><th scope="col">Order</th><th scope="col">Saved source</th><th scope="col">Exact destination</th><th scope="col">Posts</th><th scope="col">Deadline</th><th scope="col">Freshness</th><th scope="col">Route</th><th scope="col">Priority</th></tr></thead>
+              <tbody id="batch-preview-rows"></tbody>
+            </table>
+          </div>
+          <div id="batch-confirm-error" class="banner error" role="alert" hidden></div>
+          <div class="actions"><button id="batch-confirm-button" class="primary" type="button">Confirm identical batch manifest</button><button id="batch-edit-button" type="button">Edit selection</button></div>
+        </div>
+        <div id="active-batch" class="preview" hidden>
+          <div class="section-title"><div><p class="eyebrow">Admitted batch</p><h3 id="active-batch-title">Batch queued</h3></div><button id="cancel-batch-button" class="danger" type="button">Cancel remaining batch</button></div>
+          <p id="batch-status" class="fine" aria-live="polite"></p>
+          <div id="batch-job-list" class="history"></div>
+          <div id="batch-cancel-error" class="banner error" role="alert" hidden></div>
+        </div>
+      </section>
     </section>
 
     <section id="capture" class="panel workflow-section" aria-labelledby="configure-title">

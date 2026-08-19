@@ -610,6 +610,82 @@ meter {
   margin-top: 0.55rem;
 }
 
+.batch-planner {
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--line);
+}
+
+.batch-source-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.55rem;
+  margin-top: 0.4rem;
+}
+
+.batch-source-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0 0.55rem;
+  align-items: center;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  cursor: pointer;
+}
+
+.batch-source-option input {
+  grid-row: 1 / 3;
+  accent-color: var(--blue);
+}
+
+.batch-source-option small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+th,
+td {
+  min-width: 7rem;
+  padding: 0.6rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+th {
+  color: var(--muted);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.batch-job {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+  align-items: center;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+}
+
+.batch-job .actions {
+  grid-column: 1 / -1;
+}
+
 .history-item {
   display: grid;
   width: 100%;
@@ -964,6 +1040,10 @@ pre,
   .analysis-grid,
   .comparison-controls,
   .agent-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .batch-job {
     grid-template-columns: 1fr;
   }
 

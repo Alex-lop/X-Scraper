@@ -32,6 +32,17 @@ export function barPercent(value, maximum) {
   return Math.max(0, Math.min(100, amount / ceiling * 100));
 }
 
+export function orderedBatchItems(manifest) {
+  const items = Array.isArray(manifest?.items) ? manifest.items : [];
+  return [...items].sort((left, right) => {
+    const leftOrder = Number.isInteger(left?.expectedQueueOrder)
+      ? left.expectedQueueOrder : Number.MAX_SAFE_INTEGER;
+    const rightOrder = Number.isInteger(right?.expectedQueueOrder)
+      ? right.expectedQueueOrder : Number.MAX_SAFE_INTEGER;
+    return leftOrder - rightOrder || String(left?.sourceId || "").localeCompare(String(right?.sourceId || ""));
+  });
+}
+
 export function authorKey(post) {
   return String(post.author_username || post.author_id || "");
 }

@@ -412,3 +412,71 @@ def test_retention_purge_is_explicit_local_and_bounded(tmp_path):
     assert purged.status_code == 200
     assert purged.get_json() == {"purgedCount": 2}
     assert client.get("/api/snapshots?limit=99").get_json()["pagination"]["count"] == 1
+
+
+def test_progress_poll_is_bounded_allowlisted_and_preserves_durable_truth(
+    tmp_path, monkeypatch
+):
+    client, storage, job_id = _completed_snapshot(tmp_path)
+    secret = "SENTINEL-PROGRESS-SECRET"
+    job = storage.get_job(job_id)
+    job["authorization"] = secret
+    jobs = client.application.extensions["xworkbench_jobs"]
+    monkeypatch.setattr(
+        jobs,
+        "events",
+        lambda _after: {
+            "events": [
+                {
+                    "sequence": 2,
+                    "type": "terminal",
+                    "jobId": job_id,
+                    "status": "succeeded",
+                    "count": 1,
+                    "postText": secret,
+                },
+                {
+                    "sequence": 4,
+                    "type": "admitted",
+                    "jobId": job_id,
+                    "status": "queued",
+                    "token": secret,
+                },
+                {
+                    "sequence": 5,
+                    "type": "secret-event",
+                    "jobId": job_id,
+                    "token": secret,
+                },
+            ],
+            "jobs": [job],
+            "lastSequence": 5,
+            "gap": True,
+            "token": secret,
+        },
+    )
+    response = client.get("/api/progress?after=0&limit=1")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["events"] == [
+        {
+            "sequence": 2,
+            "type": "terminal",
+            "jobId": job_id,
+            "status": "succeeded",
+            "count": 1,
+        }
+    ]
+    assert body["jobs"][0]["status"] == "succeeded"
+    assert body["gap"] is True
+    assert body["hasMore"] is True
+    assert body["lastSequence"] == 2
+    assert secret not in response.get_data(as_text=True)
+
+    for path in (
+        "/api/progress?after=-1",
+        "/api/progress?after=1%20OR%201=1",
+        "/api/progress?limit=101",
+        "/api/progress?secret=value",
+    ):
+        assert client.get(path).status_code == 400

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import hmac
 import io
 import ipaddress
 import json
 import math
+import secrets
 import sqlite3
 import unicodedata
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -43,6 +47,10 @@ HARD_WORKER_MAXIMUM = 4
 HARD_QUEUE_CAPACITY = 10_000
 PER_SOURCE_CONCURRENCY = 1
 PER_AUTH_STATE_CONCURRENCY = 1
+BATCH_LIMIT = 25
+BATCH_DEADLINE_MIN = 60
+BATCH_DEADLINE_MAX = 3_600
+BATCH_PREVIEW_SECONDS = 300
 
 COMMON_PROVENANCE_FIELDS = (
     "provider",
@@ -664,6 +672,11 @@ def _public_queue_metrics(
             "persistenceActive",
             "persistenceWaiting",
             "maxPersistenceBacklog",
+            "eventBufferCapacity",
+            "eventBufferSize",
+            "eventLastSequence",
+            "eventDropped",
+            "eventCoalesced",
         )
     }
     result.update(
@@ -697,6 +710,61 @@ def _public_queue_metrics(
     return result
 
 
+def _public_progress(value: Any, *, limit: int) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    raw_events = value.get("events")
+    safe_events = []
+    for event in raw_events if isinstance(raw_events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        sequence = event.get("sequence")
+        event_type = event.get("type")
+        job_id = event.get("jobId")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 0
+            or event_type
+            not in {"admitted", "started", "persisted", "cancelled", "terminal"}
+            or not isinstance(job_id, str)
+            or not SOURCE_ID_RE.fullmatch(job_id)
+        ):
+            continue
+        public = {"sequence": sequence, "type": event_type, "jobId": job_id}
+        status = event.get("status")
+        if status in JOB_STATUSES:
+            public["status"] = status
+        count = event.get("count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            public["count"] = count
+        safe_events.append(public)
+    safe_events.sort(key=lambda event: event["sequence"])
+    has_more = len(safe_events) > limit
+    safe_events = safe_events[:limit]
+    raw_last = value.get("lastSequence")
+    last_sequence = (
+        safe_events[-1]["sequence"]
+        if has_more and safe_events
+        else raw_last
+        if isinstance(raw_last, int) and not isinstance(raw_last, bool) and raw_last >= 0
+        else safe_events[-1]["sequence"]
+        if safe_events
+        else 0
+    )
+    raw_jobs = value.get("jobs")
+    return {
+        "events": safe_events,
+        "jobs": [
+            _public_job(job)
+            for job in (raw_jobs[:100] if isinstance(raw_jobs, list) else [])
+            if isinstance(job, dict)
+        ],
+        "lastSequence": last_sequence,
+        "gap": value.get("gap") is True,
+        "hasMore": has_more,
+    }
+
+
 def _submit_with_source(
     jobs: JobService,
     collection_request: CollectionRequest,
@@ -704,6 +772,86 @@ def _submit_with_source(
     source_id: str | None,
 ) -> str:
     return jobs.submit(collection_request, execution_plan, source_id=source_id)
+
+
+def _approval_digest(key: bytes, manifest: Any) -> str:
+    canonical = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hmac.new(key, canonical, hashlib.sha256).hexdigest()
+
+
+def _batch_request(saved_source: dict[str, Any], maximum_posts: Any) -> CollectionRequest:
+    return CollectionRequest.from_dict(
+        {
+            "provider": saved_source.get("provider"),
+            "sourceType": saved_source.get("surface"),
+            "sourceValue": saved_source.get("normalized_value"),
+            "maxPosts": maximum_posts,
+        }
+    )
+
+
+def _batch_preview_items(body: Any) -> tuple[list[dict[str, Any]], int, str]:
+    if not isinstance(body, dict):
+        raise InvalidRequestError("Request body must be a JSON object.")
+    allowed = {"items", "deadlineSeconds", "freshnessChoice"}
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        raise InvalidRequestError(f"Unknown batch preview field(s): {', '.join(unknown)}.")
+    items = body.get("items")
+    if not isinstance(items, list) or not 2 <= len(items) <= BATCH_LIMIT:
+        raise InvalidRequestError(
+            f"items must contain 2 to {BATCH_LIMIT} saved-source requests."
+        )
+    normalized = []
+    source_ids = set()
+    for position, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise InvalidRequestError(f"items[{position - 1}] must be an object.")
+        item_unknown = sorted(set(item) - {"sourceId", "maxPosts", "priority"})
+        if item_unknown:
+            raise InvalidRequestError(
+                f"Unknown items[{position - 1}] field(s): {', '.join(item_unknown)}."
+            )
+        source_id = item.get("sourceId")
+        if not isinstance(source_id, str) or not SOURCE_ID_RE.fullmatch(source_id):
+            raise InvalidRequestError(f"items[{position - 1}].sourceId is invalid.")
+        if source_id in source_ids:
+            raise InvalidRequestError("A saved source may appear only once in a batch.")
+        source_ids.add(source_id)
+        maximum_posts = item.get("maxPosts")
+        if isinstance(maximum_posts, bool) or not isinstance(maximum_posts, int):
+            raise InvalidRequestError(f"items[{position - 1}].maxPosts must be an integer.")
+        priority = item.get("priority", 0)
+        if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 100:
+            raise InvalidRequestError(
+                f"items[{position - 1}].priority must be between 0 and 100."
+            )
+        normalized.append(
+            {
+                "sourceId": source_id,
+                "maxPosts": maximum_posts,
+                "priority": priority,
+                "expectedQueueOrder": position,
+            }
+        )
+    deadline_seconds = body.get("deadlineSeconds", 120)
+    if (
+        isinstance(deadline_seconds, bool)
+        or not isinstance(deadline_seconds, int)
+        or not BATCH_DEADLINE_MIN <= deadline_seconds <= BATCH_DEADLINE_MAX
+    ):
+        raise InvalidRequestError(
+            f"deadlineSeconds must be between {BATCH_DEADLINE_MIN} and "
+            f"{BATCH_DEADLINE_MAX}."
+        )
+    freshness = body.get("freshnessChoice", "capture_fresh")
+    if freshness != "capture_fresh":
+        raise InvalidRequestError(
+            "freshnessChoice must be 'capture_fresh'; batch reuse is not implicit."
+        )
+    return normalized, deadline_seconds, freshness
 
 
 def _request_body(body: Any) -> CollectionRequest:
@@ -774,6 +922,7 @@ def create_app(
         ),
     )
     reader = ReadService(storage)
+    batch_approval_key = secrets.token_bytes(32)
 
     app = Flask(__name__, static_folder="static", static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
@@ -968,6 +1117,288 @@ def create_app(
                 configured_queue_capacity=jobs.max_queue,
             )
         )
+
+    @app.get("/api/progress")
+    def progress_events():
+        unknown = sorted(set(request.args) - {"after", "limit"})
+        if unknown:
+            return _error(
+                "invalid_request",
+                f"Unknown progress parameter(s): {', '.join(unknown)}.",
+                400,
+            )
+        try:
+            after = _query_integer(
+                "after", 0, minimum=0, maximum=9_223_372_036_854_775_807
+            )
+            limit = _query_integer("limit", 100, minimum=1, maximum=100)
+            return jsonify(_public_progress(jobs.events(after), limit=limit))
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+
+    @app.post("/api/batches/preview")
+    def preview_batch():
+        if not collection_enabled:
+            return _error("collection_disabled", "Live collection is disabled in demo mode.", 409)
+        try:
+            requested, deadline_seconds, freshness = _batch_preview_items(
+                request.get_json(silent=True)
+            )
+            now = datetime.now(UTC)
+            batch_id = uuid.uuid4().hex
+            deadline_at = (now + timedelta(seconds=deadline_seconds)).isoformat()
+            order = sorted(
+                requested,
+                key=lambda item: (-item["priority"], item["expectedQueueOrder"]),
+            )
+            queue_positions = {
+                item["sourceId"]: position for position, item in enumerate(order, 1)
+            }
+            manifest_items = []
+            for item in requested:
+                saved = storage.get_source(item["sourceId"])
+                if saved is None:
+                    raise InvalidRequestError(
+                        f"Saved source {item['sourceId']} was not found."
+                    )
+                collection_request = _batch_request(saved, item["maxPosts"])
+                if saved.get("source_fingerprint") != source_fingerprint(
+                    collection_request
+                ):
+                    raise InvalidRequestError("Saved source identity is inconsistent.")
+                execution_plan = registry.prepare(collection_request)
+                visible_destination = (
+                    execution_plan.get("sourceUrl")
+                    or execution_plan.get("query")
+                    or saved["normalized_value"]
+                )
+                manifest_items.append(
+                    {
+                        "sourceId": saved["id"],
+                        "displayName": saved["display_name"],
+                        "provider": saved["provider"],
+                        "surface": saved["surface"],
+                        "normalizedDestination": saved["normalized_value"],
+                        "visibleDestination": visible_destination,
+                        "sourceFingerprint": saved["source_fingerprint"],
+                        "maxPosts": collection_request.max_posts,
+                        "deadlineSeconds": deadline_seconds,
+                        "deadlineAt": deadline_at,
+                        "freshnessChoice": freshness,
+                        "routeAlias": "direct",
+                        "priority": item["priority"],
+                        "expectedQueueOrder": queue_positions[item["sourceId"]],
+                        "request": collection_request.to_dict(),
+                        "executionPlan": execution_plan,
+                    }
+                )
+            preview_seconds = min(
+                BATCH_PREVIEW_SECONDS, max(15, deadline_seconds // 2)
+            )
+            manifest = {
+                "manifestVersion": 1,
+                "batchId": batch_id,
+                "createdAt": now.isoformat(),
+                "expiresAt": (now + timedelta(seconds=preview_seconds)).isoformat(),
+                "freshnessChoice": freshness,
+                "routeAlias": "direct",
+                "maxConcurrency": jobs.max_workers,
+                "perSourceConcurrency": PER_SOURCE_CONCURRENCY,
+                "perAuthStateConcurrency": PER_AUTH_STATE_CONCURRENCY,
+                "queueCapacity": jobs.max_queue,
+                "expectedQueueOrder": [
+                    item["sourceId"] for item in sorted(
+                        manifest_items,
+                        key=lambda value: value["expectedQueueOrder"],
+                    )
+                ],
+                "queueOrderBasis": (
+                    "Batch-local priority descending, then preview order; existing work "
+                    "and per-source/per-auth fairness may affect actual start order."
+                ),
+                "items": manifest_items,
+            }
+        except CredentialError as exc:
+            return _error("connection_missing", str(exc), 409)
+        except InvalidRequestError as exc:
+            return _error(exc.code, str(exc), 400)
+        return jsonify(
+            {
+                "manifest": manifest,
+                "approvalDigest": _approval_digest(batch_approval_key, manifest),
+                "requiresConfirmation": True,
+                "untrustedExternalContent": True,
+            }
+        )
+
+    @app.post("/api/batches/confirm")
+    def confirm_batch():
+        if not collection_enabled:
+            return _error("collection_disabled", "Live collection is disabled in demo mode.", 409)
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return _error("invalid_request", "Request body must be a JSON object.", 400)
+        unknown = sorted(set(body) - {"confirm", "manifest", "approvalDigest"})
+        if unknown:
+            return _error(
+                "invalid_request",
+                f"Unknown batch confirmation field(s): {', '.join(unknown)}.",
+                400,
+            )
+        if body.get("confirm") is not True:
+            return _error("confirmation_required", "confirm must be true.", 400)
+        manifest = body.get("manifest")
+        digest = body.get("approvalDigest")
+        if not isinstance(manifest, dict) or not isinstance(digest, str):
+            return _error(
+                "invalid_request", "manifest and approvalDigest are required.", 400
+            )
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            return _error("invalid_request", "approvalDigest is invalid.", 400)
+        expected_digest = _approval_digest(batch_approval_key, manifest)
+        if not hmac.compare_digest(digest, expected_digest):
+            return _error(
+                "approval_mismatch",
+                "The batch manifest differs from the server preview.",
+                409,
+            )
+        try:
+            if manifest.get("manifestVersion") != 1:
+                raise ValueError("Batch manifest version is invalid.")
+            batch_id = manifest.get("batchId")
+            if not isinstance(batch_id, str) or not SOURCE_ID_RE.fullmatch(batch_id):
+                raise ValueError("Batch identifier is invalid.")
+            expires_at = datetime.fromisoformat(str(manifest.get("expiresAt")))
+            if expires_at.utcoffset() is None or expires_at.astimezone(UTC) <= datetime.now(UTC):
+                return _error(
+                    "preview_expired",
+                    "The batch preview expired; preview the saved sources again.",
+                    409,
+                )
+            manifest_items = manifest.get("items")
+            if not isinstance(manifest_items, list) or not 2 <= len(manifest_items) <= BATCH_LIMIT:
+                raise ValueError("Batch manifest items are invalid.")
+            service_items = []
+            for item in manifest_items:
+                if not isinstance(item, dict):
+                    raise ValueError("Batch manifest item is invalid.")
+                source_id = item.get("sourceId")
+                saved = storage.get_source(source_id)
+                if saved is None:
+                    return _error(
+                        "approval_changed",
+                        "A saved source changed after preview; preview the batch again.",
+                        409,
+                    )
+                collection_request = _batch_request(saved, item.get("maxPosts"))
+                if (
+                    saved.get("source_fingerprint") != item.get("sourceFingerprint")
+                    or saved.get("normalized_value")
+                    != item.get("normalizedDestination")
+                    or collection_request.to_dict() != item.get("request")
+                    or item.get("freshnessChoice") != "capture_fresh"
+                    or item.get("routeAlias") != "direct"
+                    or item.get("deadlineSeconds") not in range(
+                        BATCH_DEADLINE_MIN, BATCH_DEADLINE_MAX + 1
+                    )
+                    or item.get("expectedQueueOrder") not in range(
+                        1, len(manifest_items) + 1
+                    )
+                ):
+                    return _error(
+                        "approval_changed",
+                        "A saved source or approved limit changed; preview the batch again.",
+                        409,
+                    )
+                priority = item.get("priority")
+                if (
+                    isinstance(priority, bool)
+                    or not isinstance(priority, int)
+                    or not 0 <= priority <= 100
+                ):
+                    raise ValueError("Batch item priority is invalid.")
+                deadline_at = datetime.fromisoformat(str(item.get("deadlineAt")))
+                if (
+                    deadline_at.utcoffset() is None
+                    or deadline_at.astimezone(UTC) <= datetime.now(UTC)
+                ):
+                    return _error(
+                        "preview_expired",
+                        "The approved batch deadline passed; preview the batch again.",
+                        409,
+                    )
+                execution_plan = registry.prepare(
+                    collection_request, item.get("executionPlan")
+                )
+                service_items.append(
+                    {
+                        "request": collection_request,
+                        "execution_plan": execution_plan,
+                        "priority": priority,
+                        "source_id": source_id,
+                        "idempotency_key": (
+                            f"{batch_id}:"
+                            f"{hashlib.sha256(source_id.encode('utf-8')).hexdigest()}"
+                        ),
+                        "limits": {
+                            "maxPosts": collection_request.max_posts,
+                            "deadlineSeconds": item["deadlineSeconds"],
+                            "routeAlias": "direct",
+                            "maxConcurrency": manifest.get("maxConcurrency"),
+                        },
+                        "deadline_at": deadline_at,
+                    }
+                )
+            if (
+                manifest.get("maxConcurrency") != jobs.max_workers
+                or manifest.get("perSourceConcurrency") != PER_SOURCE_CONCURRENCY
+                or manifest.get("perAuthStateConcurrency")
+                != PER_AUTH_STATE_CONCURRENCY
+                or manifest.get("queueCapacity") != jobs.max_queue
+                or manifest.get("freshnessChoice") != "capture_fresh"
+                or manifest.get("routeAlias") != "direct"
+            ):
+                return _error(
+                    "approval_changed",
+                    "Queue limits changed after preview; preview the batch again.",
+                    409,
+                )
+            job_ids = jobs.submit_batch(service_items, batch_id=batch_id)
+        except CredentialError as exc:
+            return _error("connection_missing", str(exc), 409)
+        except InvalidRequestError as exc:
+            return _error(exc.code, str(exc), 400)
+        except QueueFullError as exc:
+            return _error(exc.code, str(exc), 429)
+        except (TypeError, ValueError):
+            return _error(
+                "invalid_request", "The batch manifest is invalid.", 400
+            )
+        return jsonify(
+            {
+                "batchId": batch_id,
+                "jobIds": job_ids,
+                "status": "queued",
+                "admittedCount": len(job_ids),
+            }
+        ), 202
+
+    @app.post("/api/batches/<batch_id>/cancel")
+    def cancel_batch(batch_id: str):
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or set(body) != {"confirm"}:
+            return _error(
+                "invalid_request", "Body must be exactly {confirm: true}.", 400
+            )
+        if body.get("confirm") is not True:
+            return _error("confirmation_required", "confirm must be true.", 400)
+        if not SOURCE_ID_RE.fullmatch(batch_id):
+            return _error("invalid_request", "Batch identifier is invalid.", 400)
+        try:
+            cancelled = jobs.cancel_remaining(batch_id)
+        except ValueError as exc:
+            return _error("invalid_request", str(exc), 400)
+        return jsonify({"batchId": batch_id, "cancelledCount": cancelled})
 
     @app.post("/api/retention/purge")
     def purge_snapshots():

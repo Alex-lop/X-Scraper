@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 from datetime import UTC, datetime, timedelta
 
 from xworkbench.api import create_app
@@ -143,13 +144,17 @@ class OfficialProvider:
         return CollectionSummary(completion_reason="recent_search_exhausted")
 
 
-def make_client(tmp_path, *, token=False, partial=False, providers=None):
+def make_client(
+    tmp_path, *, token=False, partial=False, providers=None, queue_capacity=100
+):
     token_path = tmp_path / "auth" / "token"
     token_path.parent.mkdir(parents=True, mode=0o700)
     if token:
         token_path.write_text("secret")
         token_path.chmod(0o600)
-    settings = Settings(tmp_path / "test.db", token_path)
+    settings = Settings(
+        tmp_path / "test.db", token_path, queue_capacity=queue_capacity
+    )
     storage = Storage(settings.database_path)
     registry = ProviderRegistry(
         providers or [BrowserProvider(partial=partial), OfficialProvider(settings)]
@@ -193,6 +198,40 @@ def run_collection(client, app, request):
     job_id = created.get_json()["jobId"]
     app.extensions["xworkbench_jobs"].run_once(job_id)
     return preview, job_id
+
+
+def saved_batch_preview(client):
+    sources = []
+    for body in (
+        {
+            "displayName": "Saved Home",
+            "provider": "playwright_browser",
+            "surface": "home",
+            "value": "home",
+        },
+        {
+            "displayName": "Saved profile",
+            "provider": "official_x_api",
+            "surface": "profile",
+            "value": "OpenAI",
+        },
+    ):
+        response = client.post("/api/sources", json=body)
+        assert response.status_code == 201
+        sources.append(response.get_json()["source"])
+    response = client.post(
+        "/api/batches/preview",
+        json={
+            "items": [
+                {"sourceId": sources[0]["sourceId"], "maxPosts": 5, "priority": 1},
+                {"sourceId": sources[1]["sourceId"], "maxPosts": 10, "priority": 2},
+            ],
+            "deadlineSeconds": 600,
+            "freshnessChoice": "capture_fresh",
+        },
+    )
+    assert response.status_code == 200
+    return sources, response.get_json()
 
 
 def test_browser_is_default_and_does_not_require_api_token(tmp_path):
@@ -421,6 +460,185 @@ def test_saved_source_is_server_identified_and_exactly_bound_to_job(tmp_path):
     )
     assert mismatch.status_code == 400
     assert "does not match" in mismatch.get_json()["error"]["message"]
+
+
+def test_batch_preview_is_canonical_double_confirm_is_idempotent_and_cancel_is_scoped(
+    tmp_path,
+):
+    client, app = make_client(tmp_path, token=True)
+    sources, preview = saved_batch_preview(client)
+    manifest = preview["manifest"]
+    digest = preview["approvalDigest"]
+    storage = app.extensions["xworkbench_jobs"].storage
+
+    assert preview["requiresConfirmation"] is True
+    assert len(digest) == 64
+    assert manifest["routeAlias"] == "direct"
+    assert manifest["freshnessChoice"] == "capture_fresh"
+    assert manifest["maxConcurrency"] == 1
+    assert manifest["perSourceConcurrency"] == 1
+    assert manifest["perAuthStateConcurrency"] == 1
+    assert manifest["queueCapacity"] == 100
+    assert manifest["expectedQueueOrder"] == [
+        sources[1]["sourceId"],
+        sources[0]["sourceId"],
+    ]
+    assert storage.list_batch_jobs(manifest["batchId"]) == []
+    for item in manifest["items"]:
+        assert item["sourceId"] in {source["sourceId"] for source in sources}
+        assert item["normalizedDestination"] in {"home", "OpenAI"}
+        assert item["visibleDestination"]
+        assert item["deadlineSeconds"] == 600
+        assert item["freshnessChoice"] == "capture_fresh"
+        assert item["routeAlias"] == "direct"
+        assert 1 <= item["expectedQueueOrder"] <= 2
+
+    assert client.post(
+        "/api/batches/confirm",
+        json={
+            "confirm": True,
+            "manifest": {**manifest, "queueCapacity": 101},
+            "approvalDigest": digest,
+        },
+    ).status_code == 409
+    assert storage.list_batch_jobs(manifest["batchId"]) == []
+
+    assert client.post(
+        "/api/batches/confirm",
+        json={
+            "confirm": True,
+            "manifest": manifest,
+            "approvalDigest": "é" * 64,
+        },
+    ).status_code == 400
+
+    confirmation = {
+        "confirm": True,
+        "manifest": preview["manifest"],
+        "approvalDigest": preview["approvalDigest"],
+    }
+    first = client.post("/api/batches/confirm", json=confirmation)
+    second = client.post("/api/batches/confirm", json=confirmation)
+    assert first.status_code == second.status_code == 202
+    assert first.get_json()["jobIds"] == second.get_json()["jobIds"]
+    assert len(storage.list_batch_jobs(manifest["batchId"])) == 2
+    with storage.connect() as connection:
+        approvals = [
+            json.loads(row["approval_json"])
+            for row in connection.execute(
+                "SELECT approval_json FROM jobs WHERE batch_id = ?",
+                (manifest["batchId"],),
+            ).fetchall()
+        ]
+    assert all(
+        approval["confirmation"] is True
+        and approval["previewFingerprint"] != digest
+        for approval in approvals
+    )
+
+    progress = client.get("/api/progress?after=0&limit=100")
+    assert progress.status_code == 200
+    assert {event["jobId"] for event in progress.get_json()["events"]} >= set(
+        first.get_json()["jobIds"]
+    )
+
+    cancelled = client.post(
+        f"/api/batches/{manifest['batchId']}/cancel", json={"confirm": True}
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()["cancelledCount"] == 2
+    assert client.post(
+        f"/api/batches/{manifest['batchId']}/cancel", json={"confirm": True}
+    ).get_json()["cancelledCount"] == 0
+    assert all(
+        storage.get_job(job_id)["status"] == "cancelled"
+        for job_id in first.get_json()["jobIds"]
+    )
+
+
+def test_batch_rejects_unsaved_destinations_and_queue_full_rolls_back(tmp_path):
+    client, app = make_client(tmp_path, token=True, queue_capacity=2)
+    sources, preview = saved_batch_preview(client)
+    secret = "SENTINEL-BATCH-SECRET"
+    invalid_bodies = (
+        {
+            "items": [
+                {
+                    "sourceId": sources[0]["sourceId"],
+                    "maxPosts": 5,
+                    "priority": 0,
+                    "normalizedDestination": "https://attacker.invalid",
+                },
+                {"sourceId": sources[1]["sourceId"], "maxPosts": 10},
+            ]
+        },
+        {
+            "items": [
+                {"sourceId": "https://attacker.invalid", "maxPosts": 5},
+                {"sourceId": sources[1]["sourceId"], "maxPosts": 10},
+            ]
+        },
+        {
+            "items": [
+                {"sourceId": sources[0]["sourceId"], "maxPosts": 5},
+                {"sourceId": sources[0]["sourceId"], "maxPosts": 5},
+            ]
+        },
+        {
+            "items": [
+                {"sourceId": sources[0]["sourceId"], "maxPosts": 5},
+                {"sourceId": sources[1]["sourceId"], "maxPosts": 10},
+            ],
+            "freshnessChoice": "reuse_if_fresh",
+        },
+        {
+            "items": [
+                {"sourceId": sources[0]["sourceId"], "maxPosts": 5},
+                {"sourceId": sources[1]["sourceId"], "maxPosts": 10},
+            ],
+            "token": secret,
+        },
+    )
+    for body in invalid_bodies:
+        response = client.post("/api/batches/preview", json=body)
+        assert response.status_code == 400
+        assert secret not in response.get_data(as_text=True)
+    assert client.post(
+        "/api/batches/preview",
+        json={
+            "items": [
+                {"sourceId": sources[0]["sourceId"], "maxPosts": 5},
+                {"sourceId": sources[1]["sourceId"], "maxPosts": 10},
+            ]
+        },
+        headers={"Origin": "https://attacker.invalid"},
+    ).status_code == 403
+
+    request = {"provider": "playwright_browser", "sourceType": "home", "maxPosts": 1}
+    single = client.post("/api/collections/preview", json=request).get_json()
+    admitted = client.post(
+        "/api/jobs",
+        json={
+            **single["request"],
+            "executionPlan": single["executionPlan"],
+            "confirmBrowserCapture": True,
+        },
+    )
+    assert admitted.status_code == 202
+
+    confirmation = client.post(
+        "/api/batches/confirm",
+        json={
+            "confirm": True,
+            "manifest": preview["manifest"],
+            "approvalDigest": preview["approvalDigest"],
+        },
+    )
+    assert confirmation.status_code == 429
+    assert confirmation.get_json()["error"]["code"] == "queue_full"
+    assert app.extensions["xworkbench_jobs"].storage.list_batch_jobs(
+        preview["manifest"]["batchId"]
+    ) == []
 
 
 def test_browser_job_and_exports_omit_api_metadata_and_secrets(tmp_path):

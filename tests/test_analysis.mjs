@@ -74,6 +74,21 @@ test("compares bounded snapshots without treating missing metrics as zero", () =
   assert.equal(comparison.partial, true);
 });
 
+test("orders server-approved batch items deterministically", () => {
+  const manifest = {
+    items: [
+      { sourceId: "later", expectedQueueOrder: 2 },
+      { sourceId: "first-b", expectedQueueOrder: 1 },
+      { sourceId: "first-a", expectedQueueOrder: 1 },
+    ],
+  };
+  assert.deepEqual(
+    analysis.orderedBatchItems(manifest).map((item) => item.sourceId),
+    ["first-a", "first-b", "later"],
+  );
+  assert.deepEqual(analysis.orderedBatchItems({}), []);
+});
+
 test("keeps the product loop CSP-safe, keyboard-native, and motion-safe", () => {
   for (const unsafe of ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"]) {
     assert.equal(appSource.includes(unsafe), false);
@@ -84,6 +99,12 @@ test("keeps the product loop CSP-safe, keyboard-native, and motion-safe", () => 
   assert.match(htmlSource, /href="#sources" aria-current="page"/);
   assert.match(htmlSource, /id="compare-error"[^>]*role="alert"/);
   assert.match(htmlSource, /id="compare-status"[^>]*aria-live="polite"/);
+  assert.match(htmlSource, /id="batch-source-options"/);
+  assert.match(htmlSource, /id="batch-preview-rows"/);
+  assert.match(htmlSource, /id="batch-confirm-error"[^>]*role="alert"/);
+  assert.match(appSource, /Username or exact X profile URL/);
+  assert.match(appSource, /\/api\/batches\/preview/);
+  assert.match(appSource, /\/api\/progress\?after=/);
   assert.equal(/<(?:script|link)[^>]+https?:\/\//i.test(htmlSource), false);
   assert.equal(htmlSource.includes("<img"), false);
   assert.equal(appSource.includes('behavior: "smooth"'), false);

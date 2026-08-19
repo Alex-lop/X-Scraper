@@ -5,6 +5,7 @@ import {
   filterAndSortPosts,
   formatMetric,
   compareSnapshotPosts,
+  orderedBatchItems,
   postTypes,
   summarizePosts,
 } from "./analysis.js";
@@ -27,6 +28,13 @@ let allPosts = [];
 let offlineDemo = false;
 let providerConnections = {};
 let snapshotCatalog = [];
+let savedSourceCatalog = [];
+let batchPreview = null;
+let activeBatch = null;
+let progressSequence = 0;
+let progressTimer = null;
+let batchCompletedCount = 0;
+const batchJobStatuses = new Map();
 
 function savedNames() {
   try {
@@ -130,6 +138,7 @@ function setOfflineDemo() {
   $("#setup-card").hidden = true;
   $("#demo-card").hidden = false;
   $("#preview-button").disabled = true;
+  $("#batch-preview-button").disabled = true;
 }
 
 function selectedProvider() {
@@ -209,7 +218,7 @@ function updateRequestHelp() {
     sourceInput.readOnly = surface === "home";
     sourceInput.required = surface !== "home";
     sourceInput.value = surface === "home" ? "home" : sourceInput.value === "home" ? "" : sourceInput.value;
-    sourceLabel.textContent = surface === "home" ? "Home feed" : surface === "profile" ? "Profile handle" : "Search query";
+    sourceLabel.textContent = surface === "home" ? "Home feed" : surface === "profile" ? "Username or exact X profile URL" : "Search query";
     sourceInput.placeholder = surface === "profile" ? "@OpenAI" : surface === "search" ? "AI agents lang:en" : "home";
     sourceHelp.textContent = surface === "home"
       ? "The destination is fixed to your signed-in Home feed."
@@ -468,14 +477,245 @@ function renderSources(sources, note) {
   $("#sources-note").textContent = note;
 }
 
+function renderBatchSourceOptions(sources) {
+  const container = $("#batch-source-options");
+  const selected = new Set([...container.querySelectorAll('input[type="checkbox"]:checked')]
+    .map((control) => control.value));
+  container.replaceChildren();
+  for (const source of sources) {
+    const sourceId = String(source.sourceId || "");
+    if (!sourceId) continue;
+    const label = node("label", "", "batch-source-option");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.name = "batchSourceId";
+    checkbox.value = sourceId;
+    checkbox.checked = selected.has(sourceId);
+    label.append(
+      checkbox,
+      node("span", source.displayName || "Unnamed source"),
+      node("small", `${titleCase(source.surface)} · ${source.query || "home"}`),
+    );
+    container.append(label);
+  }
+  if (!container.children.length) {
+    container.append(node("p", "Save at least two sources before building a batch.", "empty"));
+  }
+}
+
 async function loadSources(fallbackJobs = snapshotCatalog) {
   try {
     const data = await api("/api/sources");
-    renderSources(Array.isArray(data.sources) ? data.sources : [], "Loaded from the local saved-source catalog.");
+    savedSourceCatalog = Array.isArray(data.sources) ? data.sources : [];
+    renderSources(savedSourceCatalog, "Loaded from the local saved-source catalog.");
+    renderBatchSourceOptions(savedSourceCatalog);
   } catch {
+    savedSourceCatalog = [];
     renderSources(derivedSources(fallbackJobs), "Saved-source API unavailable; showing sources derived from local snapshot history.");
+    renderBatchSourceOptions([]);
   }
 }
+
+function batchPayload() {
+  const selected = [...$("#batch-source-options").querySelectorAll('input[type="checkbox"]:checked')]
+    .map((control) => control.value);
+  const priority = Number($("#batch-priority").value);
+  return {
+    items: selected.map((sourceId) => {
+      const source = savedSourceCatalog.find((item) => item.sourceId === sourceId);
+      return {
+        sourceId,
+        maxPosts: Number(source?.provider === "official_x_api"
+          ? $("#batch-api-posts").value : $("#batch-browser-posts").value),
+        priority,
+      };
+    }),
+    deadlineSeconds: Number($("#batch-deadline").value),
+    freshnessChoice: $("#batch-freshness").value,
+  };
+}
+
+function renderBatchPreview() {
+  const manifest = batchPreview.manifest;
+  const rows = orderedBatchItems(manifest).map((item) => {
+    const row = node("tr");
+    for (const value of [
+      item.expectedQueueOrder,
+      item.displayName,
+      item.visibleDestination || item.normalizedDestination,
+      item.maxPosts,
+      `${item.deadlineSeconds}s · ${utc(item.deadlineAt)}`,
+      item.freshnessChoice === "capture_fresh" ? "Fresh capture" : item.freshnessChoice,
+      item.routeAlias,
+      item.priority,
+    ]) row.append(node("td", String(value ?? "—")));
+    return row;
+  });
+  $("#batch-preview-rows").replaceChildren(...rows);
+  $("#batch-preview-count").textContent = `${count(rows.length)} saved sources`;
+  $("#batch-preview-note").textContent = `Maximum concurrency ${count(manifest.maxConcurrency)} globally, `
+    + `${count(manifest.perSourceConcurrency)} per source, and ${count(manifest.perAuthStateConcurrency)} per auth state · `
+    + `queue capacity ${count(manifest.queueCapacity)} · approval expires ${utc(manifest.expiresAt)}. `
+    + manifest.queueOrderBasis;
+  banner($("#batch-confirm-error"), "");
+  $("#batch-confirm-button").disabled = false;
+  $("#batch-form").hidden = true;
+  $("#batch-preview").hidden = false;
+}
+
+function renderActiveBatch(value) {
+  activeBatch = value;
+  progressSequence = 0;
+  batchCompletedCount = 0;
+  batchJobStatuses.clear();
+  clearTimeout(progressTimer);
+  $("#active-batch").hidden = false;
+  $("#active-batch-title").textContent = `Batch ${value.batchId.slice(0, 12)}`;
+  $("#batch-status").textContent = `${count(value.admittedCount)} jobs admitted atomically. Cancelling one does not cancel the others.`;
+  const jobs = value.jobIds.map((jobId, index) => {
+    const item = node("div", "", "batch-job");
+    const status = node("span", "Queued", "pill queued");
+    batchJobStatuses.set(jobId, status);
+    item.append(node("strong", `Queue item ${index + 1} · ${jobId.slice(0, 12)}`), status);
+    const actions = node("div", "", "actions");
+    const open = node("button", "Open capture");
+    open.type = "button";
+    open.addEventListener("click", async () => {
+      await openJob(jobId);
+      $("#stage-collect").scrollIntoView({ block: "start" });
+    });
+    const cancel = node("button", "Cancel this capture", "danger");
+    cancel.type = "button";
+    cancel.addEventListener("click", async () => {
+      cancel.disabled = true;
+      try {
+        await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        cancel.textContent = "Cancellation requested";
+        await loadHistory();
+      } catch (error) {
+        banner($("#batch-cancel-error"), error.message);
+        cancel.disabled = false;
+      }
+    });
+    actions.append(open, cancel);
+    item.append(actions);
+    return item;
+  });
+  $("#batch-job-list").replaceChildren(...jobs);
+  banner($("#batch-cancel-error"), "");
+  void pollProgress();
+}
+
+async function pollProgress() {
+  if (!activeBatch) return;
+  clearTimeout(progressTimer);
+  try {
+    const value = await api(`/api/progress?after=${progressSequence}&limit=100`);
+    progressSequence = Number.isInteger(value.lastSequence)
+      ? value.lastSequence : progressSequence;
+    const durable = new Map((value.jobs || []).map((job) => [job.id, job.status]));
+    for (const jobId of activeBatch.jobIds) {
+      const event = [...(value.events || [])].reverse()
+        .find((item) => item.jobId === jobId);
+      const statusValue = durable.get(jobId) || event?.status || event?.type;
+      const status = batchJobStatuses.get(jobId);
+      if (status && statusValue) {
+        status.textContent = titleCase(statusValue);
+        status.className = `pill ${statusValue}`;
+      }
+    }
+    const complete = activeBatch.jobIds.filter((jobId) =>
+      terminalStatuses.has(durable.get(jobId))).length;
+    $("#batch-status").textContent = `${count(complete)} of ${count(activeBatch.jobIds.length)} captures are terminal.${value.gap ? " Intermediate progress was coalesced; durable job state is shown." : ""}`;
+    if (complete !== batchCompletedCount) {
+      batchCompletedCount = complete;
+      await loadHistory();
+    }
+    if (complete < activeBatch.jobIds.length) progressTimer = setTimeout(pollProgress, 1500);
+  } catch (error) {
+    $("#batch-status").textContent = `Progress events unavailable; durable capture history remains authoritative. ${error.message}`;
+    progressTimer = setTimeout(pollProgress, 3000);
+  }
+}
+
+$("#batch-form").addEventListener("change", () => {
+  batchPreview = null;
+  $("#batch-preview").hidden = true;
+  banner($("#batch-error"), "");
+});
+
+$("#batch-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("#batch-preview-button");
+  button.disabled = true;
+  banner($("#batch-error"), "");
+  try {
+    batchPreview = await api("/api/batches/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(batchPayload()),
+    });
+    renderBatchPreview();
+  } catch (error) {
+    banner($("#batch-error"), error.message);
+  } finally {
+    button.disabled = offlineDemo;
+  }
+});
+
+$("#batch-edit-button").addEventListener("click", () => {
+  batchPreview = null;
+  $("#batch-preview").hidden = true;
+  $("#batch-form").hidden = false;
+  $("#batch-source-options input")?.focus();
+});
+
+$("#batch-confirm-button").addEventListener("click", async () => {
+  if (!batchPreview) return;
+  const button = $("#batch-confirm-button");
+  button.disabled = true;
+  banner($("#batch-confirm-error"), "");
+  try {
+    const value = await api("/api/batches/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        manifest: batchPreview.manifest,
+        approvalDigest: batchPreview.approvalDigest,
+      }),
+    });
+    batchPreview = null;
+    $("#batch-preview").hidden = true;
+    $("#batch-form").hidden = false;
+    renderActiveBatch(value);
+    await loadHistory();
+  } catch (error) {
+    banner($("#batch-confirm-error"), error.message);
+    button.disabled = false;
+  }
+});
+
+$("#cancel-batch-button").addEventListener("click", async () => {
+  if (!activeBatch || !window.confirm("Cancel all queued or running captures remaining in this batch? Completed snapshots remain unchanged.")) return;
+  const button = $("#cancel-batch-button");
+  button.disabled = true;
+  banner($("#batch-cancel-error"), "");
+  try {
+    const value = await api(`/api/batches/${encodeURIComponent(activeBatch.batchId)}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    $("#batch-status").textContent = `${count(value.cancelledCount)} remaining captures cancelled. Completed snapshots were unchanged.`;
+    await loadHistory();
+  } catch (error) {
+    banner($("#batch-cancel-error"), error.message);
+    button.disabled = false;
+  }
+});
 
 async function loadSnapshotCatalog(fallbackJobs) {
   try {
