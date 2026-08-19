@@ -7,6 +7,7 @@ import re
 import sqlite3
 import stat
 import tempfile
+import threading
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -208,7 +209,18 @@ LEGACY_OBSERVATION_COLUMNS = (
 )
 
 
+_CONNECTION_LIFECYCLE_LOCK = threading.RLock()
+
+
 class _ClosingConnection(sqlite3.Connection):
+    def __init__(self, *args, **kwargs):
+        with _CONNECTION_LIFECYCLE_LOCK:
+            super().__init__(*args, **kwargs)
+
+    def close(self) -> None:
+        with _CONNECTION_LIFECYCLE_LOCK:
+            super().close()
+
     def __exit__(self, exc_type, exc_value, traceback):
         try:
             return super().__exit__(exc_type, exc_value, traceback)

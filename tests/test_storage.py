@@ -1,6 +1,9 @@
 import json
 import sqlite3
 import stat
+import subprocess
+import sys
+import textwrap
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -992,3 +995,66 @@ def test_repeated_context_connections_close_under_a_low_fd_limit(tmp_path):
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
     assert len(list(descriptors.iterdir())) <= baseline + 4
+
+
+def test_concurrent_connection_lifecycle_with_writer_and_read_only_polls(tmp_path):
+    storage = Storage(tmp_path / "connection-race.db")
+    storage.initialize()
+    script = textwrap.dedent(
+        """
+        import sys
+        from concurrent.futures import ThreadPoolExecutor
+        from pathlib import Path
+        from threading import Barrier
+
+        from xworkbench.mcp_server import _ReadOnlyStorage
+        from xworkbench.models import CollectionRequest
+        from xworkbench.storage import Storage
+        from xworkbench.x_api import compile_request
+
+        storage = Storage(Path(sys.argv[1]))
+        read_only = _ReadOnlyStorage(storage.path)
+        request = CollectionRequest.from_dict(
+            {"sourceType": "profile", "sourceValue": "race", "maxPosts": 10}
+        )
+        job_id = storage.create_job(request, compile_request(request))
+        tasks = []
+        barrier = Barrier(6)
+
+        def poll_storage():
+            barrier.wait()
+            for _ in range(400):
+                assert storage.get_job(job_id)["id"] == job_id
+
+        def poll_read_only():
+            barrier.wait()
+            for _ in range(100):
+                with read_only.connect() as connection:
+                    assert connection.execute(
+                        "SELECT id FROM jobs WHERE id = ?", (job_id,)
+                    ).fetchone()[0] == job_id
+
+        def write():
+            barrier.wait()
+            for _ in range(150):
+                with storage.connect() as connection:
+                    connection.execute(
+                        "UPDATE jobs SET updated_at = updated_at WHERE id = ?", (job_id,)
+                    )
+
+        tasks = [poll_storage, poll_storage, poll_read_only, poll_read_only, write, write]
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            futures = [pool.submit(task) for task in tasks]
+            for future in futures:
+                future.result(timeout=20)
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(storage.path)],
+        cwd=storage.path.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
