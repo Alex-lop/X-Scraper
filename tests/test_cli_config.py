@@ -51,6 +51,7 @@ def test_malformed_settings_have_stable_error_without_traceback(tmp_path, monkey
         ("not-json", "valid UTF-8 JSON"),
         ('{"surprise": true}', "Unknown config key"),
         ('{"job_timeout_seconds": 0}', "from 1 to 3600"),
+        ('{"max_workers": 3}', "from 1 to 2"),
     ],
 )
 def test_config_rejects_malformed_unknown_and_unsafe_values(
@@ -85,6 +86,15 @@ def test_config_and_token_reject_world_readable_files_and_symlinks(tmp_path, mon
     configured = Settings(tmp_path / "db", token_link)
     with pytest.raises(SettingsError, match="not a symlink"):
         configured.bearer_token()
+
+
+def test_browser_state_path_must_remain_app_owned(tmp_path):
+    with pytest.raises(SettingsError, match="app-owned auth directory"):
+        Settings(
+            tmp_path / "runtime" / "db",
+            tmp_path / "runtime" / "auth" / "token",
+            storage_state_path=tmp_path / "unrelated-profile" / "state.json",
+        )
 
 
 @pytest.mark.parametrize(
@@ -163,6 +173,49 @@ def test_doctor_is_read_only_and_does_not_expose_invalid_state(
     assert "invalid local Playwright JSON" in output
 
 
+def test_doctor_keeps_last_live_verification_visible_after_expiry(
+    tmp_path, monkeypatch, capsys
+):
+    settings = Settings(tmp_path / "db", tmp_path / "token")
+    Storage(settings.database_path).initialize()
+    monkeypatch.setattr(
+        "xworkbench.cli._chromium_available", lambda: (True, "Chromium launches")
+    )
+    monkeypatch.setattr(
+        "xworkbench.cli.PlaywrightBrowserProvider.connection_status",
+        lambda _provider: {
+            "status": "expired",
+            "localStateValid": True,
+            "verifiedAt": "2026-08-19T04:00:00+00:00",
+        },
+    )
+
+    assert _doctor(settings, require_token=False, port=0) == 0
+    output = capsys.readouterr().out
+    assert "last verified live at 2026-08-19T04:00:00+00:00" in output
+    assert "current status is expired" in output
+
+
+def test_doctor_treats_missing_auth_as_offline_ready_warning(
+    tmp_path, monkeypatch, capsys
+):
+    settings = Settings(tmp_path / "runtime" / "db", tmp_path / "runtime" / "token")
+    settings.ensure_runtime_dirs()
+    Storage(settings.database_path).initialize()
+    monkeypatch.setattr(
+        "xworkbench.cli._chromium_available", lambda: (True, "Chromium launches")
+    )
+    monkeypatch.setattr(
+        "xworkbench.cli.PlaywrightBrowserProvider.connection_status",
+        lambda _provider: {"status": "missing", "localStateValid": False},
+    )
+
+    assert _doctor(settings, require_token=False, port=0) == 0
+    output = capsys.readouterr().out
+    assert "WARN  local auth state" in output
+    assert "READY WITH WARNINGS" in output
+
+
 def test_config_show_redacts_environment_token(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("XWORKBENCH_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setenv("XWORKBENCH_X_BEARER_TOKEN", "never-print-me")
@@ -171,6 +224,10 @@ def test_config_show_redacts_environment_token(tmp_path, monkeypatch, capsys):
     shown = capsys.readouterr().out
     assert "never-print-me" not in shown
     assert json.loads(shown)["database_path"].endswith("x_collection_workbench.db")
+    resolved = json.loads(shown)
+    assert resolved["max_workers"] == resolved["per_auth_state_concurrency"] == 1
+    assert resolved["hard_worker_maximum"] == 4
+    assert resolved["route_mode"] == "direct"
 
 
 def test_expected_browser_failure_has_stable_exit_without_traceback(

@@ -100,6 +100,10 @@ class Settings:
     job_timeout_seconds: int = 120
     page_timeout_ms: int = 30_000
     no_progress_limit: int = 3
+    max_workers: int = 1
+    queue_capacity: int = 100
+    retention_keep_per_source: int = 10
+    snapshot_stale_after_seconds: int = 86_400
     config_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -127,12 +131,27 @@ class Settings:
                 "config_path",
             ),
         )
+        auth_directory = Path(self.config_path).parent / "auth"
+        if Path(self.storage_state_path).parent != auth_directory:
+            raise SettingsError(
+                "storage_state_path must be inside the app-owned auth directory: "
+                f"{auth_directory}"
+            )
         if not isinstance(self.browser_headless, bool):
             raise SettingsError("browser_headless must be true or false.")
         for name, value, minimum, maximum in (
             ("job_timeout_seconds", self.job_timeout_seconds, 1, 3600),
             ("page_timeout_ms", self.page_timeout_ms, 100, 300_000),
             ("no_progress_limit", self.no_progress_limit, 1, 100),
+            ("max_workers", self.max_workers, 1, 2),
+            ("queue_capacity", self.queue_capacity, 1, 10_000),
+            ("retention_keep_per_source", self.retention_keep_per_source, 1, 100),
+            (
+                "snapshot_stale_after_seconds",
+                self.snapshot_stale_after_seconds,
+                0,
+                315_360_000,
+            ),
         ):
             if (
                 isinstance(value, bool)
@@ -174,6 +193,18 @@ class Settings:
             no_progress_limit=cls._integer(
                 setting("no_progress_limit", 3), "no_progress_limit"
             ),
+            max_workers=cls._integer(setting("max_workers", 1), "max_workers"),
+            queue_capacity=cls._integer(
+                setting("queue_capacity", 100), "queue_capacity"
+            ),
+            retention_keep_per_source=cls._integer(
+                setting("retention_keep_per_source", 10),
+                "retention_keep_per_source",
+            ),
+            snapshot_stale_after_seconds=cls._integer(
+                setting("snapshot_stale_after_seconds", 86_400),
+                "snapshot_stale_after_seconds",
+            ),
             config_path=config_path,
         )
 
@@ -200,6 +231,10 @@ class Settings:
             "job_timeout_seconds",
             "page_timeout_ms",
             "no_progress_limit",
+            "max_workers",
+            "queue_capacity",
+            "retention_keep_per_source",
+            "snapshot_stale_after_seconds",
         }
         unknown = sorted(set(value) - allowed)
         if unknown:
@@ -243,6 +278,10 @@ class Settings:
                 "job_timeout_seconds": self.job_timeout_seconds,
                 "page_timeout_ms": self.page_timeout_ms,
                 "no_progress_limit": self.no_progress_limit,
+                "max_workers": self.max_workers,
+                "queue_capacity": self.queue_capacity,
+                "retention_keep_per_source": self.retention_keep_per_source,
+                "snapshot_stale_after_seconds": self.snapshot_stale_after_seconds,
             },
             indent=2,
         )
@@ -292,6 +331,14 @@ class Settings:
             "job_timeout_seconds": self.job_timeout_seconds,
             "page_timeout_ms": self.page_timeout_ms,
             "no_progress_limit": self.no_progress_limit,
+            "max_workers": self.max_workers,
+            "queue_capacity": self.queue_capacity,
+            "retention_keep_per_source": self.retention_keep_per_source,
+            "snapshot_stale_after_seconds": self.snapshot_stale_after_seconds,
+            "per_source_concurrency": 1,
+            "per_auth_state_concurrency": 1,
+            "hard_worker_maximum": 4,
+            "route_mode": "direct",
         }
 
     def bearer_token(self) -> str | None:

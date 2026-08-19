@@ -71,7 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--no-open", action="store_true", help="Do not open the dashboard")
 
     mcp = commands.add_parser("mcp", help="Expose terminal local snapshots over MCP stdio")
-    mcp.add_argument("--url", default="http://127.0.0.1:5000")
+    mcp.add_argument(
+        "--url",
+        default=None,
+        help="Use the legacy loopback REST adapter instead of direct read-only SQLite",
+    )
 
     smoke = commands.add_parser("live-smoke", help="Capture at most two live Home-feed Posts")
     smoke.add_argument("--confirm-live-x", action="store_true")
@@ -116,6 +120,7 @@ def _database_ready(path: Path) -> tuple[bool, str]:
         return True, f"new database will be created at {path}"
     try:
         with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
             metadata = dict(connection.execute("SELECT key, value FROM schema_meta"))
             version = metadata.get("schema_version")
             compatible = False
@@ -224,7 +229,7 @@ def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
             "Run: xworkbench setup",
         )
     except FileNotFoundError:
-        result("WARN", "runtime path", f"missing at {runtime}", "Run: xworkbench setup")
+        result("FAIL", "runtime path", f"missing at {runtime}", "Run: xworkbench setup")
     except OSError as exc:
         result("FAIL", "runtime path", str(exc), "Check the configured path.")
 
@@ -249,15 +254,26 @@ def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
         "missing": "missing",
         "invalid_local_state": "invalid local Playwright JSON or permissions",
     }.get(browser_state, "valid local Playwright JSON (contents hidden)")
+    auth_level = "PASS" if local_valid else "WARN" if browser_state == "missing" else "FAIL"
     result(
-        "PASS" if local_valid else "FAIL",
+        auth_level,
         "local auth state",
         local_message,
         None if local_valid else "Run: xworkbench auth",
     )
     verified_at = browser_status.get("verifiedAt")
-    if browser_state == "verified_live" and isinstance(verified_at, str):
-        result("PASS", "live verification", f"verified live at {verified_at}")
+    if isinstance(verified_at, str):
+        detail = (
+            f"verified live at {verified_at}"
+            if browser_state == "verified_live"
+            else f"last verified live at {verified_at}; current status is {browser_state}"
+        )
+        result(
+            "PASS" if browser_state == "verified_live" else "WARN",
+            "last live verification",
+            detail,
+            None if browser_state == "verified_live" else "Run: xworkbench auth",
+        )
     else:
         verification_message = {
             "ready": "legacy verification marker has no timestamp",
@@ -268,7 +284,12 @@ def _doctor(settings: Settings, *, require_token: bool, port: int) -> int:
             "invalid_local_state": "cannot verify invalid local state",
             "missing": "never live-verified",
         }.get(browser_state, "no valid live-verification status")
-        result("WARN", "live verification", verification_message, "Run: xworkbench auth")
+        result(
+            "WARN",
+            "last live verification",
+            verification_message,
+            "Run: xworkbench auth",
+        )
 
     try:
         token = settings.bearer_token()
@@ -492,6 +513,7 @@ def _run_live_smoke(settings: Settings, *, confirmed: bool) -> int:
             root / "no-token",
             allow_environment_token=False,
             storage_state_path=settings.storage_state_path,
+            config_path=settings.config_path,
             browser_headless=False,
             job_timeout_seconds=settings.job_timeout_seconds,
             page_timeout_ms=settings.page_timeout_ms,
@@ -550,7 +572,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "mcp":
             from .mcp_server import run_mcp
 
-            run_mcp(args.url)
+            run_mcp(
+                args.url,
+                database_path=None if args.url else settings.database_path,
+            )
             return 0
         if args.command == "live-smoke":
             return _run_live_smoke(settings, confirmed=args.confirm_live_x)

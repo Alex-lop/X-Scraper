@@ -31,6 +31,7 @@ def test_cli_exposes_recovered_commands_and_bounded_live_gate():
         "live-smoke",
     }
     assert parser.parse_args(["serve", "--port", "0"]).port == 0
+    assert parser.parse_args(["mcp"]).url is None
     assert parser.parse_args(["doctor", "--require-token"]).require_token is True
     assert parser.parse_args(["live-smoke", "--confirm-live-x"]).confirm_live_x is True
 
