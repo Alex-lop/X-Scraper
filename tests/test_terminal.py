@@ -26,6 +26,7 @@ class _LocalFixtureClient:
         self.peak = 0
         self._lock = threading.Lock()
         self.progress = {
+            "eventEpoch": "a" * 32,
             "events": [
                 {
                     "sequence": 7,
@@ -121,7 +122,14 @@ class _LocalFixtureClient:
                     }
                 }
             if path == "/api/progress":
-                return copy.deepcopy(self.progress)
+                progress = copy.deepcopy(self.progress)
+                after = query.get("after", 0) if isinstance(query, dict) else 0
+                progress["events"] = [
+                    event
+                    for event in progress.get("events", [])
+                    if isinstance(event.get("sequence"), int) and event["sequence"] > after
+                ]
+                return progress
             if path == "/api/queue/metrics":
                 return copy.deepcopy(self.metrics)
             if path == "/api/sources":
@@ -271,6 +279,65 @@ def test_monitor_is_responsive_read_only_stale_safe_and_serial(size):
 
             app.action_open_web()
             assert opened == ["http://127.0.0.1:5000"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("restart_sequence", [1, 7, 9])
+def test_monitor_replays_progress_after_server_event_stream_reset(restart_sequence):
+    async def scenario() -> None:
+        client = _LocalFixtureClient()
+        app = TerminalWorkbench(
+            "http://127.0.0.1:5000",
+            owner=False,
+            client=client,
+        )
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.pause()
+            assert app._last_sequence == 7
+            assert app._event_epoch == "a" * 32
+            initial_progress_queries = [
+                call[2]
+                for call in client.calls
+                if call[:2] == ("GET", "/api/progress")
+            ]
+            assert initial_progress_queries == [{"after": 0, "limit": 100}]
+
+            restarted = copy.deepcopy(client.progress)
+            restarted["eventEpoch"] = "b" * 32
+            restarted["events"] = [
+                {
+                    "sequence": restart_sequence,
+                    "type": "started",
+                    "jobId": "job-1",
+                    "status": "running",
+                    "count": 1,
+                }
+            ]
+            restarted["lastSequence"] = restart_sequence
+            restarted["gap"] = False
+            client.progress = restarted
+            call_start = len(client.calls)
+
+            await app._poll_queue(force=True)
+
+            progress_queries = [
+                call[2]
+                for call in client.calls[call_start:]
+                if call[:2] == ("GET", "/api/progress")
+            ]
+            assert progress_queries == [
+                {"after": 7, "limit": 100},
+                {"after": 0, "limit": 100},
+            ]
+            assert app._event_epoch == "b" * 32
+            assert app._last_sequence == restart_sequence
+            assert f"#{restart_sequence} started" in str(
+                app.query_one("#queue-events", Static).content
+            )
+            assert "gap: True" in str(app.query_one("#queue-metrics", Static).content)
+            assert str(app.query_one("#jobs-table", DataTable).get_row_at(0)[2]) == "succeeded"
+            assert client.peak == 1
 
     asyncio.run(scenario())
 

@@ -52,18 +52,26 @@ The production-reachable local matrix is recorded in
 [`reachable-mixed-provider-2026-08-20.json`](../benchmarks/reachable-mixed-provider-2026-08-20.json).
 Each case used real saved-source creation/listing and batch preview/confirm, SQLite admission and
 leases, one production Playwright provider against a loopback fixture, and one production official
-provider with an in-memory synthetic transport. It ran three times per worker count.
+provider with an in-memory synthetic transport. Three paired repetitions ran in alternating
+`AB/BA/AB` order. The middle pair reverses order, but with only three pairs residual order and
+warm-cache bias remain. Each run recorded both absolute peak process-tree RSS and the increment
+above a baseline sampled immediately before the case started. Wall timing excluded sampler startup
+and shutdown. CPU combined the coordinator `RUSAGE_SELF` delta after subtracting sampler-thread
+`thread_time` with the maximum cumulative CPU observed for each descendant PID in the same `ps`
+snapshots. Observer `ps` PIDs were excluded; `RUSAGE_CHILDREN` was not used.
 
 | Fixture | Workers | Jobs/run | Median wall | Median process-tree RSS | Median CPU | Median SQLite fraction | Cleanup |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Route-admitted Browser + synthetic official | 1 | 2 | 1.081s | 497.2MB | 0.847s | 0.3742% | 0 failures |
-| Route-admitted Browser + synthetic official | 2 | 2 | 0.603s | 482.9MB | 0.690s | 0.6193% | 0 failures |
+| Route-admitted Browser + synthetic official | 1 | 2 | 1.194s | 468.4MB | 0.462166s | 0.3214% | 0 failures |
+| Route-admitted Browser + synthetic official | 2 | 2 | 0.591s | 499.6MB | 0.481773s | 0.7398% | 0 failures |
 
-The two-worker median was 1.793 times faster. CPU did not grow, incremental median RSS was below the
-128MiB ceiling, SQLite callback time remained below 20% of wall time, backlog stayed at one, the
-stable state digest matched, and exact results, duplicate, lease, thread, Chromium-descendant,
-cleanup, and zero-egress gates passed. This retains the global maximum of two. It does not permit
-two Browser or two official jobs to run together and does not support a live-X speed claim.
+The two-worker median was 2.020× as fast. CPU grew by about 4.2%, below the 25% ceiling. Median
+baseline-adjusted process-tree RSS was `397,606,912` bytes with one worker and `428,228,608` bytes
+with two, so the two-worker increment was `30,621,696` bytes higher and remained within the 128MiB
+ceiling. SQLite callback time remained below 20% of wall time, backlog stayed at one, the stable state
+digest matched, and exact results, duplicate, lease, thread, Chromium-descendant, cleanup, and
+zero-egress gates passed. This retains the global maximum of two. It does not permit two Browser or
+two official jobs to run together and does not support a live-X speed claim.
 
 The earlier [`queue-performance-2026-08-19.json`](../benchmarks/queue-performance-2026-08-19.json)
 is preserved with its raw `3.111s`, `1.288s`, and 2.415x values. That direct-submit matrix injected

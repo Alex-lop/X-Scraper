@@ -232,6 +232,7 @@ class JobService:
         self._persistence_waiting = 0
         self._max_persistence_backlog = 0
         self._event_buffer: deque[dict[str, Any]] = deque(maxlen=event_capacity)
+        self._event_epoch = uuid.uuid4().hex
         self._event_sequence = 0
         self._event_dropped = 0
         self._event_coalesced = 0
@@ -291,6 +292,7 @@ class JobService:
         except OSError:
             pass
         self._lock_owned = False
+        atexit.unregister(self.shutdown)
 
     def start(self) -> None:
         if any(thread.is_alive() for thread in self._threads):
@@ -851,6 +853,7 @@ class JobService:
         return {
             "events": events,
             "jobs": jobs,
+            "eventEpoch": self._event_epoch,
             "lastSequence": last_sequence,
             "gap": gap,
         }
@@ -1085,6 +1088,8 @@ class JobService:
                         activated = True
                     try:
                         added = self.storage.add_posts(job_id, posts, provider_state, metadata)
+                        if not added and metadata.get("resourcesReturned"):
+                            self.storage.record_cancelled_official_usage(job_id, metadata)
                         with self._condition:
                             self._emit_locked("persisted", job_id, count=added)
                         return added

@@ -1,5 +1,9 @@
+import gc
+import json
 import threading
 import time
+import uuid
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from urllib.error import URLError
@@ -158,6 +162,96 @@ def test_shutdown_interrupts_active_official_request_and_releases_worker_lock(tm
     assert not any(thread.is_alive() for thread in service._threads)
     assert not service._lock_path.exists()
     assert service.metrics()["cleanupFailures"] == 0
+
+
+@pytest.mark.parametrize("action", ["shutdown", "cancel"])
+def test_successful_official_page_accounts_for_interruption(tmp_path, action):
+    token_path = tmp_path / "auth" / "token"
+    token_path.parent.mkdir(mode=0o700)
+    token_path.write_text("fixture-token", encoding="utf-8")
+    token_path.chmod(0o600)
+    settings = Settings(tmp_path / f"{action}-success.db", token_path)
+    reading = threading.Event()
+    release = threading.Event()
+
+    class Response:
+        headers = {"x-rate-limit-remaining": "41", "x-rate-limit-reset": "123"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            reading.set()
+            assert release.wait(2)
+            return json.dumps(
+                {
+                    "data": [
+                        {"id": str(index), "text": "fixture", "author_id": "fixture"}
+                        for index in range(10)
+                    ],
+                    "meta": {"result_count": 10},
+                }
+            ).encode()
+
+    provider = XApiProvider(settings, opener=lambda *_args, **_kwargs: Response())
+    storage = Storage(settings.database_path)
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "search", "sourceValue": "fixture", "maxPosts": 10}
+    )
+    service = JobService(storage, provider, start_worker=False)
+    job_id = service.submit(request, compile_request(request))
+    service.start()
+    assert reading.wait(2)
+
+    if action == "shutdown":
+        shutdown = threading.Thread(target=service.shutdown)
+        shutdown.start()
+        assert service._stop_event.wait(2)
+        release.set()
+        shutdown.join(timeout=5)
+        assert not shutdown.is_alive()
+    else:
+        assert service.cancel(job_id)
+        release.set()
+        service.shutdown()
+
+    job = storage.get_job(job_id)
+    assert job["status"] == job["error_code"] == (
+        "interrupted" if action == "shutdown" else "cancelled"
+    )
+    assert job["collected_count"] == storage.count_job_posts(job_id) == (
+        10 if action == "shutdown" else 0
+    )
+    assert job["checkpoint"]["metadata"]["resourcesReturned"] == {
+        "posts": 10,
+        "users": 0,
+        "media": 0,
+    }
+    assert job["rate_limit_remaining"] == 41
+    assert job["rate_limit_reset"] == 123
+    assert any("resource usage was recorded" in warning for warning in job["warnings"]) is (
+        action == "cancel"
+    )
+    assert job["lease_owner"] is job["lease_expires_at"] is None
+    assert not service._lock_path.exists()
+
+
+def test_shutdown_releases_atexit_reference(tmp_path):
+    storage = Storage(tmp_path / "shutdown-reference.db")
+    storage.initialize()
+    service = JobService(storage, Provider("ok"), start_worker=False)
+    service.start()
+    reference = weakref.ref(service)
+
+    service.shutdown()
+    del service
+    gc.collect()
+
+    assert reference() is None
 
 
 def test_provider_failure_preserves_completed_page(tmp_path):
@@ -1037,6 +1131,9 @@ def test_progress_events_are_bounded_coalesced_and_fall_back_to_durable_state(
     current = service.events(snapshot["lastSequence"])
     metrics = service.metrics()
     service.shutdown()
+    restarted = JobService(storage, EventProvider(), start_worker=False)
+    restarted_epoch = restarted.events(0)["eventEpoch"]
+    restarted.shutdown()
 
     assert [event["sequence"] for event in snapshot["events"]] == [2, 4, 5]
     assert [event["type"] for event in snapshot["events"]] == [
@@ -1049,6 +1146,9 @@ def test_progress_events_are_bounded_coalesced_and_fall_back_to_durable_state(
     assert snapshot["jobs"][0]["id"] == job_id
     assert snapshot["jobs"][0]["status"] == "succeeded"
     assert current["events"] == [] and current["gap"] is False
+    assert uuid.UUID(hex=snapshot["eventEpoch"]).hex == snapshot["eventEpoch"]
+    assert current["eventEpoch"] == snapshot["eventEpoch"]
+    assert restarted_epoch != snapshot["eventEpoch"]
     assert metrics["eventBufferCapacity"] == metrics["eventBufferSize"] == 3
     assert metrics["eventLastSequence"] == 5
     assert metrics["eventDropped"] == metrics["eventCoalesced"] == 1

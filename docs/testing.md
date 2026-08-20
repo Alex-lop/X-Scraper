@@ -97,10 +97,17 @@ The default runtime probe supports only coordinator-process RSS/CPU; unsupported
 the non-applicable synchronous event-loop metric must remain explicit nulls, not green zeros.
 
 The production-reachable concurrency matrix is deliberately opt-in because it starts real
-Chromium. Each of three one-worker and three two-worker repetitions uses saved sources, the real
+Chromium. Three paired one-worker/two-worker repetitions run in alternating `AB/BA/AB` order. The
+middle pair reverses the order, but three pairs do not eliminate residual order or warm-cache bias.
+Every case uses saved sources, the real
 preview/confirm routes, SQLite admission, one production Playwright provider against a numeric
 loopback page, and one production official provider with an in-memory synthetic transport. Browser
-navigation is intercepted before egress and every unexpected destination aborts:
+navigation is intercepted before egress and every unexpected destination aborts. Process-tree RSS
+is sampled as both an absolute peak and a per-case increment above the baseline taken immediately
+before that case starts. Wall time starts after sampler readiness and stops when both jobs finish.
+CPU is the coordinator `RUSAGE_SELF` delta minus sampler-thread `thread_time`, plus the maximum
+cumulative CPU observed for each descendant PID in the same `ps` snapshots. The observer `ps` PID
+is excluded; the matrix does not use `RUSAGE_CHILDREN`:
 
 ```bash
 XWORKBENCH_RUN_BROWSER_MATRIX=1 \
@@ -111,10 +118,11 @@ CI asserts topology, exact results, stable state, leases, duplicate absence, bac
 and cleanup, not timing. To apply the local decision thresholds explicitly, also set
 `XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1`.
 
-On the recorded 2026-08-20 arm64 macOS machine, median wall time fell from `1.081s` to `0.603s`
-(`1.793x`) while median CPU fell, median incremental process-tree RSS was negative, median SQLite
-callback fraction was `0.6193%`, and backlog stayed at one. All correctness, cleanup, and zero-egress
-gates passed, so the supported maximum remains two **globally**. Production auth keys still
+On the recorded 2026-08-20 arm64 macOS machine, median wall time fell from `1.194s` to `0.591s`
+(`2.020x`) while median CPU grew about 4.2%, from `0.462166s` to `0.481773s`. The two-worker median
+baseline-adjusted process-tree RSS was `30,621,696` bytes higher than the one-worker median, median
+SQLite callback fraction was `0.7398%`, and backlog stayed at one. All correctness, cleanup, and
+zero-egress gates passed, so the supported maximum remains two **globally**. Production auth keys still
 serialize Browser+Browser and official+official; only a mixed Browser+official workload can occupy
 both workers. See [ADR 0002](adr/0002-bounded-capture-queue.md) and the
 [reachable artifact](benchmarks/reachable-mixed-provider-2026-08-20.json).
@@ -155,9 +163,9 @@ The mount namespace is used to make the network namespace visible through remoun
 not a general filesystem sandbox.
 
 At `c843690`, the hardened local pre-CI gate ran three times with 30 passed and one macOS skip per
-run; the skipped item is the Linux-only namespace/privilege assertion. At the current feature
-checkpoint, the ordinary full suite with installed local Chromium reported 229 passed and 32
-skipped: 31 gated lab items plus the opt-in browser matrix.
+run; the skipped item is the Linux-only namespace/privilege assertion. At repair source checkpoint
+`74fe233`, the ordinary full suite with installed local Chromium reported 237 passed and 32 skipped:
+31 gated lab items plus the opt-in browser matrix.
 
 At capability-lab revision `1bd21ea`,
 [CI run 32230574720](https://github.com/Alex-lop/X-Scraper/actions/runs/32230574720) passed all

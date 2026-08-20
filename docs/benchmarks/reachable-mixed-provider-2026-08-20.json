@@ -1,6 +1,9 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 4,
   "recordedDate": "2026-08-20",
+  "sourceRevision": "74fe2333ee44dd7dc26f4b9dad6c28bf59f16bd5",
+  "trackedWorktreeClean": true,
+  "command": "XWORKBENCH_RUN_BROWSER_MATRIX=1 XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1 .venv/bin/python -m pytest -q -s tests/test_queue_performance.py -k production_playwright_mixed_provider_matrix_is_reachable",
   "environment": {
     "operatingSystem": "Darwin 25.5.0",
     "architecture": "arm64",
@@ -12,204 +15,397 @@
   "productionAdmission": true,
   "externalEgress": false,
   "repetitionsPerCase": 3,
+  "executionOrder": [
+    {
+      "repetition": 1,
+      "sequence": 1,
+      "workers": 1
+    },
+    {
+      "repetition": 1,
+      "sequence": 2,
+      "workers": 2
+    },
+    {
+      "repetition": 2,
+      "sequence": 3,
+      "workers": 2
+    },
+    {
+      "repetition": 2,
+      "sequence": 4,
+      "workers": 1
+    },
+    {
+      "repetition": 3,
+      "sequence": 5,
+      "workers": 1
+    },
+    {
+      "repetition": 3,
+      "sequence": 6,
+      "workers": 2
+    }
+  ],
+  "measurementDesign": "paired alternating AB/BA/AB in one process; residual order and warm-cache bias remain",
+  "rssBasis": "per-run peak process-tree RSS minus the pre-case baseline",
+  "cpuBasis": "coordinator RUSAGE_SELF delta minus sampler thread_time, plus maximum cumulative CPU per observed descendant PID; observer ps PIDs excluded",
   "runs": [
     {
-      "workers": 1,
+      "baselineProcessTreeRssBytes": 64339968,
+      "cleanupFailures": 0,
+      "cleanupSeconds": 0.000061,
+      "cpuBreakdown": {
+        "coordinatorExcludingSamplerSeconds": 0.048378,
+        "coordinatorIncludingSamplerSeconds": 0.09364,
+        "observedDescendantProcessCount": 5,
+        "observedDescendantSeconds": 0.52,
+        "samplerThreadSeconds": 0.045262
+      },
+      "cpuSeconds": 0.568378,
+      "duplicateCount": 0,
+      "externalEgressCount": 0,
+      "incrementalProcessTreeRssBytes": 424591360,
+      "jobIds": [
+        "e49860cec85c42e2b55bccffbe77e68d",
+        "e6b1c8c9dd8d40cbb64e58137b5f2a06"
+      ],
+      "jobs": 2,
+      "maxPersistenceBacklog": 1,
+      "peakCollectors": 1,
+      "peakProcessTreeRssBytes": 488931328,
+      "queueWaitP50Ms": 0.531,
+      "queueWaitP95Ms": 1118.623,
+      "remainingChromiumDescendants": 0,
+      "remainingLeases": 0,
+      "remainingWorkerThreads": 0,
       "repetition": 1,
-      "jobs": 2,
-      "wallSeconds": 1.145,
-      "cpuSeconds": 0.858,
-      "peakProcessTreeRssBytes": 505479168,
-      "queueWaitP50Ms": 0.291,
-      "queueWaitP95Ms": 629.91,
-      "throughputJobsPerSecond": 1.728,
-      "sqliteCallbackSeconds": 0.00369,
-      "sqliteCallbackFraction": 0.003223,
-      "maxPersistenceBacklog": 1,
-      "jobIds": ["21dc240c893d4c3c8583204a193b8543", "83eeb8c1f8994683be1fbe3b07d17361"],
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
-      "duplicateCount": 0,
-      "remainingLeases": 0,
-      "remainingWorkerThreads": 0,
-      "remainingChromiumDescendants": 0,
+      "sequence": 1,
+      "sqliteCallbackFraction": 0.002477,
+      "sqliteCallbackSeconds": 0.003941,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
-      "cleanupSeconds": 0.00012,
-      "cleanupFailures": 0,
-      "externalEgressCount": 0,
       "syntheticOfficialRequests": 1,
-      "peakCollectors": 1
+      "throughputJobsPerSecond": 1.212,
+      "wallSeconds": 1.591,
+      "workers": 1
     },
     {
-      "workers": 1,
-      "repetition": 2,
-      "jobs": 2,
-      "wallSeconds": 1.08,
-      "cpuSeconds": 0.83,
-      "peakProcessTreeRssBytes": 482312192,
-      "queueWaitP50Ms": 0.333,
-      "queueWaitP95Ms": 581.227,
-      "throughputJobsPerSecond": 1.832,
-      "sqliteCallbackSeconds": 0.004043,
-      "sqliteCallbackFraction": 0.003742,
-      "maxPersistenceBacklog": 1,
-      "jobIds": ["1bbd4f26be5542a9bb0e4af1efa0e184", "e3f9815c54504b8c8311a2fe6f879443"],
-      "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+      "baselineProcessTreeRssBytes": 73449472,
+      "cleanupFailures": 0,
+      "cleanupSeconds": 0.000078,
+      "cpuBreakdown": {
+        "coordinatorExcludingSamplerSeconds": 0.049704,
+        "coordinatorIncludingSamplerSeconds": 0.066653,
+        "observedDescendantProcessCount": 5,
+        "observedDescendantSeconds": 0.44,
+        "samplerThreadSeconds": 0.016949
       },
+      "cpuSeconds": 0.489704,
       "duplicateCount": 0,
+      "externalEgressCount": 0,
+      "incrementalProcessTreeRssBytes": 427474944,
+      "jobIds": [
+        "b77fac007e5d40e1b0382425a4725c39",
+        "3f4c165f859848df8656c6857b0c694d"
+      ],
+      "jobs": 2,
+      "maxPersistenceBacklog": 1,
+      "peakCollectors": 2,
+      "peakProcessTreeRssBytes": 500924416,
+      "queueWaitP50Ms": 0.289,
+      "queueWaitP95Ms": 0.301,
+      "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
-      "remainingChromiumDescendants": 0,
-      "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
-      "cleanupSeconds": 0.000094,
-      "cleanupFailures": 0,
-      "externalEgressCount": 0,
-      "syntheticOfficialRequests": 1,
-      "peakCollectors": 1
-    },
-    {
-      "workers": 1,
-      "repetition": 3,
-      "jobs": 2,
-      "wallSeconds": 1.081,
-      "cpuSeconds": 0.847,
-      "peakProcessTreeRssBytes": 497188864,
-      "queueWaitP50Ms": 0.272,
-      "queueWaitP95Ms": 570.378,
-      "throughputJobsPerSecond": 1.832,
-      "sqliteCallbackSeconds": 0.0062,
-      "sqliteCallbackFraction": 0.005736,
-      "maxPersistenceBacklog": 1,
-      "jobIds": ["f21a2e7f26b2416c8de377056e5e5258", "ed8a28e8193c41d7be06cca0db5445e8"],
-      "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
-      },
-      "duplicateCount": 0,
-      "remainingLeases": 0,
-      "remainingWorkerThreads": 0,
-      "remainingChromiumDescendants": 0,
-      "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
-      "cleanupSeconds": 0.000123,
-      "cleanupFailures": 0,
-      "externalEgressCount": 0,
-      "syntheticOfficialRequests": 1,
-      "peakCollectors": 1
-    },
-    {
-      "workers": 2,
       "repetition": 1,
-      "jobs": 2,
-      "wallSeconds": 0.603,
-      "cpuSeconds": 0.69,
-      "peakProcessTreeRssBytes": 488620032,
-      "queueWaitP50Ms": 0.385,
-      "queueWaitP95Ms": 0.405,
-      "throughputJobsPerSecond": 3.251,
-      "sqliteCallbackSeconds": 0.005244,
-      "sqliteCallbackFraction": 0.008703,
-      "maxPersistenceBacklog": 1,
-      "jobIds": ["0bf0b6bf662142768da6c2c84576c47b", "1b69a9ca56474cd5844ee0ea381b589e"],
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
-      "duplicateCount": 0,
-      "remainingLeases": 0,
-      "remainingWorkerThreads": 0,
-      "remainingChromiumDescendants": 0,
+      "sequence": 2,
+      "sqliteCallbackFraction": 0.007443,
+      "sqliteCallbackSeconds": 0.004406,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
-      "cleanupSeconds": 0.000152,
-      "cleanupFailures": 0,
-      "externalEgressCount": 0,
       "syntheticOfficialRequests": 1,
-      "peakCollectors": 2
+      "throughputJobsPerSecond": 3.163,
+      "wallSeconds": 0.592,
+      "workers": 2
     },
     {
-      "workers": 2,
+      "baselineProcessTreeRssBytes": 70254592,
+      "cleanupFailures": 0,
+      "cleanupSeconds": 0.000069,
+      "cpuBreakdown": {
+        "coordinatorExcludingSamplerSeconds": 0.042621,
+        "coordinatorIncludingSamplerSeconds": 0.058426,
+        "observedDescendantProcessCount": 5,
+        "observedDescendantSeconds": 0.4,
+        "samplerThreadSeconds": 0.015805
+      },
+      "cpuSeconds": 0.442621,
+      "duplicateCount": 0,
+      "externalEgressCount": 0,
+      "incrementalProcessTreeRssBytes": 429326336,
+      "jobIds": [
+        "e851f44f87b84c74baa76838d0af3a95",
+        "95d2d98a04644c61b149b7d682044257"
+      ],
+      "jobs": 2,
+      "maxPersistenceBacklog": 1,
+      "peakCollectors": 2,
+      "peakProcessTreeRssBytes": 499580928,
+      "queueWaitP50Ms": 0.261,
+      "queueWaitP95Ms": 0.273,
+      "remainingChromiumDescendants": 0,
+      "remainingLeases": 0,
+      "remainingWorkerThreads": 0,
       "repetition": 2,
-      "jobs": 2,
-      "wallSeconds": 0.601,
-      "cpuSeconds": 0.679,
-      "peakProcessTreeRssBytes": 479133696,
-      "queueWaitP50Ms": 0.29,
-      "queueWaitP95Ms": 0.307,
-      "throughputJobsPerSecond": 3.262,
-      "sqliteCallbackSeconds": 0.003722,
-      "sqliteCallbackFraction": 0.006193,
-      "maxPersistenceBacklog": 1,
-      "jobIds": ["805a668438a4423eb04fe577567731ae", "acf41340d25e4074b3acd35c1df7b259"],
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
-      "duplicateCount": 0,
-      "remainingLeases": 0,
-      "remainingWorkerThreads": 0,
-      "remainingChromiumDescendants": 0,
+      "sequence": 3,
+      "sqliteCallbackFraction": 0.007398,
+      "sqliteCallbackSeconds": 0.004064,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
-      "cleanupSeconds": 0.000139,
-      "cleanupFailures": 0,
-      "externalEgressCount": 0,
       "syntheticOfficialRequests": 1,
-      "peakCollectors": 2
+      "throughputJobsPerSecond": 3.396,
+      "wallSeconds": 0.549,
+      "workers": 2
     },
     {
-      "workers": 2,
-      "repetition": 3,
-      "jobs": 2,
-      "wallSeconds": 0.622,
-      "cpuSeconds": 0.702,
-      "peakProcessTreeRssBytes": 482902016,
-      "queueWaitP50Ms": 0.274,
-      "queueWaitP95Ms": 0.283,
-      "throughputJobsPerSecond": 3.155,
-      "sqliteCallbackSeconds": 0.003554,
-      "sqliteCallbackFraction": 0.005717,
-      "maxPersistenceBacklog": 1,
-      "jobIds": ["5f5932ade5a24533b2dc192d86447f8d", "9ec0f6f1c6964fb592afb67909069e12"],
-      "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+      "baselineProcessTreeRssBytes": 70778880,
+      "cleanupFailures": 0,
+      "cleanupSeconds": 0.000047,
+      "cpuBreakdown": {
+        "coordinatorExcludingSamplerSeconds": 0.046199,
+        "coordinatorIncludingSamplerSeconds": 0.076197,
+        "observedDescendantProcessCount": 5,
+        "observedDescendantSeconds": 0.4,
+        "samplerThreadSeconds": 0.029998
       },
+      "cpuSeconds": 0.446199,
       "duplicateCount": 0,
+      "externalEgressCount": 0,
+      "incrementalProcessTreeRssBytes": 397606912,
+      "jobIds": [
+        "6de19c44bc2a4b3c8d2b5e6990da992f",
+        "99c1179155de494aabfdb887e491ed0c"
+      ],
+      "jobs": 2,
+      "maxPersistenceBacklog": 1,
+      "peakCollectors": 1,
+      "peakProcessTreeRssBytes": 468385792,
+      "queueWaitP50Ms": 0.273,
+      "queueWaitP95Ms": 569.493,
+      "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
-      "remainingChromiumDescendants": 0,
+      "repetition": 2,
+      "resultIds": {
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
+      },
+      "sequence": 4,
+      "sqliteCallbackFraction": 0.003582,
+      "sqliteCallbackSeconds": 0.00372,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
-      "cleanupSeconds": 0.000189,
-      "cleanupFailures": 0,
-      "externalEgressCount": 0,
       "syntheticOfficialRequests": 1,
-      "peakCollectors": 2
+      "throughputJobsPerSecond": 1.859,
+      "wallSeconds": 1.038,
+      "workers": 1
+    },
+    {
+      "baselineProcessTreeRssBytes": 69992448,
+      "cleanupFailures": 0,
+      "cleanupSeconds": 0.000058,
+      "cpuBreakdown": {
+        "coordinatorExcludingSamplerSeconds": 0.052166,
+        "coordinatorIncludingSamplerSeconds": 0.081924,
+        "observedDescendantProcessCount": 5,
+        "observedDescendantSeconds": 0.41,
+        "samplerThreadSeconds": 0.029758
+      },
+      "cpuSeconds": 0.462166,
+      "duplicateCount": 0,
+      "externalEgressCount": 0,
+      "incrementalProcessTreeRssBytes": 397557760,
+      "jobIds": [
+        "da5766e36fcb4835bd978d38fe89809b",
+        "07ed962a698c4b289670a7e222951f13"
+      ],
+      "jobs": 2,
+      "maxPersistenceBacklog": 1,
+      "peakCollectors": 1,
+      "peakProcessTreeRssBytes": 467550208,
+      "queueWaitP50Ms": 0.251,
+      "queueWaitP95Ms": 725.3,
+      "remainingChromiumDescendants": 0,
+      "remainingLeases": 0,
+      "remainingWorkerThreads": 0,
+      "repetition": 3,
+      "resultIds": {
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
+      },
+      "sequence": 5,
+      "sqliteCallbackFraction": 0.003214,
+      "sqliteCallbackSeconds": 0.003839,
+      "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
+      "syntheticOfficialRequests": 1,
+      "throughputJobsPerSecond": 1.608,
+      "wallSeconds": 1.194,
+      "workers": 1
+    },
+    {
+      "baselineProcessTreeRssBytes": 70418432,
+      "cleanupFailures": 0,
+      "cleanupSeconds": 0.000061,
+      "cpuBreakdown": {
+        "coordinatorExcludingSamplerSeconds": 0.041773,
+        "coordinatorIncludingSamplerSeconds": 0.0578,
+        "observedDescendantProcessCount": 5,
+        "observedDescendantSeconds": 0.44,
+        "samplerThreadSeconds": 0.016027
+      },
+      "cpuSeconds": 0.481773,
+      "duplicateCount": 0,
+      "externalEgressCount": 0,
+      "incrementalProcessTreeRssBytes": 428228608,
+      "jobIds": [
+        "3c159b60a9e34a87abd855d286d2defe",
+        "89fec0e000be455d910b399ee27005ad"
+      ],
+      "jobs": 2,
+      "maxPersistenceBacklog": 1,
+      "peakCollectors": 2,
+      "peakProcessTreeRssBytes": 498647040,
+      "queueWaitP50Ms": 0.302,
+      "queueWaitP95Ms": 0.316,
+      "remainingChromiumDescendants": 0,
+      "remainingLeases": 0,
+      "remainingWorkerThreads": 0,
+      "repetition": 3,
+      "resultIds": {
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
+      },
+      "sequence": 6,
+      "sqliteCallbackFraction": 0.0069,
+      "sqliteCallbackSeconds": 0.004076,
+      "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
+      "syntheticOfficialRequests": 1,
+      "throughputJobsPerSecond": 3.176,
+      "wallSeconds": 0.591,
+      "workers": 2
     }
   ],
   "medians": {
+    "incrementalRssBytes": 30621696,
     "oneWorker": {
-      "wallSeconds": 1.081,
-      "cpuSeconds": 0.847,
-      "peakProcessTreeRssBytes": 497188864
+      "cpuSeconds": 0.462166,
+      "incrementalProcessTreeRssBytes": 397606912,
+      "peakProcessTreeRssBytes": 468385792,
+      "wallSeconds": 1.194
     },
+    "speedup": 2.02,
     "twoWorkers": {
-      "wallSeconds": 0.603,
-      "cpuSeconds": 0.69,
-      "peakProcessTreeRssBytes": 482902016,
-      "sqliteCallbackFraction": 0.006193
-    },
-    "speedup": 1.793,
-    "incrementalRssBytes": -14286848
+      "cpuSeconds": 0.481773,
+      "incrementalProcessTreeRssBytes": 428228608,
+      "peakProcessTreeRssBytes": 499580928,
+      "sqliteCallbackFraction": 0.007398,
+      "wallSeconds": 0.591
+    }
   },
   "decision": {
-    "speedupAtLeast15Percent": true,
-    "cpuGrowthAtMost25Percent": true,
-    "incrementalRssAtMost128MiB": true,
-    "sqliteFractionBelow20Percent": true,
     "backlogAtMost2": true,
     "correctnessCleanupZeroEgress": true,
+    "cpuGrowthAtMost25Percent": true,
+    "incrementalRssAtMost128MiB": true,
+    "speedupAtLeast15Percent": true,
+    "sqliteFractionBelow20Percent": true,
     "stableStateDigest": true,
     "supportedMaximum": 2,
     "scope": "Global mixed-provider ceiling only; same-provider Browser and official jobs remain serialized by provider auth key."

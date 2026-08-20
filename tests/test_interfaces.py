@@ -205,6 +205,25 @@ def test_monitor_dispatch_never_constructs_settings_or_runtime(monkeypatch):
     assert seen == ["http://127.0.0.1:6123"]
 
 
+def test_monitor_rejects_invalid_url_without_traceback_or_runtime(tmp_path, monkeypatch, capsys):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("XWORKBENCH_RUNTIME_DIR", str(runtime))
+    monkeypatch.setattr(
+        "xworkbench.cli._terminal_entrypoints",
+        lambda: (None, lambda url: LocalJsonClient(url)),
+    )
+    monkeypatch.setattr(
+        "xworkbench.cli.Settings.from_env",
+        lambda: (_ for _ in ()).throw(AssertionError("monitor must not load settings")),
+    )
+
+    assert main(["monitor", "--url", "https://example.com"]) == EXIT_PRECONDITION
+    assert not runtime.exists()
+    error = capsys.readouterr().err
+    assert "loopback HTTP dashboard root" in error
+    assert "Traceback" not in error
+
+
 def test_live_smoke_requires_explicit_confirmation_before_provider_use(monkeypatch, capsys):
     class ShouldNotConstruct:
         def __init__(self, settings):
@@ -281,6 +300,60 @@ def test_owner_server_cleans_up_after_frontend_error(tmp_path):
 
     assert not any(thread.is_alive() for thread in service._threads)
     assert not service._lock_path.exists()
+
+
+def test_owner_server_waits_until_serving_before_immediate_frontend(tmp_path, monkeypatch):
+    serving = threading.Event()
+    stopped = threading.Event()
+    readiness_checked = threading.Event()
+
+    class Server:
+        server_port = 54321
+
+        def serve_forever(self):
+            serving.set()
+            assert stopped.wait(2)
+
+        def shutdown(self):
+            stopped.set()
+
+        def server_close(self):
+            return None
+
+    class Service:
+        _threads = ()
+        _lock_path = tmp_path / "absent.lock"
+
+        def shutdown(self):
+            return None
+
+    class ReadyClient:
+        def __init__(self, url, *, timeout):
+            assert url == "http://127.0.0.1:54321"
+            assert timeout == 5
+
+        def get(self, path):
+            assert path == "/api/health"
+            assert serving.wait(2)
+            readiness_checked.set()
+            return {"status": "ok"}
+
+    app = type("App", (), {"extensions": {"xworkbench_jobs": Service()}})()
+    monkeypatch.setattr("xworkbench.cli.make_server", lambda *_args, **_kwargs: Server())
+    monkeypatch.setattr("xworkbench.cli.LocalJsonClient", ReadyClient)
+
+    assert (
+        _run_server(
+            app,
+            "127.0.0.1",
+            0,
+            open_browser=False,
+            frontend=lambda _url: 9,
+        )
+        == 9
+    )
+    assert readiness_checked.is_set()
+    assert stopped.is_set()
 
 
 def test_owner_server_bind_failure_still_stops_worker(monkeypatch):

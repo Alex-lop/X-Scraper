@@ -608,6 +608,8 @@ class XApiProvider:
                 next_token,
                 {**rate, "resourcesReturned": resources, "warnings": page_warnings},
             )
+            if should_cancel():
+                raise CollectionCancelled("Collection cancelled by the user.")
             stored_remaining -= added
             resource_remaining -= returned_posts
             repeated_token = bool(next_token and next_token in seen_tokens)
