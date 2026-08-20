@@ -538,7 +538,10 @@ def test_batch_preview_is_canonical_double_confirm_is_idempotent_and_cancel_is_s
 
     progress = client.get("/api/progress?after=0&limit=100")
     assert progress.status_code == 200
-    assert {event["jobId"] for event in progress.get_json()["events"]} >= set(
+    progress_payload = progress.get_json()
+    assert len(progress_payload["eventEpoch"]) == 32
+    assert set(progress_payload["eventEpoch"]) <= set("0123456789abcdef")
+    assert {event["jobId"] for event in progress_payload["events"]} >= set(
         first.get_json()["jobIds"]
     )
 

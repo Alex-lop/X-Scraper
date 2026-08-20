@@ -29,8 +29,8 @@ commit, passing workflow, or star count does not by itself prove current X compa
 
 ## X-Scraper
 
-- **Snapshot — `REPO FACT`:** local implementation checkpoint
-  `71d42c58690e83058f21813d5ea781b76f62b9d9`; no published package release;
+- **Snapshot — `REPO FACT`:** [feature implementation checkpoint](https://github.com/Alex-lop/X-Scraper/commit/62ccc366906d15e086ba872d061165c835b1d201)
+  `62ccc366906d15e086ba872d061165c835b1d201`; no published package release;
   MIT; repository star count intentionally omitted because this is the subject, not a candidate.
 - **Documentation language:** English.
 - **Transport class:** official X API plus a separately approved Playwright Browser provider.
@@ -39,11 +39,10 @@ commit, passing workflow, or star count does not by itself prove current X compa
 - **Durability:** SQLite jobs, atomic batch admission, leases, checkpoints, cancellation, restart
   recovery, snapshots, local search, comparison, and JSON/CSV export.
 - **UI:** loopback web dashboard, CLI, read-only MCP, and optional terminal operations UI.
-- **CI evidence — `PROJECT CI`:** the earlier baseline passed Python, JavaScript, fixture Chromium,
-  packaging, and isolated capability-lab workflow jobs. At this checkpoint, local gates cover the
-  dashboard workflow, terminal Pilot sizes, and production-route topology, but an exact-head hosted
-  run is pending. The route regression proves the global two-worker ceiling and same-provider auth
-  serialization.
+- **CI evidence — `PROJECT CI`:** [feature checkpoint run 32337098742](https://github.com/Alex-lop/X-Scraper/actions/runs/32337098742)
+  passed Python 3.11-3.13, JavaScript, packaging, dashboard/fixture Chromium, terminal Pilot,
+  production-route topology, and isolated capability-lab jobs. The route regression proves the
+  global two-worker ceiling and same-provider auth serialization.
 - **Contradictory evidence:** the historical 2.415× Browser matrix injected distinct synthetic auth
   keys and bypassed route admission. Live X, Windows, external MCP-client, and browser-process-tree
   governance are not established.

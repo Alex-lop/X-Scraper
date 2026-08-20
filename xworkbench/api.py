@@ -777,6 +777,14 @@ def _public_queue_metrics(
 
 def _public_progress(value: Any, *, limit: int) -> dict[str, Any]:
     value = value if isinstance(value, dict) else {}
+    raw_epoch = value.get("eventEpoch")
+    event_epoch = (
+        raw_epoch
+        if isinstance(raw_epoch, str)
+        and len(raw_epoch) == 32
+        and all(character in "0123456789abcdef" for character in raw_epoch)
+        else None
+    )
     raw_events = value.get("events")
     safe_events = []
     for event in raw_events if isinstance(raw_events, list) else []:
@@ -824,6 +832,7 @@ def _public_progress(value: Any, *, limit: int) -> dict[str, Any]:
             for job in (raw_jobs[:100] if isinstance(raw_jobs, list) else [])
             if isinstance(job, dict)
         ],
+        "eventEpoch": event_epoch,
         "lastSequence": last_sequence,
         "gap": value.get("gap") is True,
         "hasMore": has_more,

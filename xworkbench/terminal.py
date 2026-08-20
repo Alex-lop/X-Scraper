@@ -127,6 +127,7 @@ class TerminalWorkbench(App[None]):
         self.open_browser = open_browser
         self.authenticate = authenticate
         self._request_lock = asyncio.Lock()
+        self._event_epoch: str | None = None
         self._last_sequence = 0
         self._next_retry = 0.0
         self._jobs: list[dict[str, Any]] = []
@@ -281,12 +282,32 @@ class TerminalWorkbench(App[None]):
     async def _poll_queue(self, *, force: bool = False) -> None:
         if not force and time.monotonic() < self._next_retry:
             return
+        requested_sequence = self._last_sequence
+        event_stream_reset = False
         try:
             progress = await self._call(
                 self.client.get,
                 "/api/progress",
-                {"after": self._last_sequence, "limit": 100},
+                {"after": requested_sequence, "limit": 100},
             )
+            event_epoch = progress.get("eventEpoch")
+            last_sequence = progress.get("lastSequence")
+            event_stream_reset = (
+                self._event_epoch is not None
+                and isinstance(event_epoch, str)
+                and bool(event_epoch)
+                and event_epoch != self._event_epoch
+            ) or (
+                isinstance(last_sequence, int)
+                and not isinstance(last_sequence, bool)
+                and last_sequence < requested_sequence
+            )
+            if event_stream_reset:
+                progress = await self._call(
+                    self.client.get,
+                    "/api/progress",
+                    {"after": 0, "limit": 100},
+                )
             metrics = await self._call(self.client.get, "/api/queue/metrics")
         except Exception:
             self._next_retry = time.monotonic() + 3
@@ -294,14 +315,23 @@ class TerminalWorkbench(App[None]):
             return
         self._next_retry = 0
         self._set_connection(f"Connected: {safe_text(self.base_url)}")
+        event_epoch = progress.get("eventEpoch")
+        if isinstance(event_epoch, str) and event_epoch:
+            self._event_epoch = event_epoch
         last_sequence = progress.get("lastSequence")
         if isinstance(last_sequence, int) and not isinstance(last_sequence, bool):
-            self._last_sequence = max(self._last_sequence, last_sequence)
+            self._last_sequence = (
+                last_sequence
+                if event_stream_reset
+                else max(self._last_sequence, last_sequence)
+            )
+        elif event_stream_reset:
+            self._last_sequence = 0
         jobs = progress.get("jobs")
         if isinstance(jobs, list):
             self._jobs = [job for job in jobs[:100] if isinstance(job, dict)]
         self._render_jobs()
-        self._render_metrics(metrics, gap=progress.get("gap") is True)
+        self._render_metrics(metrics, gap=event_stream_reset or progress.get("gap") is True)
         self._render_events(progress)
 
     def _render_jobs(self) -> None:

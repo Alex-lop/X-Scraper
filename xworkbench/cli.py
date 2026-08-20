@@ -27,6 +27,7 @@ from .api import BROWSER_PROVIDER, create_app
 from .config import Settings, SettingsError, save_bearer_token, validate_token
 from .errors import CollectionError
 from .jobs import JobService
+from .local_client import LocalJsonClient
 from .models import CollectionRequest, Post, SourceDefinition
 from .playwright_browser import PlaywrightBrowserProvider, authenticate_interactively
 from .providers import ProviderRegistry
@@ -662,6 +663,7 @@ def _run_server(
                 daemon=True,
             )
             server_thread.start()
+            LocalJsonClient(url, timeout=5).get("/api/health")
             result = frontend(url) or 0
     except KeyboardInterrupt:
         print("\nStopping X-Scraper.")
@@ -832,7 +834,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "monitor":
             _, run_monitor = _terminal_entrypoints()
-            return run_monitor(args.url)
+            try:
+                return run_monitor(args.url)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
         settings = Settings.from_env()
         if args.command == "setup":
             return _setup(settings)

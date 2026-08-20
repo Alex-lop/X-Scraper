@@ -74,17 +74,22 @@ accepts only a plain loopback root URL. Credentials, fragments, redirects, arbit
 environment proxies, oversized bodies, and malformed JSON are rejected.
 
 Queue/progress polling runs every 1.5 seconds and connection readiness every 10 seconds with one
-request in flight. Durable job rows take precedence after an event gap. On disconnection, stale
-state remains visibly labeled and the client retries after three seconds.
+request in flight. Durable job rows take precedence after an event gap. A changed service event
+epoch triggers one bounded replay from sequence zero, including when a restarted server has already
+reached the old sequence number. On disconnection, stale state remains visibly labeled and the
+client retries after three seconds.
 
 ## Shutdown boundary
 
 `q` stops the terminal, loopback HTTP server, workers, and worker lock in order. Running work is
 interrupted truthfully; queued and completed durable jobs are not silently cancelled or deleted.
+An official page that fully returned before interruption is checkpointed first so its posts and
+resource counts are not silently discarded.
 The owner process reports a cleanup failure instead of claiming a clean exit while a server thread,
 worker, or lock remains.
 
-The Linux workflow is configured for Pilot/lifecycle tests and the base-wheel missing-extra command
-paths; exact-head hosted CI is pending. The local Pilot gate was recorded on macOS. Windows terminal
-use has not passed a clean platform gate. See [testing](testing.md) and [verification](verification.md)
-for the exact evidence boundaries.
+[Feature checkpoint run 32337098742](https://github.com/Alex-lop/X-Scraper/actions/runs/32337098742)
+passed the configured Linux Pilot/lifecycle, base-wheel missing-extra, browser, and capability-lab
+jobs. The local Pilot gate was also recorded on macOS. Windows terminal use has not passed a clean
+platform gate. See [testing](testing.md) and [verification](verification.md) for the exact evidence
+boundaries.

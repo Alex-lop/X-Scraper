@@ -32,6 +32,7 @@ from xworkbench.x_api import XApiProvider
 RUN_BROWSER_MATRIX = os.environ.get("XWORKBENCH_RUN_BROWSER_MATRIX") == "1"
 ASSERT_SCALE_THRESHOLDS = os.environ.get("XWORKBENCH_ASSERT_SCALE_THRESHOLDS") == "1"
 RSS_GROWTH_LIMIT_BYTES = 32 * 1024 * 1024
+REACHABLE_MATRIX_ORDER = ((1, 1), (1, 2), (2, 2), (2, 1), (3, 1), (3, 2))
 
 
 def _wait_for_jobs(service: JobService, target_finished: int, timeout: float = 30) -> None:
@@ -63,27 +64,46 @@ def _rss_bytes() -> int:
         return int(maximum if platform.system() == "Darwin" else maximum * 1024)
 
 
-def _process_tree_rss_bytes(root_pid: int) -> int:
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,rss="],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return _rss_bytes()
+def _parse_ps_cpu_seconds(value: str) -> float:
+    day_text, separator, clock = value.partition("-")
+    days = int(day_text) if separator else 0
+    if not separator:
+        clock = day_text
+    parts = clock.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds = parts
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    else:
+        raise ValueError(f"Unsupported ps CPU time: {value}")
+    return days * 86_400 + int(hours) * 3_600 + int(minutes) * 60 + float(seconds)
+
+
+def _parse_process_tree_snapshot(
+    output: str, root_pid: int, observer_pid: int
+) -> tuple[int, dict[int, float]]:
     children: dict[int, list[int]] = defaultdict(list)
     rss: dict[int, int] = {}
-    for line in result.stdout.splitlines():
+    cpu: dict[int, float] = {}
+    for line in output.splitlines():
+        parts = line.strip().split(maxsplit=4)
+        if len(parts) != 5:
+            continue
         try:
-            pid, parent, kib = (int(value) for value in line.split())
-        except (TypeError, ValueError):
+            pid, parent, kib = (int(value) for value in parts[:3])
+            cpu_seconds = _parse_ps_cpu_seconds(parts[3])
+        except ValueError:
+            continue
+        if pid == observer_pid:
             continue
         children[parent].append(pid)
         rss[pid] = kib * 1024
-    total = 0
+        cpu[pid] = cpu_seconds
+    if root_pid not in rss:
+        raise ValueError("Root process is absent from ps output.")
+    total_rss = 0
+    descendant_cpu: dict[int, float] = {}
     pending = [root_pid]
     seen: set[int] = set()
     while pending:
@@ -91,9 +111,36 @@ def _process_tree_rss_bytes(root_pid: int) -> int:
         if pid in seen:
             continue
         seen.add(pid)
-        total += rss.get(pid, 0)
+        total_rss += rss[pid]
+        if pid != root_pid:
+            descendant_cpu[pid] = cpu[pid]
         pending.extend(children.get(pid, ()))
-    return total or _rss_bytes()
+    return total_rss, descendant_cpu
+
+
+def _process_tree_snapshot(root_pid: int) -> tuple[int, dict[int, float]]:
+    process = subprocess.Popen(  # noqa: S603
+        ["ps", "-axo", "pid=,ppid=,rss=,time=,comm="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, process.args, stderr=stderr)
+    return _parse_process_tree_snapshot(stdout, root_pid, process.pid)
+
+
+def _process_tree_rss_bytes(root_pid: int) -> int:
+    try:
+        return _process_tree_snapshot(root_pid)[0]
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        return _rss_bytes()
 
 
 def _descendant_commands(root_pid: int) -> list[str]:
@@ -134,28 +181,107 @@ def _cpu_seconds() -> float:
     return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
 
 
+def _self_cpu_seconds() -> float:
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    return own.ru_utime + own.ru_stime
+
+
 class _ResourceSampler:
     def __init__(self) -> None:
         self._stop = threading.Event()
-        self.peak_rss_bytes = _process_tree_rss_bytes(os.getpid())
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
+        self._baseline_descendant_cpu: dict[int, float] = {}
+        self._maximum_descendant_cpu: dict[int, float] = {}
+        self._coordinator_cpu_started = 0.0
+        self._sampler_cpu_baseline = 0.0
+        self.peak_rss_bytes = 0
+        self.coordinator_including_sampler_seconds = 0.0
+        self.sampler_thread_seconds = 0.0
+        self.coordinator_excluding_sampler_seconds = 0.0
+        self.observed_descendant_seconds = 0.0
+        self.observed_descendant_processes = 0
+        self.cpu_seconds = 0.0
         self._thread = threading.Thread(target=self._sample, daemon=True)
 
     def _sample(self) -> None:
-        while not self._stop.wait(0.05):
-            self.peak_rss_bytes = max(
-                self.peak_rss_bytes, _process_tree_rss_bytes(os.getpid())
+        first = True
+        try:
+            while True:
+                rss_bytes, descendant_cpu = _process_tree_snapshot(os.getpid())
+                self.peak_rss_bytes = max(self.peak_rss_bytes, rss_bytes)
+                if first:
+                    self._baseline_descendant_cpu = descendant_cpu.copy()
+                    first = False
+                    self._sampler_cpu_baseline = time.thread_time()
+                    self._ready.set()
+                for pid, cpu_seconds in descendant_cpu.items():
+                    self._maximum_descendant_cpu[pid] = max(
+                        cpu_seconds, self._maximum_descendant_cpu.get(pid, 0.0)
+                    )
+                if self._stop.wait(0.05):
+                    break
+        except BaseException as error:
+            self._error = error
+            self._ready.set()
+        finally:
+            self.sampler_thread_seconds = max(
+                0.0, time.thread_time() - self._sampler_cpu_baseline
             )
 
     def __enter__(self) -> _ResourceSampler:
         self._thread.start()
+        if not self._ready.wait(3) or self._error is not None:
+            self._stop.set()
+            self._thread.join(timeout=3)
+            raise RuntimeError(
+                "Could not start the process-tree resource sampler."
+            ) from self._error
+        self._coordinator_cpu_started = _self_cpu_seconds()
         return self
 
-    def __exit__(self, *_args: object) -> None:
+    def __exit__(self, exception_type: object, *_args: object) -> None:
         self._stop.set()
-        self._thread.join(timeout=2)
-        self.peak_rss_bytes = max(
-            self.peak_rss_bytes, _process_tree_rss_bytes(os.getpid())
+        self._thread.join(timeout=3)
+        if self._thread.is_alive():
+            raise RuntimeError("Process-tree resource sampler did not stop.")
+        self.coordinator_including_sampler_seconds = (
+            _self_cpu_seconds() - self._coordinator_cpu_started
         )
+        self.coordinator_excluding_sampler_seconds = max(
+            0.0,
+            self.coordinator_including_sampler_seconds - self.sampler_thread_seconds,
+        )
+        self.observed_descendant_seconds = sum(
+            max(0.0, maximum - self._baseline_descendant_cpu.get(pid, 0.0))
+            for pid, maximum in self._maximum_descendant_cpu.items()
+        )
+        self.observed_descendant_processes = len(self._maximum_descendant_cpu)
+        self.cpu_seconds = (
+            self.coordinator_excluding_sampler_seconds
+            + self.observed_descendant_seconds
+        )
+        if self._error is not None and exception_type is None:
+            raise RuntimeError("Process-tree resource sampling failed.") from self._error
+
+
+def test_process_tree_snapshot_parser_excludes_observer_and_parses_cpu():
+    rss_bytes, descendant_cpu = _parse_process_tree_snapshot(
+        "\n".join(
+            (
+                "100 1 1024 0:01.25 python",
+                "101 100 2048 0:00.50 chromium",
+                "102 101 512 1-02:03:04.25 chromium-helper",
+                "103 100 4096 0:09.00 ps",
+                "200 1 8192 0:20.00 unrelated",
+            )
+        ),
+        root_pid=100,
+        observer_pid=103,
+    )
+
+    assert rss_bytes == (1024 + 2048 + 512) * 1024
+    assert descendant_cpu == {101: 0.5, 102: 93_784.25}
 
 
 class _LifecycleTracker:
@@ -595,8 +721,14 @@ class _MeasuredOfficialProvider:
 
 
 def _run_reachable_matrix_case(
-    tmp_path: Path, loopback_url: str, workers: int, repetition: int
+    tmp_path: Path,
+    loopback_url: str,
+    workers: int,
+    repetition: int,
+    sequence: int,
 ) -> dict:
+    gc.collect()
+    baseline_rss_bytes = _process_tree_rss_bytes(os.getpid())
     root = tmp_path / f"mixed-{workers}-{repetition}"
     root.mkdir(mode=0o700)
     token_path = root / "auth" / "token"
@@ -681,10 +813,9 @@ def _run_reachable_matrix_case(
     assert preview["manifest"]["maxConcurrency"] == workers
     assert preview["manifest"]["perAuthStateConcurrency"] == 1
 
-    wall_started = time.monotonic()
-    cpu_started = _cpu_seconds()
     try:
         with _ResourceSampler() as resources:
+            wall_started = time.monotonic()
             confirmed = client.post(
                 "/api/batches/confirm",
                 json={
@@ -697,8 +828,8 @@ def _run_reachable_matrix_case(
             job_ids = confirmed.get_json()["jobIds"]
             with service._condition:
                 assert service._condition.wait_for(lambda: service._finished == 2, timeout=60)
-        wall_seconds = time.monotonic() - wall_started
-        cpu_seconds = _cpu_seconds() - cpu_started
+            wall_seconds = time.monotonic() - wall_started
+        cpu_seconds = resources.cpu_seconds
         metrics = service.metrics()
         jobs = [storage.get_job(job_id) for job_id in job_ids]
         results = {
@@ -754,13 +885,43 @@ def _run_reachable_matrix_case(
     assert not any(thread.is_alive() for thread in service._threads)
     assert chromium_descendants == []
     sqlite_fraction = tracker.persistence_seconds / wall_seconds
+    incremental_rss_bytes = resources.peak_rss_bytes - baseline_rss_bytes
+    assert incremental_rss_bytes >= 0
+    assert resources.observed_descendant_processes > 0
+    assert resources.coordinator_including_sampler_seconds >= (
+        resources.sampler_thread_seconds
+    )
+    assert resources.coordinator_excluding_sampler_seconds == pytest.approx(
+        resources.coordinator_including_sampler_seconds
+        - resources.sampler_thread_seconds
+    )
+    assert cpu_seconds == pytest.approx(
+        resources.coordinator_excluding_sampler_seconds
+        + resources.observed_descendant_seconds
+    )
     return {
+        "sequence": sequence,
         "workers": workers,
         "repetition": repetition,
         "jobs": 2,
         "wallSeconds": round(wall_seconds, 3),
-        "cpuSeconds": round(cpu_seconds, 3),
+        "cpuSeconds": round(cpu_seconds, 6),
+        "cpuBreakdown": {
+            "coordinatorIncludingSamplerSeconds": round(
+                resources.coordinator_including_sampler_seconds, 6
+            ),
+            "samplerThreadSeconds": round(resources.sampler_thread_seconds, 6),
+            "coordinatorExcludingSamplerSeconds": round(
+                resources.coordinator_excluding_sampler_seconds, 6
+            ),
+            "observedDescendantSeconds": round(
+                resources.observed_descendant_seconds, 6
+            ),
+            "observedDescendantProcessCount": resources.observed_descendant_processes,
+        },
+        "baselineProcessTreeRssBytes": baseline_rss_bytes,
         "peakProcessTreeRssBytes": resources.peak_rss_bytes,
+        "incrementalProcessTreeRssBytes": incremental_rss_bytes,
         "queueWaitP50Ms": round(metrics["queueWaitP50Ms"] or 0, 3),
         "queueWaitP95Ms": round(metrics["queueWaitP95Ms"] or 0, 3),
         "throughputJobsPerSecond": round(metrics["throughputJobsPerSecond"], 3),
@@ -782,36 +943,54 @@ def _run_reachable_matrix_case(
     }
 
 
-@pytest.mark.skipif(
-    not RUN_BROWSER_MATRIX,
-    reason="set XWORKBENCH_RUN_BROWSER_MATRIX=1 in the installed-Chromium job",
-)
-def test_production_playwright_mixed_provider_matrix_is_reachable(tmp_path):
-    with _loopback_fixture() as (loopback_url, fixture_server):
-        runs = [
-            _run_reachable_matrix_case(tmp_path, loopback_url, workers, repetition)
-            for workers in (1, 2)
-            for repetition in range(1, 4)
-        ]
-        assert fixture_server.request_count == 6
-
+def _reachable_matrix_measurements(runs: list[dict]) -> tuple[dict, dict]:
     serial = [run for run in runs if run["workers"] == 1]
     concurrent = [run for run in runs if run["workers"] == 2]
-    serial_wall = median(run["wallSeconds"] for run in serial)
-    concurrent_wall = median(run["wallSeconds"] for run in concurrent)
-    decision = {
-        "speedupAtLeast15Percent": concurrent_wall <= serial_wall * 0.85,
-        "cpuGrowthAtMost25Percent": median(run["cpuSeconds"] for run in concurrent)
-        <= median(run["cpuSeconds"] for run in serial) * 1.25,
-        "incrementalRssAtMost128MiB": (
-            median(run["peakProcessTreeRssBytes"] for run in concurrent)
-            - median(run["peakProcessTreeRssBytes"] for run in serial)
-            <= 128 * 1024 * 1024
+    one_worker = {
+        "wallSeconds": median(run["wallSeconds"] for run in serial),
+        "cpuSeconds": median(run["cpuSeconds"] for run in serial),
+        "peakProcessTreeRssBytes": median(
+            run["peakProcessTreeRssBytes"] for run in serial
         ),
-        "sqliteFractionBelow20Percent": median(
+        "incrementalProcessTreeRssBytes": median(
+            run["incrementalProcessTreeRssBytes"] for run in serial
+        ),
+    }
+    two_workers = {
+        "wallSeconds": median(run["wallSeconds"] for run in concurrent),
+        "cpuSeconds": median(run["cpuSeconds"] for run in concurrent),
+        "peakProcessTreeRssBytes": median(
+            run["peakProcessTreeRssBytes"] for run in concurrent
+        ),
+        "incrementalProcessTreeRssBytes": median(
+            run["incrementalProcessTreeRssBytes"] for run in concurrent
+        ),
+        "sqliteCallbackFraction": median(
             run["sqliteCallbackFraction"] for run in concurrent
-        )
-        < 0.20,
+        ),
+    }
+    incremental_rss = (
+        two_workers["incrementalProcessTreeRssBytes"]
+        - one_worker["incrementalProcessTreeRssBytes"]
+    )
+    medians = {
+        "oneWorker": one_worker,
+        "twoWorkers": two_workers,
+        "speedup": round(one_worker["wallSeconds"] / two_workers["wallSeconds"], 3),
+        "incrementalRssBytes": incremental_rss,
+    }
+    stable_digest = len({run["stateDigest"] for run in runs}) == 1
+    gates = {
+        "speedupAtLeast15Percent": (
+            two_workers["wallSeconds"] <= one_worker["wallSeconds"] * 0.85
+        ),
+        "cpuGrowthAtMost25Percent": (
+            two_workers["cpuSeconds"] <= one_worker["cpuSeconds"] * 1.25
+        ),
+        "incrementalRssAtMost128MiB": incremental_rss <= 128 * 1024 * 1024,
+        "sqliteFractionBelow20Percent": (
+            two_workers["sqliteCallbackFraction"] < 0.20
+        ),
         "backlogAtMost2": max(run["maxPersistenceBacklog"] for run in runs) <= 2,
         "correctnessCleanupZeroEgress": all(
             run["duplicateCount"] == 0
@@ -820,25 +999,70 @@ def test_production_playwright_mixed_provider_matrix_is_reachable(tmp_path):
             and run["remainingChromiumDescendants"] == 0
             and run["cleanupFailures"] == 0
             and run["externalEgressCount"] == 0
+            and run["syntheticOfficialRequests"] == 1
+            and run["peakCollectors"] == run["workers"]
             for run in runs
         ),
+        "stableStateDigest": stable_digest,
     }
+    return medians, {**gates, "supportedMaximum": 2 if all(gates.values()) else 1}
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_MATRIX,
+    reason="set XWORKBENCH_RUN_BROWSER_MATRIX=1 in the installed-Chromium job",
+)
+def test_production_playwright_mixed_provider_matrix_is_reachable(tmp_path):
+    with _loopback_fixture() as (loopback_url, fixture_server):
+        runs = [
+            _run_reachable_matrix_case(
+                tmp_path, loopback_url, workers, repetition, sequence
+            )
+            for sequence, (repetition, workers) in enumerate(
+                REACHABLE_MATRIX_ORDER, start=1
+            )
+        ]
+        assert fixture_server.request_count == 6
+
+    medians, decision = _reachable_matrix_measurements(runs)
     summary = {
         "fixture": "production-routes-loopback-browser-synthetic-official",
         "repetitionsPerCase": 3,
+        "executionOrder": [
+            {"sequence": sequence, "repetition": repetition, "workers": workers}
+            for sequence, (repetition, workers) in enumerate(
+                REACHABLE_MATRIX_ORDER, start=1
+            )
+        ],
+        "measurementDesign": (
+            "paired alternating AB/BA/AB in one process; residual order and "
+            "warm-cache bias remain"
+        ),
+        "rssBasis": "per-run peak process-tree RSS minus the pre-case baseline",
+        "cpuBasis": (
+            "coordinator RUSAGE_SELF delta minus sampler thread_time, plus maximum "
+            "cumulative CPU per observed descendant PID; observer ps PIDs excluded"
+        ),
         "runs": runs,
-        "medianSpeedup": round(serial_wall / concurrent_wall, 3),
-        "stableStateDigest": len({run["stateDigest"] for run in runs}) == 1,
+        "medians": medians,
         "decision": decision,
-        "supportedMaximum": 2 if all(decision.values()) else 1,
     }
     print("REACHABLE_MIXED_PROVIDER_MATRIX=" + json.dumps(summary, sort_keys=True))
 
-    assert summary["stableStateDigest"] is True
+    assert [(run["repetition"], run["workers"]) for run in runs] == list(
+        REACHABLE_MATRIX_ORDER
+    )
+    assert [run["sequence"] for run in runs] == list(range(1, 7))
+    assert all(
+        {run["workers"] for run in runs if run["repetition"] == repetition}
+        == {1, 2}
+        for repetition in range(1, 4)
+    )
     assert decision["backlogAtMost2"] is True
     assert decision["correctnessCleanupZeroEgress"] is True
+    assert decision["stableStateDigest"] is True
     if ASSERT_SCALE_THRESHOLDS:
-        assert all(decision.values()), summary
+        assert decision["supportedMaximum"] == 2, summary
 
 
 def test_recorded_benchmarks_separate_historical_and_reachable_evidence():
@@ -855,34 +1079,57 @@ def test_recorded_benchmarks_separate_historical_and_reachable_evidence():
     reachable = json.loads(
         (benchmark_dir / "reachable-mixed-provider-2026-08-20.json").read_text()
     )
+    assert reachable["schemaVersion"] == 3
+    assert reachable["repetitionsPerCase"] == 3
+    assert reachable["measurementDesign"] == (
+        "paired alternating AB/BA/AB in one process; residual order and warm-cache "
+        "bias remain"
+    )
+    assert reachable["rssBasis"] == (
+        "per-run peak process-tree RSS minus the pre-case baseline"
+    )
+    assert reachable["cpuBasis"] == (
+        "coordinator RUSAGE_SELF delta minus sampler thread_time, plus maximum "
+        "cumulative CPU per observed descendant PID; observer ps PIDs excluded"
+    )
     runs = reachable["runs"]
     assert len(runs) == 6
-    assert [run["workers"] for run in runs].count(1) == 3
-    assert [run["workers"] for run in runs].count(2) == 3
-    serial = [run for run in runs if run["workers"] == 1]
-    concurrent = [run for run in runs if run["workers"] == 2]
-    assert reachable["medians"] == {
-        "oneWorker": {
-            "wallSeconds": median(run["wallSeconds"] for run in serial),
-            "cpuSeconds": median(run["cpuSeconds"] for run in serial),
-            "peakProcessTreeRssBytes": median(
-                run["peakProcessTreeRssBytes"] for run in serial
-            ),
-        },
-        "twoWorkers": {
-            "wallSeconds": median(run["wallSeconds"] for run in concurrent),
-            "cpuSeconds": median(run["cpuSeconds"] for run in concurrent),
-            "peakProcessTreeRssBytes": median(
-                run["peakProcessTreeRssBytes"] for run in concurrent
-            ),
-            "sqliteCallbackFraction": median(
-                run["sqliteCallbackFraction"] for run in concurrent
-            ),
-        },
-        "speedup": 1.793,
-        "incrementalRssBytes": -14_286_848,
-    }
-    assert len({run["stateDigest"] for run in runs}) == 1
+    assert [(run["repetition"], run["workers"]) for run in runs] == list(
+        REACHABLE_MATRIX_ORDER
+    )
+    assert [run["sequence"] for run in runs] == list(range(1, 7))
+    assert reachable["executionOrder"] == [
+        {"sequence": sequence, "repetition": repetition, "workers": workers}
+        for sequence, (repetition, workers) in enumerate(
+            REACHABLE_MATRIX_ORDER, start=1
+        )
+    ]
+    assert all(
+        run["peakProcessTreeRssBytes"] >= run["baselineProcessTreeRssBytes"]
+        and run["incrementalProcessTreeRssBytes"]
+        == run["peakProcessTreeRssBytes"] - run["baselineProcessTreeRssBytes"]
+        and run["cpuBreakdown"]["observedDescendantProcessCount"] > 0
+        and run["cpuBreakdown"]["coordinatorIncludingSamplerSeconds"]
+        >= run["cpuBreakdown"]["samplerThreadSeconds"]
+        and run["cpuBreakdown"]["coordinatorExcludingSamplerSeconds"]
+        == pytest.approx(
+            run["cpuBreakdown"]["coordinatorIncludingSamplerSeconds"]
+            - run["cpuBreakdown"]["samplerThreadSeconds"],
+            abs=0.000002,
+        )
+        and run["cpuSeconds"]
+        == pytest.approx(
+            run["cpuBreakdown"]["coordinatorExcludingSamplerSeconds"]
+            + run["cpuBreakdown"]["observedDescendantSeconds"],
+            abs=0.000002,
+        )
+        for run in runs
+    )
+    medians, decision = _reachable_matrix_measurements(runs)
+    assert reachable["medians"] == medians
+    assert {
+        key: reachable["decision"][key] for key in decision
+    } == decision
     assert all(
         run["duplicateCount"] == run["remainingLeases"] == 0
         and run["remainingWorkerThreads"] == run["remainingChromiumDescendants"] == 0
@@ -890,9 +1137,8 @@ def test_recorded_benchmarks_separate_historical_and_reachable_evidence():
         and run["maxPersistenceBacklog"] <= 2
         for run in runs
     )
-    assert reachable["decision"]["supportedMaximum"] == 2
-    assert all(
-        value is True
-        for key, value in reachable["decision"].items()
-        if key not in {"supportedMaximum", "scope"}
+    assert decision["supportedMaximum"] == 2
+    assert reachable["decision"]["scope"] == (
+        "Global mixed-provider ceiling only; same-provider Browser and official jobs "
+        "remain serialized by provider auth key."
     )
