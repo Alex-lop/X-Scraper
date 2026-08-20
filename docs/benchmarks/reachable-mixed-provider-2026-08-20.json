@@ -1,6 +1,9 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "recordedDate": "2026-08-20",
+  "sourceRevision": "74fe2333ee44dd7dc26f4b9dad6c28bf59f16bd5",
+  "trackedWorktreeClean": true,
+  "command": "XWORKBENCH_RUN_BROWSER_MATRIX=1 XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1 .venv/bin/python -m pytest -q -s tests/test_queue_performance.py -k production_playwright_mixed_provider_matrix_is_reachable",
   "environment": {
     "operatingSystem": "Darwin 25.5.0",
     "architecture": "arm64",
@@ -13,266 +16,386 @@
   "externalEgress": false,
   "repetitionsPerCase": 3,
   "executionOrder": [
-    {"repetition": 1, "sequence": 1, "workers": 1},
-    {"repetition": 1, "sequence": 2, "workers": 2},
-    {"repetition": 2, "sequence": 3, "workers": 2},
-    {"repetition": 2, "sequence": 4, "workers": 1},
-    {"repetition": 3, "sequence": 5, "workers": 1},
-    {"repetition": 3, "sequence": 6, "workers": 2}
+    {
+      "repetition": 1,
+      "sequence": 1,
+      "workers": 1
+    },
+    {
+      "repetition": 1,
+      "sequence": 2,
+      "workers": 2
+    },
+    {
+      "repetition": 2,
+      "sequence": 3,
+      "workers": 2
+    },
+    {
+      "repetition": 2,
+      "sequence": 4,
+      "workers": 1
+    },
+    {
+      "repetition": 3,
+      "sequence": 5,
+      "workers": 1
+    },
+    {
+      "repetition": 3,
+      "sequence": 6,
+      "workers": 2
+    }
   ],
   "measurementDesign": "paired alternating AB/BA/AB in one process; residual order and warm-cache bias remain",
   "rssBasis": "per-run peak process-tree RSS minus the pre-case baseline",
   "cpuBasis": "coordinator RUSAGE_SELF delta minus sampler thread_time, plus maximum cumulative CPU per observed descendant PID; observer ps PIDs excluded",
   "runs": [
     {
-      "baselineProcessTreeRssBytes": 97796096,
+      "baselineProcessTreeRssBytes": 64339968,
       "cleanupFailures": 0,
-      "cleanupSeconds": 0.000068,
+      "cleanupSeconds": 0.000061,
       "cpuBreakdown": {
-        "coordinatorExcludingSamplerSeconds": 0.063026,
-        "coordinatorIncludingSamplerSeconds": 0.115949,
+        "coordinatorExcludingSamplerSeconds": 0.048378,
+        "coordinatorIncludingSamplerSeconds": 0.09364,
         "observedDescendantProcessCount": 5,
-        "observedDescendantSeconds": 0.62,
-        "samplerThreadSeconds": 0.052923
+        "observedDescendantSeconds": 0.52,
+        "samplerThreadSeconds": 0.045262
       },
-      "cpuSeconds": 0.683026,
+      "cpuSeconds": 0.568378,
       "duplicateCount": 0,
       "externalEgressCount": 0,
-      "incrementalProcessTreeRssBytes": 431685632,
-      "jobIds": ["9544354b9fcd47bba383173f0fe00d5e", "4d707f1d08fb4fbe80575d99ae33ff55"],
+      "incrementalProcessTreeRssBytes": 424591360,
+      "jobIds": [
+        "e49860cec85c42e2b55bccffbe77e68d",
+        "e6b1c8c9dd8d40cbb64e58137b5f2a06"
+      ],
       "jobs": 2,
       "maxPersistenceBacklog": 1,
       "peakCollectors": 1,
-      "peakProcessTreeRssBytes": 529481728,
-      "queueWaitP50Ms": 0.275,
-      "queueWaitP95Ms": 1120.74,
+      "peakProcessTreeRssBytes": 488931328,
+      "queueWaitP50Ms": 0.531,
+      "queueWaitP95Ms": 1118.623,
       "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
       "repetition": 1,
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
       "sequence": 1,
-      "sqliteCallbackFraction": 0.005566,
-      "sqliteCallbackSeconds": 0.009,
+      "sqliteCallbackFraction": 0.002477,
+      "sqliteCallbackSeconds": 0.003941,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
       "syntheticOfficialRequests": 1,
-      "throughputJobsPerSecond": 1.194,
-      "wallSeconds": 1.617,
+      "throughputJobsPerSecond": 1.212,
+      "wallSeconds": 1.591,
       "workers": 1
     },
     {
-      "baselineProcessTreeRssBytes": 98385920,
+      "baselineProcessTreeRssBytes": 73449472,
       "cleanupFailures": 0,
-      "cleanupSeconds": 0.000077,
+      "cleanupSeconds": 0.000078,
       "cpuBreakdown": {
-        "coordinatorExcludingSamplerSeconds": 0.054482,
-        "coordinatorIncludingSamplerSeconds": 0.07357,
+        "coordinatorExcludingSamplerSeconds": 0.049704,
+        "coordinatorIncludingSamplerSeconds": 0.066653,
         "observedDescendantProcessCount": 5,
-        "observedDescendantSeconds": 0.42,
-        "samplerThreadSeconds": 0.019088
+        "observedDescendantSeconds": 0.44,
+        "samplerThreadSeconds": 0.016949
       },
-      "cpuSeconds": 0.474482,
+      "cpuSeconds": 0.489704,
       "duplicateCount": 0,
       "externalEgressCount": 0,
-      "incrementalProcessTreeRssBytes": 435961856,
-      "jobIds": ["22564884fd0b44cd88cf42ca6b9df1af", "3d8b6e63d3444d96b7ed350f75c7cec8"],
+      "incrementalProcessTreeRssBytes": 427474944,
+      "jobIds": [
+        "b77fac007e5d40e1b0382425a4725c39",
+        "3f4c165f859848df8656c6857b0c694d"
+      ],
       "jobs": 2,
       "maxPersistenceBacklog": 1,
       "peakCollectors": 2,
-      "peakProcessTreeRssBytes": 534347776,
-      "queueWaitP50Ms": 0.323,
-      "queueWaitP95Ms": 0.342,
+      "peakProcessTreeRssBytes": 500924416,
+      "queueWaitP50Ms": 0.289,
+      "queueWaitP95Ms": 0.301,
       "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
       "repetition": 1,
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
       "sequence": 2,
-      "sqliteCallbackFraction": 0.006727,
-      "sqliteCallbackSeconds": 0.00406,
+      "sqliteCallbackFraction": 0.007443,
+      "sqliteCallbackSeconds": 0.004406,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
       "syntheticOfficialRequests": 1,
-      "throughputJobsPerSecond": 3.084,
-      "wallSeconds": 0.604,
+      "throughputJobsPerSecond": 3.163,
+      "wallSeconds": 0.592,
       "workers": 2
     },
     {
-      "baselineProcessTreeRssBytes": 98516992,
+      "baselineProcessTreeRssBytes": 70254592,
       "cleanupFailures": 0,
-      "cleanupSeconds": 0.000065,
+      "cleanupSeconds": 0.000069,
       "cpuBreakdown": {
-        "coordinatorExcludingSamplerSeconds": 0.052642,
-        "coordinatorIncludingSamplerSeconds": 0.071309,
+        "coordinatorExcludingSamplerSeconds": 0.042621,
+        "coordinatorIncludingSamplerSeconds": 0.058426,
         "observedDescendantProcessCount": 5,
-        "observedDescendantSeconds": 0.42,
-        "samplerThreadSeconds": 0.018667
+        "observedDescendantSeconds": 0.4,
+        "samplerThreadSeconds": 0.015805
       },
-      "cpuSeconds": 0.472642,
+      "cpuSeconds": 0.442621,
       "duplicateCount": 0,
       "externalEgressCount": 0,
-      "incrementalProcessTreeRssBytes": 433651712,
-      "jobIds": ["28c59deaf71949808876a2ba1d94f622", "c8b770fcc497446cb1b1ed8c4ae3ef85"],
+      "incrementalProcessTreeRssBytes": 429326336,
+      "jobIds": [
+        "e851f44f87b84c74baa76838d0af3a95",
+        "95d2d98a04644c61b149b7d682044257"
+      ],
       "jobs": 2,
       "maxPersistenceBacklog": 1,
       "peakCollectors": 2,
-      "peakProcessTreeRssBytes": 532168704,
-      "queueWaitP50Ms": 0.292,
-      "queueWaitP95Ms": 0.326,
+      "peakProcessTreeRssBytes": 499580928,
+      "queueWaitP50Ms": 0.261,
+      "queueWaitP95Ms": 0.273,
       "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
       "repetition": 2,
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
       "sequence": 3,
-      "sqliteCallbackFraction": 0.006689,
-      "sqliteCallbackSeconds": 0.003955,
+      "sqliteCallbackFraction": 0.007398,
+      "sqliteCallbackSeconds": 0.004064,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
       "syntheticOfficialRequests": 1,
-      "throughputJobsPerSecond": 3.154,
-      "wallSeconds": 0.591,
+      "throughputJobsPerSecond": 3.396,
+      "wallSeconds": 0.549,
       "workers": 2
     },
     {
-      "baselineProcessTreeRssBytes": 98516992,
+      "baselineProcessTreeRssBytes": 70778880,
       "cleanupFailures": 0,
-      "cleanupSeconds": 0.000056,
+      "cleanupSeconds": 0.000047,
       "cpuBreakdown": {
-        "coordinatorExcludingSamplerSeconds": 0.051682,
-        "coordinatorIncludingSamplerSeconds": 0.083595,
+        "coordinatorExcludingSamplerSeconds": 0.046199,
+        "coordinatorIncludingSamplerSeconds": 0.076197,
         "observedDescendantProcessCount": 5,
-        "observedDescendantSeconds": 0.39,
-        "samplerThreadSeconds": 0.031914
+        "observedDescendantSeconds": 0.4,
+        "samplerThreadSeconds": 0.029998
       },
-      "cpuSeconds": 0.441682,
+      "cpuSeconds": 0.446199,
       "duplicateCount": 0,
       "externalEgressCount": 0,
-      "incrementalProcessTreeRssBytes": 435748864,
-      "jobIds": ["a8be8636dbf54f2dad285ec2c3c9156a", "d6a2bf3faab04168a0c102210ef97b15"],
+      "incrementalProcessTreeRssBytes": 397606912,
+      "jobIds": [
+        "6de19c44bc2a4b3c8d2b5e6990da992f",
+        "99c1179155de494aabfdb887e491ed0c"
+      ],
       "jobs": 2,
       "maxPersistenceBacklog": 1,
       "peakCollectors": 1,
-      "peakProcessTreeRssBytes": 534265856,
-      "queueWaitP50Ms": 0.29,
-      "queueWaitP95Ms": 585.082,
+      "peakProcessTreeRssBytes": 468385792,
+      "queueWaitP50Ms": 0.273,
+      "queueWaitP95Ms": 569.493,
       "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
       "repetition": 2,
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
       "sequence": 4,
-      "sqliteCallbackFraction": 0.004144,
-      "sqliteCallbackSeconds": 0.004386,
+      "sqliteCallbackFraction": 0.003582,
+      "sqliteCallbackSeconds": 0.00372,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
       "syntheticOfficialRequests": 1,
-      "throughputJobsPerSecond": 1.818,
-      "wallSeconds": 1.058,
+      "throughputJobsPerSecond": 1.859,
+      "wallSeconds": 1.038,
       "workers": 1
     },
     {
-      "baselineProcessTreeRssBytes": 98516992,
+      "baselineProcessTreeRssBytes": 69992448,
       "cleanupFailures": 0,
-      "cleanupSeconds": 0.000043,
+      "cleanupSeconds": 0.000058,
       "cpuBreakdown": {
-        "coordinatorExcludingSamplerSeconds": 0.053279,
-        "coordinatorIncludingSamplerSeconds": 0.084402,
+        "coordinatorExcludingSamplerSeconds": 0.052166,
+        "coordinatorIncludingSamplerSeconds": 0.081924,
         "observedDescendantProcessCount": 5,
-        "observedDescendantSeconds": 0.48,
-        "samplerThreadSeconds": 0.031123
+        "observedDescendantSeconds": 0.41,
+        "samplerThreadSeconds": 0.029758
       },
-      "cpuSeconds": 0.533279,
+      "cpuSeconds": 0.462166,
       "duplicateCount": 0,
       "externalEgressCount": 0,
-      "incrementalProcessTreeRssBytes": 449495040,
-      "jobIds": ["6f02edac04a140dcade934433df1536b", "75b7b3eb881c468184abcf4fc5a472ca"],
+      "incrementalProcessTreeRssBytes": 397557760,
+      "jobIds": [
+        "da5766e36fcb4835bd978d38fe89809b",
+        "07ed962a698c4b289670a7e222951f13"
+      ],
       "jobs": 2,
       "maxPersistenceBacklog": 1,
       "peakCollectors": 1,
-      "peakProcessTreeRssBytes": 548012032,
-      "queueWaitP50Ms": 0.293,
-      "queueWaitP95Ms": 593.431,
+      "peakProcessTreeRssBytes": 467550208,
+      "queueWaitP50Ms": 0.251,
+      "queueWaitP95Ms": 725.3,
       "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
       "repetition": 3,
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
       "sequence": 5,
-      "sqliteCallbackFraction": 0.003799,
-      "sqliteCallbackSeconds": 0.00405,
+      "sqliteCallbackFraction": 0.003214,
+      "sqliteCallbackSeconds": 0.003839,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
       "syntheticOfficialRequests": 1,
-      "throughputJobsPerSecond": 1.797,
-      "wallSeconds": 1.066,
+      "throughputJobsPerSecond": 1.608,
+      "wallSeconds": 1.194,
       "workers": 1
     },
     {
-      "baselineProcessTreeRssBytes": 98549760,
+      "baselineProcessTreeRssBytes": 70418432,
       "cleanupFailures": 0,
-      "cleanupSeconds": 0.000076,
+      "cleanupSeconds": 0.000061,
       "cpuBreakdown": {
-        "coordinatorExcludingSamplerSeconds": 0.052953,
-        "coordinatorIncludingSamplerSeconds": 0.071537,
+        "coordinatorExcludingSamplerSeconds": 0.041773,
+        "coordinatorIncludingSamplerSeconds": 0.0578,
         "observedDescendantProcessCount": 5,
-        "observedDescendantSeconds": 0.41,
-        "samplerThreadSeconds": 0.018584
+        "observedDescendantSeconds": 0.44,
+        "samplerThreadSeconds": 0.016027
       },
-      "cpuSeconds": 0.462953,
+      "cpuSeconds": 0.481773,
       "duplicateCount": 0,
       "externalEgressCount": 0,
-      "incrementalProcessTreeRssBytes": 437862400,
-      "jobIds": ["b8e225aa30564b3aac8a90f470ac487b", "559fc737eb8e479cabbeda7d2c58eacb"],
+      "incrementalProcessTreeRssBytes": 428228608,
+      "jobIds": [
+        "3c159b60a9e34a87abd855d286d2defe",
+        "89fec0e000be455d910b399ee27005ad"
+      ],
       "jobs": 2,
       "maxPersistenceBacklog": 1,
       "peakCollectors": 2,
-      "peakProcessTreeRssBytes": 536412160,
-      "queueWaitP50Ms": 0.298,
-      "queueWaitP95Ms": 0.338,
+      "peakProcessTreeRssBytes": 498647040,
+      "queueWaitP50Ms": 0.302,
+      "queueWaitP95Ms": 0.316,
       "remainingChromiumDescendants": 0,
       "remainingLeases": 0,
       "remainingWorkerThreads": 0,
       "repetition": 3,
       "resultIds": {
-        "official_x_api": ["9100", "9101", "9102", "9103", "9104", "9105", "9106", "9107", "9108", "9109"],
-        "playwright_browser": ["2001"]
+        "official_x_api": [
+          "9100",
+          "9101",
+          "9102",
+          "9103",
+          "9104",
+          "9105",
+          "9106",
+          "9107",
+          "9108",
+          "9109"
+        ],
+        "playwright_browser": [
+          "2001"
+        ]
       },
       "sequence": 6,
-      "sqliteCallbackFraction": 0.006802,
-      "sqliteCallbackSeconds": 0.004023,
+      "sqliteCallbackFraction": 0.0069,
+      "sqliteCallbackSeconds": 0.004076,
       "stateDigest": "1c38f99cc228b2ef1577ea8b46b85b6bed8da44b9cd04048d77c2a6e6a60608b",
       "syntheticOfficialRequests": 1,
-      "throughputJobsPerSecond": 3.156,
+      "throughputJobsPerSecond": 3.176,
       "wallSeconds": 0.591,
       "workers": 2
     }
   ],
   "medians": {
-    "incrementalRssBytes": 212992,
+    "incrementalRssBytes": 30621696,
     "oneWorker": {
-      "cpuSeconds": 0.533279,
-      "incrementalProcessTreeRssBytes": 435748864,
-      "peakProcessTreeRssBytes": 534265856,
-      "wallSeconds": 1.066
+      "cpuSeconds": 0.462166,
+      "incrementalProcessTreeRssBytes": 397606912,
+      "peakProcessTreeRssBytes": 468385792,
+      "wallSeconds": 1.194
     },
-    "speedup": 1.804,
+    "speedup": 2.02,
     "twoWorkers": {
-      "cpuSeconds": 0.472642,
-      "incrementalProcessTreeRssBytes": 435961856,
-      "peakProcessTreeRssBytes": 534347776,
-      "sqliteCallbackFraction": 0.006727,
+      "cpuSeconds": 0.481773,
+      "incrementalProcessTreeRssBytes": 428228608,
+      "peakProcessTreeRssBytes": 499580928,
+      "sqliteCallbackFraction": 0.007398,
       "wallSeconds": 0.591
     }
   },

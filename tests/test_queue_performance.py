@@ -1079,7 +1079,14 @@ def test_recorded_benchmarks_separate_historical_and_reachable_evidence():
     reachable = json.loads(
         (benchmark_dir / "reachable-mixed-provider-2026-08-20.json").read_text()
     )
-    assert reachable["schemaVersion"] == 3
+    assert reachable["schemaVersion"] == 4
+    assert reachable["sourceRevision"] == "74fe2333ee44dd7dc26f4b9dad6c28bf59f16bd5"
+    assert reachable["trackedWorktreeClean"] is True
+    assert reachable["command"] == (
+        "XWORKBENCH_RUN_BROWSER_MATRIX=1 XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1 "
+        ".venv/bin/python -m pytest -q -s tests/test_queue_performance.py -k "
+        "production_playwright_mixed_provider_matrix_is_reachable"
+    )
     assert reachable["repetitionsPerCase"] == 3
     assert reachable["measurementDesign"] == (
         "paired alternating AB/BA/AB in one process; residual order and warm-cache "

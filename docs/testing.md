@@ -118,10 +118,10 @@ CI asserts topology, exact results, stable state, leases, duplicate absence, bac
 and cleanup, not timing. To apply the local decision thresholds explicitly, also set
 `XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1`.
 
-On the recorded 2026-08-20 arm64 macOS machine, median wall time fell from `1.066s` to `0.591s`
-(`1.804x`) while median CPU fell from `0.533279s` to `0.472642s`. The two-worker median
-baseline-adjusted process-tree RSS was `212,992` bytes higher than the one-worker median, median
-SQLite callback fraction was `0.6727%`, and backlog stayed at one. All correctness, cleanup, and
+On the recorded 2026-08-20 arm64 macOS machine, median wall time fell from `1.194s` to `0.591s`
+(`2.020x`) while median CPU grew about 4.2%, from `0.462166s` to `0.481773s`. The two-worker median
+baseline-adjusted process-tree RSS was `30,621,696` bytes higher than the one-worker median, median
+SQLite callback fraction was `0.7398%`, and backlog stayed at one. All correctness, cleanup, and
 zero-egress gates passed, so the supported maximum remains two **globally**. Production auth keys still
 serialize Browser+Browser and official+official; only a mixed Browser+official workload can occupy
 both workers. See [ADR 0002](adr/0002-bounded-capture-queue.md) and the
@@ -163,9 +163,9 @@ The mount namespace is used to make the network namespace visible through remoun
 not a general filesystem sandbox.
 
 At `c843690`, the hardened local pre-CI gate ran three times with 30 passed and one macOS skip per
-run; the skipped item is the Linux-only namespace/privilege assertion. At recorded dashboard
-checkpoint `71d42c5`, the ordinary full suite with installed local Chromium reported 229 passed and 32
-skipped: 31 gated lab items plus the opt-in browser matrix.
+run; the skipped item is the Linux-only namespace/privilege assertion. At repair source checkpoint
+`74fe233`, the ordinary full suite with installed local Chromium reported 237 passed and 32 skipped:
+31 gated lab items plus the opt-in browser matrix.
 
 At capability-lab revision `1bd21ea`,
 [CI run 32230574720](https://github.com/Alex-lop/X-Scraper/actions/runs/32230574720) passed all

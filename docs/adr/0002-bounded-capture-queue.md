@@ -62,16 +62,16 @@ snapshots. Observer `ps` PIDs were excluded; `RUSAGE_CHILDREN` was not used.
 
 | Fixture | Workers | Jobs/run | Median wall | Median process-tree RSS | Median CPU | Median SQLite fraction | Cleanup |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Route-admitted Browser + synthetic official | 1 | 2 | 1.066s | 534.3MB | 0.533279s | 0.4144% | 0 failures |
-| Route-admitted Browser + synthetic official | 2 | 2 | 0.591s | 534.3MB | 0.472642s | 0.6727% | 0 failures |
+| Route-admitted Browser + synthetic official | 1 | 2 | 1.194s | 468.4MB | 0.462166s | 0.3214% | 0 failures |
+| Route-admitted Browser + synthetic official | 2 | 2 | 0.591s | 499.6MB | 0.481773s | 0.7398% | 0 failures |
 
-The two-worker median was 1.804 times faster. CPU did not grow. Median baseline-adjusted
-process-tree RSS was `435,748,864` bytes with one worker and `435,961,856` bytes with two, so the
-two-worker increment was `212,992` bytes higher and remained within the 128MiB ceiling. SQLite
-callback time remained below 20% of wall time, backlog stayed at one, the stable state digest
-matched, and exact results, duplicate, lease, thread, Chromium-descendant, cleanup, and zero-egress
-gates passed. This retains the global maximum of two. It does not permit two Browser or two official
-jobs to run together and does not support a live-X speed claim.
+The two-worker median was 2.020× as fast. CPU grew by about 4.2%, below the 25% ceiling. Median
+baseline-adjusted process-tree RSS was `397,606,912` bytes with one worker and `428,228,608` bytes
+with two, so the two-worker increment was `30,621,696` bytes higher and remained within the 128MiB
+ceiling. SQLite callback time remained below 20% of wall time, backlog stayed at one, the stable state
+digest matched, and exact results, duplicate, lease, thread, Chromium-descendant, cleanup, and
+zero-egress gates passed. This retains the global maximum of two. It does not permit two Browser or
+two official jobs to run together and does not support a live-X speed claim.
 
 The earlier [`queue-performance-2026-08-19.json`](../benchmarks/queue-performance-2026-08-19.json)
 is preserved with its raw `3.111s`, `1.288s`, and 2.415x values. That direct-submit matrix injected
