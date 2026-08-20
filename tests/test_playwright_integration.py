@@ -1,11 +1,17 @@
+import json
+import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
+from werkzeug.serving import make_server
 
+from xworkbench.api import create_app
 from xworkbench.config import Settings
-from xworkbench.models import CollectionRequest
+from xworkbench.errors import CollectionCancelled, InvalidRequestError
+from xworkbench.models import CollectionRequest, Post, ProviderType
 from xworkbench.playwright_browser import (
     ARTICLE_SELECTOR,
     DOM_PROJECTION,
@@ -14,6 +20,8 @@ from xworkbench.playwright_browser import (
     _record_status,
     parse_projected_article,
 )
+from xworkbench.providers import ProviderRegistry
+from xworkbench.storage import Storage
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CARDS = FIXTURES / "playwright_cards.html"
@@ -305,3 +313,199 @@ def test_real_chromium_uses_only_derived_profile_and_latest_search_destinations(
         "sourceUrl": destination,
         "stopReason": "target_reached",
     }
+
+
+class _DashboardProvider:
+    provider_id = ProviderType.PLAYWRIGHT_BROWSER
+    provider_version = 2
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.cancel_seen = False
+
+    def capabilities(self):
+        return {
+            "provider": self.provider_id.value,
+            "providerVersion": self.provider_version,
+            "sources": ["home"],
+        }
+
+    def connection_status(self):
+        return {
+            "provider": self.provider_id.value,
+            "status": "verified_live",
+            "ready": True,
+            "message": "Local fixture ready.",
+        }
+
+    def prepare(self, request, supplied_plan=None):
+        plan = {
+            "provider": self.provider_id.value,
+            "providerVersion": self.provider_version,
+            "sourceKind": request.source_type.value,
+            "sourceValue": request.source_value,
+            "sourceUrl": HOME_URL,
+            "targetPosts": request.max_posts,
+        }
+        if supplied_plan is not None and supplied_plan != plan:
+            raise InvalidRequestError("Dashboard fixture plan mismatch.")
+        return plan
+
+    def collect(self, request, *, execution_plan, checkpoint, on_batch, should_cancel):
+        try:
+            added = on_batch(
+                [
+                    Post(
+                        post_id="9001",
+                        text="Dashboard fixture evidence.",
+                        author_username="fixture",
+                        url="https://x.com/fixture/status/9001",
+                        created_at="2026-08-20T12:00:00+00:00",
+                        language="en",
+                        like_count=1,
+                        reply_count=0,
+                        repost_count=0,
+                        quote_count=0,
+                        bookmark_count=0,
+                        view_count=1,
+                        is_reply=False,
+                        is_repost=False,
+                        is_quote=False,
+                        has_media=False,
+                        media=[],
+                        source_position=0,
+                    )
+                ],
+                {
+                    "seenPostIds": ["9001"],
+                    "scanIterations": 1,
+                    "scrollIterations": 0,
+                },
+                {
+                    "browserVersion": "dashboard-fixture",
+                    "sourceKind": "home",
+                    "sourceUrl": HOME_URL,
+                    "scanIterations": 1,
+                    "scrollIterations": 0,
+                    "visibleCards": 1,
+                    "parsedCards": 1,
+                    "duplicatePostIds": 0,
+                    "observedAt": "2026-08-20T12:00:01+00:00",
+                },
+            )
+            assert added == 1
+            assert self.release.wait(10), "dashboard fixture was not released"
+            self.cancel_seen = should_cancel()
+            raise CollectionCancelled("Dashboard fixture cancelled.")
+        finally:
+            self.finished.set()
+
+
+def test_dashboard_preview_progress_cancel_analysis_export_stays_loopback(tmp_path):
+    provider = _DashboardProvider()
+    settings = Settings(
+        tmp_path / "dashboard.db",
+        tmp_path / "auth" / "token",
+        browser_headless=True,
+    )
+    storage = Storage(settings.database_path)
+    app = create_app(
+        settings,
+        storage=storage,
+        registry=ProviderRegistry([provider]),
+    )
+    jobs = app.extensions["xworkbench_jobs"]
+
+    server = make_server("127.0.0.1", 0, app, threaded=True)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    allowed_origin = urlsplit(base_url)
+    requested = []
+    external = []
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(accept_downloads=True)
+
+            def loopback_only(route):
+                requested.append(route.request.url)
+                candidate = urlsplit(route.request.url)
+                if (
+                    candidate.scheme,
+                    candidate.hostname,
+                    candidate.port,
+                ) == (
+                    allowed_origin.scheme,
+                    allowed_origin.hostname,
+                    allowed_origin.port,
+                ):
+                    route.continue_()
+                else:
+                    external.append(route.request.url)
+                    route.abort()
+
+            context.route("**/*", loopback_only)
+            page = context.new_page()
+            try:
+                page.goto(base_url, wait_until="networkidle")
+
+                page.locator("#browser-max-posts").fill("2")
+                page.locator("#preview-button").click()
+                expect(page.locator("#preview-card")).to_be_visible()
+                expect(page.locator("#browser-preview-target")).to_have_text(
+                    "2 visible Posts maximum"
+                )
+
+                page.locator("#confirm-button").click()
+                expect(page.locator("#job-status")).to_have_text("Running")
+                expect(page.locator("#collected-count")).to_have_text("1 / 2")
+                expect(page.locator("#job-progress")).to_have_js_property("value", 50)
+                expect(page.locator("#progress-copy")).to_have_text(
+                    "1 unique Posts stored locally."
+                )
+
+                with page.expect_response(
+                    lambda response: response.request.method == "POST"
+                    and response.url.endswith("/cancel")
+                ) as cancellation:
+                    page.locator("#cancel-button").click()
+                assert cancellation.value.status == 202
+
+                provider.release.set()
+                expect(page.locator("#job-status")).to_have_text("Cancelled")
+                expect(page.locator("#partial-notice")).to_be_visible()
+                expect(page.locator("#summary-total")).to_have_text("1")
+                expect(page.locator("#posts-list .post")).to_have_count(1)
+
+                page.locator("#text-filter").fill("fixture evidence")
+                expect(page.locator("#posts-list .post")).to_have_count(1)
+
+                page.locator("details.raw-evidence summary").click()
+                with page.expect_download() as downloaded:
+                    page.locator("#json-export").click()
+                payload = json.loads(Path(downloaded.value.path()).read_text())
+                assert payload["schemaVersion"] == 4
+                assert payload["job"]["status"] == "cancelled"
+                assert [post["post_id"] for post in payload["posts"]] == ["9001"]
+            finally:
+                context.close()
+                browser.close()
+            assert not browser.is_connected()
+
+        assert requested
+        assert external == []
+        assert provider.finished.wait(5)
+        assert provider.cancel_seen
+    finally:
+        provider.release.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+        jobs.shutdown()
+
+    assert not server_thread.is_alive()
+    assert jobs.metrics()["cleanupFailures"] == 0
+    assert not storage.path.with_name(f"{storage.path.name}.worker.lock").exists()
