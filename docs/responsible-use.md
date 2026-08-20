@@ -32,8 +32,9 @@ or identity rotation, block-triggered proxy changes, X write actions, private-da
 commercial-scale harvesting. Do not republish content or personal data merely because it was
 visible to an authenticated account.
 
-The local-only dashboard, small budgets, explicit previews, stop behavior, and read-only MCP reduce
-technical scope. They do not make a use compliant, licensed, fair, permitted, or safe by themselves.
+The local-only dashboard and terminal surfaces, small budgets, explicit previews, stop behavior,
+and read-only MCP reduce technical scope. They do not make a use compliant, licensed, fair,
+permitted, or safe by themselves.
 
 ## Capability lab boundary
 

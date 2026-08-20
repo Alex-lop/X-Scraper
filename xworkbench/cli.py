@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import webbrowser
+from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,7 +24,7 @@ from pathlib import Path
 from werkzeug.serving import make_server
 
 from .api import BROWSER_PROVIDER, create_app
-from .config import Settings, SettingsError, validate_token
+from .config import Settings, SettingsError, save_bearer_token, validate_token
 from .errors import CollectionError
 from .jobs import JobService
 from .models import CollectionRequest, Post, SourceDefinition
@@ -80,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use the legacy loopback REST adapter instead of direct read-only SQLite",
     )
 
+    tui = commands.add_parser("tui", help="Run the loopback dashboard with terminal operations")
+    tui.add_argument("--port", type=_port, default=5000)
+
+    monitor = commands.add_parser("monitor", help="Attach a read-only terminal queue monitor")
+    monitor.add_argument("--url", default="http://127.0.0.1:5000")
+
     smoke = commands.add_parser("live-smoke", help="Capture at most two live Home-feed Posts")
     smoke.add_argument("--confirm-live-x", action="store_true")
     return parser
@@ -91,22 +98,7 @@ def _configure(settings: Settings) -> int:
     except SettingsError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return EXIT_PRECONDITION
-    settings.ensure_runtime_dirs()
-    settings.validate_local_files()
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{settings.bearer_token_path.name}.",
-        dir=settings.bearer_token_path.parent,
-        text=True,
-    )
-    temporary = settings.bearer_token_path.with_name(os.path.basename(temporary_name))
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
-            target.write(token + "\n")
-        os.chmod(temporary, 0o600)
-        temporary.replace(settings.bearer_token_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    print(f"Saved Bearer Token to {settings.bearer_token_path}")
+    print(f"Saved Bearer Token to {save_bearer_token(settings, token)}")
     return 0
 
 
@@ -380,10 +372,26 @@ def _doctor(
     return 0 if not failures else EXIT_PRECONDITION
 
 
-def _setup(settings: Settings) -> int:
+def _initialize_runtime(settings: Settings) -> Storage:
     settings.ensure_runtime_dirs()
     settings.ensure_config_file()
     settings.validate_local_files()
+    storage = Storage(settings.database_path)
+    storage.initialize()
+    try:
+        with closing(sqlite3.connect(settings.database_path, timeout=0)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            f"Database is locked at {settings.database_path}; stop the other writer and retry."
+        ) from exc
+    settings.database_path.chmod(0o600)
+    return storage
+
+
+def _setup(settings: Settings) -> int:
+    _initialize_runtime(settings)
     print(f"PASS  config             protected at {settings.config_path}")
 
     lock_path = Path(__file__).resolve().parent.parent / "requirements.lock"
@@ -396,17 +404,6 @@ def _setup(settings: Settings) -> int:
             "python -m pip install -r requirements.lock"
         )
 
-    storage = Storage(settings.database_path)
-    storage.initialize()
-    try:
-        with closing(sqlite3.connect(settings.database_path, timeout=0)) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.rollback()
-    except sqlite3.OperationalError as exc:
-        raise RuntimeError(
-            f"Database is locked at {settings.database_path}; stop the other writer and retry."
-        ) from exc
-    settings.database_path.chmod(0o600)
     print(f"PASS  database           initialized at {settings.database_path}")
 
     print("INFO  setup never signs in or contacts X; use xworkbench auth when ready.")
@@ -632,7 +629,14 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _run_server(app, host: str, port: int, *, open_browser: bool) -> int:
+def _run_server(
+    app,
+    host: str,
+    port: int,
+    *,
+    open_browser: bool,
+    frontend: Callable[[str], int | None] | None = None,
+) -> int:
     try:
         server = make_server(host, port, app, threaded=True)
     except OSError:
@@ -646,14 +650,55 @@ def _run_server(app, host: str, port: int, *, open_browser: bool) -> int:
         timer = threading.Timer(0.4, lambda: webbrowser.open(url))
         timer.daemon = True
         timer.start()
+    server_thread = None
+    result = 0
     try:
-        server.serve_forever()
+        if frontend is None:
+            server.serve_forever()
+        else:
+            server_thread = threading.Thread(
+                target=server.serve_forever,
+                name="xworkbench-http",
+                daemon=True,
+            )
+            server_thread.start()
+            result = frontend(url) or 0
     except KeyboardInterrupt:
         print("\nStopping X-Scraper.")
     finally:
+        if server_thread is not None:
+            server.shutdown()
+            server_thread.join(timeout=5)
         server.server_close()
-        app.extensions["xworkbench_jobs"].shutdown()
-    return 0
+        jobs = app.extensions["xworkbench_jobs"]
+        jobs.shutdown()
+        cleanup_failures = []
+        if server_thread is not None and server_thread.is_alive():
+            cleanup_failures.append("HTTP server thread")
+        if any(thread.is_alive() for thread in getattr(jobs, "_threads", ())):
+            cleanup_failures.append("worker thread")
+        lock_path = getattr(jobs, "_lock_path", None)
+        if lock_path is not None and lock_path.exists():
+            cleanup_failures.append("worker lock")
+        if cleanup_failures:
+            raise RuntimeError(f"Shutdown did not release: {', '.join(cleanup_failures)}.")
+    return result
+
+
+def _terminal_entrypoints():
+    if importlib.util.find_spec("textual") is None:
+        raise RuntimeError(
+            'Terminal UI support is missing; install with: pip install -e ".[tui]"'
+        )
+    try:
+        from .terminal import run_monitor, run_owner
+    except ModuleNotFoundError as exc:
+        if exc.name and (exc.name == "textual" or exc.name.startswith("textual.")):
+            raise RuntimeError(
+                'Terminal UI support is missing; install with: pip install -e ".[tui]"'
+            ) from exc
+        raise
+    return run_owner, run_monitor
 
 
 def _run_demo(*, port: int, open_browser: bool) -> int:
@@ -785,6 +830,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "monitor":
+            _, run_monitor = _terminal_entrypoints()
+            return run_monitor(args.url)
         settings = Settings.from_env()
         if args.command == "setup":
             return _setup(settings)
@@ -809,6 +857,17 @@ def main(argv: list[str] | None = None) -> int:
                 database_path=None if args.url else settings.database_path,
             )
             return 0
+        if args.command == "tui":
+            run_owner, _ = _terminal_entrypoints()
+            storage = _initialize_runtime(settings)
+            app = create_app(settings, storage=storage)
+            return _run_server(
+                app,
+                "127.0.0.1",
+                args.port,
+                open_browser=False,
+                frontend=lambda url: run_owner(url, settings),
+            )
         if args.command == "live-smoke":
             return _run_live_smoke(settings, confirmed=args.confirm_live_x)
         if not _is_loopback(args.host):

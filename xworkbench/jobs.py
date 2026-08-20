@@ -337,14 +337,14 @@ class JobService:
             raise
 
     def shutdown(self) -> None:
-        if self._shutdown:
-            return
         started = monotonic()
-        self._shutdown = True
-        self._stop_event.set()
-        with self._condition:
-            self._condition.notify_all()
-        deadline = monotonic() + 5
+        if not self._shutdown:
+            self._shutdown = True
+            self._stop_event.set()
+            with self._condition:
+                self._condition.notify_all()
+        # ponytail: covers one 30s official HTTP call; process isolation is the upgrade path.
+        deadline = monotonic() + max(5, self.lease_seconds + 5)
         for thread in self._threads:
             thread.join(timeout=max(0.0, deadline - monotonic()))
         alive = sum(thread.is_alive() for thread in self._threads)
@@ -561,10 +561,15 @@ class JobService:
                 job = self.storage.get_job(job_id)
             request = CollectionRequest.from_dict(job["request"]) if job else None
         except (CollectionError, KeyError, TypeError):
+            job = None
             request = None
         return (
-            source_fingerprint(request) if request else job_id,
-            request.provider.value if request else "unknown",
+            str(job.get("source_id") or source_fingerprint(request))
+            if job and request
+            else job_id,
+            str(job.get("auth_state_id") or f"provider:{request.provider.value}")
+            if job and request
+            else "provider:unknown",
         )
 
     def _enqueue_locked(

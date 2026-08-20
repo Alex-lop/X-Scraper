@@ -11,11 +11,13 @@ from xworkbench.errors import CollectionCancelled
 from xworkbench.models import CollectionRequest
 from xworkbench.playwright_browser import (
     SYNC_CALL_MAX_MS,
+    BrowserManualActionRequired,
     BrowserSessionInvalidError,
     PlaywrightBrowserProvider,
     _atomic_text,
     _record_status,
     _save_storage_state,
+    authenticate,
 )
 
 
@@ -110,9 +112,10 @@ def test_state_marker_is_digest_bound_and_unverified_state_is_rejected(tmp_path)
         settings.storage_state_path.with_name(".playwright.json.auth-status").read_text()
     )
     status = provider.connection_status()
-    assert marker["stateSha256"] == hashlib.sha256(
-        settings.storage_state_path.read_bytes()
-    ).hexdigest()
+    assert (
+        marker["stateSha256"]
+        == hashlib.sha256(settings.storage_state_path.read_bytes()).hexdigest()
+    )
     assert status["status"] == "verified_live" and status["ready"] is True
     assert status["verifiedAt"] == verified_at
 
@@ -298,6 +301,26 @@ class _Lifecycle:
         return None
 
 
+def test_headed_authentication_cancellation_closes_browser_lifecycle(tmp_path):
+    lifecycle = _Lifecycle()
+    settings = _settings(tmp_path)
+    checks = 0
+
+    def should_cancel():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    with pytest.raises(BrowserManualActionRequired, match="cancelled"):
+        authenticate(
+            settings,
+            should_cancel=should_cancel,
+            _playwright_factory=lambda: lifecycle,
+        )
+
+    assert lifecycle.page.closed and lifecycle.context.closed and lifecycle.browser.closed
+
+
 def _ready_provider(tmp_path, lifecycle, **changes):
     settings = _settings(tmp_path, **changes)
     _write_state(settings, {"cookies": [], "origins": []})
@@ -408,7 +431,7 @@ def test_selector_drift_report_is_sanitized_and_never_promoted(tmp_path):
         evaluate_all=lambda _script: [
             {
                 "tag": "article",
-                "testId": 'tweet\"><script>',
+                "testId": 'tweet"><script>',
                 "role": "article",
                 "statusLinks": 1,
                 "times": 1,

@@ -63,7 +63,7 @@ network, mount, and PID namespaces, remounts namespace-visible sysfs read-only, 
 loopback, and asserts that no default route exists. It then starts from an empty environment, drops
 to the non-root runner identity with no effective capabilities or privilege escalation, runs the
 complete lab three times, and rejects a surviving Chromium process between runs. The remote result
-at final implementation revision `1bd21ea9d0c7766b9440b65891569260ed92e5f3` is green:
+at capability-lab revision `1bd21ea9d0c7766b9440b65891569260ed92e5f3` is green:
 [CI run 32230574720](https://github.com/Alex-lop/X-Scraper/actions/runs/32230574720) passed
 all 31 lab items three times (`11.83s`, `10.22s`, and `9.71s`) after the dependent browser job.
 The capability-lab job completed in 1m13s.

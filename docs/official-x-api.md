@@ -32,8 +32,9 @@ and media-only filters are compiled after the user's query, with grouping retain
 user-authored OR expressions.
 
 Every request first produces an exact five-minute preview. Job creation must return that unchanged
-execution plan and set `confirmPaidRead: true`. A stale or modified plan is rejected. There is no
-supported CLI shortcut that skips dashboard preview and confirmation.
+execution plan and set `confirmPaidRead: true`. A stale or modified plan is rejected. The dashboard
+and optional terminal owner expose that approval; there is no CLI shortcut that skips preview and
+confirmation. See [terminal operations](terminal-operations.md).
 
 The preview reports resource ceilings and list-price planning estimates. Those values are not an
 invoice or billing guarantee: current prices, daily resource deduplication, account access, and the

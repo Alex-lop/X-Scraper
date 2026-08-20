@@ -1,11 +1,12 @@
 import json
 from datetime import UTC, datetime
+from urllib.error import URLError
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from xworkbench.config import Settings
-from xworkbench.errors import InvalidRequestError, SchemaDriftError
+from xworkbench.errors import CollectionCancelled, InvalidRequestError, SchemaDriftError
 from xworkbench.models import CollectionRequest, ProviderType
 from xworkbench.x_api import (
     ARCHIVE_ENDPOINT,
@@ -42,9 +43,7 @@ def payload(*, next_token="next"):
         ],
         "includes": {
             "users": [{"id": "7", "username": "tester"}],
-            "media": [
-                {"media_key": "3_1", "type": "photo", "url": "https://img.invalid/a.jpg"}
-            ],
+            "media": [{"media_key": "3_1", "type": "photo", "url": "https://img.invalid/a.jpg"}],
         },
         "meta": {"result_count": 1, "next_token": next_token},
     }
@@ -62,9 +61,7 @@ def checkpoint(*, state=None, stored=0, posts=0):
     return {
         "providerState": state,
         "storedCount": stored,
-        "metadata": {
-            "resourcesReturned": {"posts": posts, "users": 0, "media": 0}
-        },
+        "metadata": {"resourcesReturned": {"posts": posts, "users": 0, "media": 0}},
     }
 
 
@@ -261,3 +258,26 @@ def test_official_resume_honors_persisted_resource_ceiling_without_a_request(tmp
     assert requested == []
     assert summary.partial is True
     assert summary.completion_reason == "post_resource_limit_reached"
+
+
+def test_official_transport_cancellation_stops_before_retry(tmp_path):
+    cancelled = False
+    calls = 0
+
+    def opener(_request, timeout):
+        nonlocal cancelled, calls
+        assert timeout > 0
+        calls += 1
+        cancelled = True
+        raise URLError("fixture unavailable")
+
+    provider = XApiProvider(
+        settings(tmp_path),
+        opener=opener,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("cancelled request must not retry")
+        ),
+    )
+    with pytest.raises(CollectionCancelled):
+        provider._request({"query": "fixture"}, should_cancel=lambda: cancelled)
+    assert calls == 1

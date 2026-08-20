@@ -800,7 +800,6 @@ function renderJob(job) {
   $("#job-progress").value = progress;
   let progressCopy = `${count(job.collectedCount)} unique Posts stored locally.`;
   if (!browser && job.resourcesReturned) progressCopy += ` ${count(resources.posts)} Post, ${count(resources.users)} User, and ${count(resources.media)} Media resources returned.`;
-  if (status === "waiting" && job.retryAt) progressCopy = `Rate limited. Automatic retry at ${utc(job.retryAt)}.`;
   $("#progress-copy").textContent = progressCopy;
   const provenance = job.provenance || {};
   $("#job-provenance").textContent = browser

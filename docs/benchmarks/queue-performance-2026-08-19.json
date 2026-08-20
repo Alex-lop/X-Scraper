@@ -29,6 +29,10 @@
   },
   "realBrowserMatrix": {
     "fixture": "production Playwright provider with dynamic numeric-loopback HTML",
+    "productionAdmission": false,
+    "productionReachable": false,
+    "authStateModel": "synthetic unique auth_state_id override per job",
+    "prohibitedInference": "Does not support same-provider Browser concurrency or a production-route speed claim.",
     "externalEgress": false,
     "jobsPerCase": 4,
     "cases": [
@@ -67,6 +71,6 @@
     "defaultWorkers": 1,
     "normalOptInMaximum": 2,
     "hardMaximum": 4,
-    "reason": "Two workers materially reduced local wall time with correct cleanup, but increased peak process-tree RSS by about 385 MB."
+    "reason": "Historical isolated-runtime/auth-key evidence only. The raw 2.415x result bypassed production route admission; use the reachable mixed-provider artifact for the supported ceiling."
   }
 }

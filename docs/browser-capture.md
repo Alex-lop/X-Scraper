@@ -60,7 +60,8 @@ and preview. Confirm only if **Source** is `https://x.com/home` and **Target** i
 maximum`; otherwise edit or stop.
 
 There is no standalone `xworkbench capture` or batch command; do not copy examples that imply one
-exists. The dashboard preview-and-confirm path is the maintained interface.
+exists. The dashboard and optional `xworkbench tui` use the same maintained preview-and-confirm
+routes. See [terminal operations](terminal-operations.md) for the keyboard-first subset.
 
 For a bounded batch, first save each Browser or official-API source through the single-capture
 form. Then, in **Capture several saved sources**:
@@ -77,8 +78,10 @@ form. Then, in **Capture several saved sources**:
 The approval digest uses a process-local secret and expires quickly, so a restart requires a new
 preview. Scheduling favors higher priority; at equal priority it preserves FIFO and rotates
 sources. It permits only one active capture per logical source and auth state. The configured
-default is one worker; two isolated workers are the normal opt-in maximum. These are offline queue
-and local-fixture claims, not permission or evidence that concurrent live X capture succeeds.
+default is one worker; two is a global mixed-provider ceiling. Production routes assign all Browser
+jobs the same provider auth key, so two Browser sources remain serial; the same is true for two
+official jobs. Only Browser+official can occupy both workers. These are offline queue and
+local-fixture claims, not permission or evidence that concurrent live X capture succeeds.
 
 Concrete batch example: after saving two distinct Browser sources you are authorized to capture,
 select exactly those two, set **Browser Posts per source** to `5`, **Deadline** to `600`, **Priority**
@@ -102,8 +105,8 @@ unexpected browser failure. Already committed rows remain available with truthfu
 The progress wait polls for cancellation at 100 ms intervals. Launch and navigation have bounded
 timeouts and checkpoints, but synchronous Playwright native calls cannot be interrupted in the
 middle of one call. Cleanup tests prove page, context, browser, and manager closure; they are not an
-all-platform guarantee. The separate opt-in queue benchmark also recorded process-tree cleanup on
-one macOS machine; see [testing](testing.md).
+all-platform guarantee. The separate opt-in mixed-provider queue benchmark also recorded one
+Browser process tree's cleanup on one macOS machine; see [testing](testing.md).
 
 ## What the local Chromium tests prove
 

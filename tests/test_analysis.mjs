@@ -108,6 +108,7 @@ test("keeps the product loop CSP-safe, keyboard-native, and motion-safe", () => 
   assert.match(appSource, /MCP test passed during demo startup/);
   assert.match(appSource, /\/api\/batches\/preview/);
   assert.match(appSource, /\/api\/progress\?after=/);
+  assert.doesNotMatch(appSource, /Automatic retry/);
   assert.equal(/<(?:script|link)[^>]+https?:\/\//i.test(htmlSource), false);
   assert.equal(htmlSource.includes("<img"), false);
   assert.equal(appSource.includes('behavior: "smooth"'), false);

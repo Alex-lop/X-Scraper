@@ -31,6 +31,10 @@ Real production projection/navigation in local Chromium:
 pytest tests/test_playwright_integration.py
 ```
 
+That file also drives the real loopback dashboard through preview, confirmation, durable progress,
+explicit cancellation, analysis filtering, and JSON export. The app uses real SQLite and
+`JobService` with a blocking synthetic provider; Chromium aborts every non-loopback request.
+
 Browser unit, hardening, adversarial, and local-Chromium coverage together:
 
 ```bash
@@ -57,12 +61,23 @@ Deterministic complete offline demo:
 pytest tests/test_offline_demo.py
 ```
 
+Optional terminal owner, read-only monitor, shared loopback client, and lifecycle behavior:
+
+```bash
+pytest tests/test_terminal.py tests/test_local_client.py tests/test_interfaces.py
+```
+
+Textual's built-in Pilot runs through `asyncio.run` at normal, wide, and narrow sizes. The focused
+gate covers lazy missing-extra failure, exact/expired approvals, unknown mutation outcomes,
+reconnect with stale durable state, secret/markup/control-character filtering, explicit
+cancellation, auth shutdown, one request in flight, owner cleanup, and monitor non-ownership.
+
 Rendered demo QA was also recorded in pinned local Chromium. The in-app Browser had no attached
 session, so the check used the installed Playwright Chromium fallback: 15 loopback requests, no
 external request, no console/page error, no desktop or 390 px mobile overflow, named controls,
 working skip-link/focus and dynamic `aria-current`, the exact 10/15/10 comparison, and 25 evidence
 cards. The two sanitized desktop captures are in [the demo record](demo.md). This was a recorded
-render check, not a new automated test or a live-X claim.
+visual check, distinct from the automated controlled-provider E2E above and not a live-X claim.
 
 Queue correctness and the ordinary 300-job lightweight stress gate:
 
@@ -81,21 +96,33 @@ Injected signals prove pre-lease pause and five-second recovery without interrup
 The default runtime probe supports only coordinator-process RSS/CPU; unsupported browser counts and
 the non-applicable synchronous event-loop metric must remain explicit nulls, not green zeros.
 
-The measured production-Playwright concurrency matrix is deliberately opt-in because it starts
-real Chromium. It still intercepts the exact validated destination before egress, serves only a
-numeric-loopback fixture, and aborts every other request:
+The production-reachable concurrency matrix is deliberately opt-in because it starts real
+Chromium. Each of three one-worker and three two-worker repetitions uses saved sources, the real
+preview/confirm routes, SQLite admission, one production Playwright provider against a numeric
+loopback page, and one production official provider with an in-memory synthetic transport. Browser
+navigation is intercepted before egress and every unexpected destination aborts:
 
 ```bash
 XWORKBENCH_RUN_BROWSER_MATRIX=1 \
   pytest tests/test_queue_performance.py -k production_playwright
 ```
 
-On the recorded 2026-08-19 arm64 macOS machine, the local four-job fixture was 2.415 times faster
-with two workers than one, while peak process-tree RSS rose by about 385 MB. Correctness and cleanup
-passed in both cases; this supports default 1 and opt-in maximum 2, not higher live-X concurrency.
-See [ADR 0002](adr/0002-bounded-capture-queue.md) and the
-[sanitized benchmark](benchmarks/queue-performance-2026-08-19.json) for exact measurements and
-limits.
+CI asserts topology, exact results, stable state, leases, duplicate absence, backlog, zero egress,
+and cleanup, not timing. To apply the local decision thresholds explicitly, also set
+`XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1`.
+
+On the recorded 2026-08-20 arm64 macOS machine, median wall time fell from `1.081s` to `0.603s`
+(`1.793x`) while median CPU fell, median incremental process-tree RSS was negative, median SQLite
+callback fraction was `0.6193%`, and backlog stayed at one. All correctness, cleanup, and zero-egress
+gates passed, so the supported maximum remains two **globally**. Production auth keys still
+serialize Browser+Browser and official+official; only a mixed Browser+official workload can occupy
+both workers. See [ADR 0002](adr/0002-bounded-capture-queue.md) and the
+[reachable artifact](benchmarks/reachable-mixed-provider-2026-08-20.json).
+
+The preserved [2026-08-19 artifact](benchmarks/queue-performance-2026-08-19.json) still records its
+raw 2.415x values, but that test directly supplied distinct synthetic Browser auth keys and bypassed
+production admission. It is isolated-runtime/auth-key evidence, not a Browser concurrency or
+production speed claim.
 
 CLI/configuration and local API boundaries:
 
@@ -104,12 +131,15 @@ pytest tests/test_cli_config.py tests/test_interfaces.py tests/test_api.py \
   tests/test_api_security.py
 ```
 
-The project CI runs locked ordinary tests, Ruff, JavaScript checks, both help entry points, wheel
-build, and package-content inspection on Linux with Python 3.11-3.13. A dependent Linux/Python
-3.13 job installs Chromium once and runs the offline integration file plus the bounded queue browser
-matrix. CI intentionally has no X credentials or live target. An archived Python 3.13.3 clean
-install passed locally on macOS; Windows has no clean-install record, and neither desktop platform
-has a CI job.
+The project CI installs the all-extras lock and runs ordinary tests (including Textual Pilot), Ruff,
+JavaScript checks, both help entry points, wheel build, and package-content inspection on Linux with
+Python 3.11-3.13. It checks the conditional Textual metadata and proves a base-wheel `tui` or
+`monitor` failure creates no runtime state. On Python 3.13 it uses uv 0.11.29 to regenerate the
+universal/all-extras lock twice and byte-compare both results with the committed lock. A dependent
+Linux/Python 3.13 job installs Chromium and runs the integration file, including the
+controlled-provider dashboard E2E, plus the bounded queue browser matrix. CI intentionally has no
+X credentials or live target. An archived Python 3.13.3 clean install passed locally on macOS;
+Windows has no clean-install record, and neither desktop platform has a CI job.
 
 ## Hard-isolated capability lab
 
@@ -125,11 +155,11 @@ The mount namespace is used to make the network namespace visible through remoun
 not a general filesystem sandbox.
 
 At `c843690`, the hardened local pre-CI gate ran three times with 30 passed and one macOS skip per
-run; the skipped item is the Linux-only namespace/privilege assertion. The ordinary full suite
-reported 200 passed and 32 skipped: 31 gated lab items plus the opt-in browser matrix. These local
-results were then extended by the Linux-only gate.
+run; the skipped item is the Linux-only namespace/privilege assertion. At the current feature
+checkpoint, the ordinary full suite with installed local Chromium reported 229 passed and 32
+skipped: 31 gated lab items plus the opt-in browser matrix.
 
-At final implementation revision `1bd21ea`,
+At capability-lab revision `1bd21ea`,
 [CI run 32230574720](https://github.com/Alex-lop/X-Scraper/actions/runs/32230574720) passed all
 31 lab items inside the isolated Linux job three times (`11.83s`, `10.22s`, and `9.71s`). The
 dependent browser job also passed; the complete pipeline was green on Python 3.11, 3.12, and 3.13.
@@ -172,7 +202,8 @@ make a test green.
 
 ## Packaging limits
 
-The universal lock is complete but has no artifact hashes. The wheel is expected to contain the
-Python package and four static assets, while excluding tests and any capability-lab code. The exact
-archived clean-install record and current caveats live in [verification](verification.md), rather
-than being inferred from a developer's existing virtual environment.
+The 54-package universal lock is complete but has no artifact hashes. The wheel is expected to
+contain the Python package, shared loopback client, terminal module, and four static assets while
+excluding tests and capability-lab code. Its metadata must guard Textual behind the `tui` extra;
+the base wheel must run ordinary help and fail both terminal commands cleanly without creating
+runtime state. See [verification](verification.md).

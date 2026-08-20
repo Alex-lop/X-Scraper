@@ -24,6 +24,9 @@ browser = [
 mcp = [
   "mcp>=2,<3",
 ]
+tui = [
+  "textual>=8.2.8,<9",
+]
 
 [project.scripts]
 xworkbench = "xworkbench.cli:main"

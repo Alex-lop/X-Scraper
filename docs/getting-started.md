@@ -41,6 +41,28 @@ The universal extras lock was generated with uv 0.11.29; `pyproject.toml` separa
 setuptools build input. The lock does not contain artifact hashes, so `pip --require-hashes` is not
 supported.
 
+When dependencies intentionally change, regenerate the same universal/all-extras lock:
+
+```bash
+python -m pip install uv==0.11.29
+uv --version
+uv pip compile pyproject.toml --all-extras --universal \
+  --python-version 3.11 --no-annotate -o requirements.lock
+```
+
+CI saves the committed file, runs that exact compile twice against the same path, and requires both
+results to match byte-for-byte.
+
+The terminal interface is optional in an ordinary editable install:
+
+```bash
+python -m pip install -e '.[tui]'
+xworkbench tui --port 5000
+```
+
+Use `--port 0` to select a free loopback port. The Setup tab displays the resolved dashboard URL
+and monitor command; `w` opens the web dashboard. See [terminal operations](terminal-operations.md).
+
 ## Windows PowerShell
 
 From a source checkout:
@@ -77,6 +99,12 @@ non-loopback host, and `--no-open` suppresses opening a browser. On startup, the
 durable queued jobs from SQLite. Terminal snapshots remain inspectable and are not recollected
 automatically.
 
+A second terminal can attach to that running server without opening SQLite or starting a worker:
+
+```bash
+xworkbench monitor --url http://127.0.0.1:5000
+```
+
 Browser capture needs an app-owned session created by visible manual sign-in:
 
 ```bash
@@ -111,6 +139,8 @@ xworkbench doctor --require-token
 | Database incompatible or backup already exists | Stop and preserve both files; read [storage and cache](storage-and-cache.md). |
 | Port unavailable | Use `xworkbench start --port 0` or choose a free loopback port. |
 | Official token missing | Ignore for Browser capture, or run `xworkbench configure`. |
+| Terminal UI support missing | Install the `tui` extra; base installs intentionally omit Textual. |
+| Monitor URL rejected | Use a plain loopback root such as `http://127.0.0.1:5000`. |
 
 Do not post auth files, tokens, live Post content, or database copies in an issue. Sanitized command
 output and error codes are sufficient for most reports.

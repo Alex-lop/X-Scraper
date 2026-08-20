@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,28 @@ def validate_token(value: str) -> str:
             f"Bearer Token must be one printable line of 1-{MAX_TOKEN_LENGTH} characters."
         )
     return token
+
+
+def save_bearer_token(settings: Settings, value: str) -> Path:
+    token = validate_token(value)
+    settings.ensure_runtime_dirs()
+    settings.validate_local_files()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{settings.bearer_token_path.name}.",
+        dir=settings.bearer_token_path.parent,
+        text=True,
+    )
+    temporary = settings.bearer_token_path.with_name(os.path.basename(temporary_name))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            target.write(token + "\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(temporary, 0o600)
+        temporary.replace(settings.bearer_token_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return settings.bearer_token_path
 
 
 def _private_directory(path: Path) -> None:
@@ -271,7 +294,7 @@ class Settings:
 
     @staticmethod
     def _integer(value: Any, name: str) -> int:
-        if isinstance(value, bool) or not isinstance(value, (int, str)):
+        if isinstance(value, bool) or not isinstance(value, int | str):
             raise SettingsError(f"{name} must be an integer.")
         try:
             return int(value)

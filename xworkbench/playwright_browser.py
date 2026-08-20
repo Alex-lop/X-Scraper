@@ -570,12 +570,15 @@ def authenticate(
     settings: Settings,
     *,
     timeout_seconds: float = 600,
+    should_cancel: Callable[[], bool] = lambda: False,
     _playwright_factory: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Let the user sign in on X itself, then atomically save app-owned browser state."""
     browser = context = page = None
     deadline = time.monotonic() + timeout_seconds
     try:
+        if should_cancel():
+            raise BrowserManualActionRequired("Authentication was cancelled.")
         with (_playwright_factory or _sync_playwright)() as playwright:
             remaining_ms = max(1, int((deadline - time.monotonic()) * 1_000))
             browser = playwright.chromium.launch(headless=False, timeout=remaining_ms)
@@ -587,6 +590,8 @@ def authenticate(
                 timeout=min(30_000, max(1, int((deadline - time.monotonic()) * 1_000))),
             )
             while time.monotonic() < deadline:
+                if should_cancel():
+                    raise BrowserManualActionRequired("Authentication was cancelled.")
                 parsed = urlparse(str(page.url))
                 home_surface = page.locator(
                     'a[data-testid="AppTabBar_Home_Link"], [data-testid="primaryColumn"]'
@@ -630,8 +635,10 @@ def authenticate(
     )
 
 
-def authenticate_interactively(settings: Settings) -> Path:
-    authenticate(settings)
+def authenticate_interactively(
+    settings: Settings, *, should_cancel: Callable[[], bool] = lambda: False
+) -> Path:
+    authenticate(settings, should_cancel=should_cancel)
     return _state_path(settings)
 
 

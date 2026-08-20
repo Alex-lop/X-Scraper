@@ -25,10 +25,12 @@ Cancellation and terminal state precedence stay in the existing job lifecycle.
 Progress uses a bounded, monotonically sequenced in-memory buffer; reconnecting readers recover
 the final truth from SQLite even if an intermediate animation was coalesced or evicted.
 
-Use one worker by default. Expose two as the normal opt-in maximum and enforce four as the internal
-hard maximum. Keep per-source and per-auth-state concurrency at one. More than one worker requires
-a factory that returns a distinct provider registry for every worker, preventing shared
-thread-affine Playwright objects. Each browser capture owns its Playwright runtime, browser,
+Use one worker by default. Expose two as the global mixed-provider opt-in maximum and enforce four
+as the internal hard maximum. Keep per-source and per-auth-state concurrency at one. Public route
+admission derives one auth key per provider, so Browser+Browser and official+official remain serial;
+only Browser+official can occupy both workers. Auth identifiers are not public inputs. More than one
+worker requires a factory that returns a distinct provider registry for every worker, preventing
+shared thread-affine Playwright objects. Each browser capture owns its Playwright runtime, browser,
 context, page, and app-owned auth-state file; cleanup happens in the provider's `finally` path.
 Auth-state refreshes remain serialized and a stale capture cannot overwrite newer state.
 
@@ -46,19 +48,27 @@ a whole-browser memory ceiling.
 
 ## Evidence
 
-The sanitized local benchmark is recorded in
-[`queue-performance-2026-08-19.json`](../benchmarks/queue-performance-2026-08-19.json).
+The production-reachable local matrix is recorded in
+[`reachable-mixed-provider-2026-08-20.json`](../benchmarks/reachable-mixed-provider-2026-08-20.json).
+Each case used real saved-source creation/listing and batch preview/confirm, SQLite admission and
+leases, one production Playwright provider against a loopback fixture, and one production official
+provider with an in-memory synthetic transport. It ran three times per worker count.
 
-| Fixture | Workers | Jobs | Wall | Peak process-tree RSS | CPU | SQLite callback time | Cleanup |
+| Fixture | Workers | Jobs/run | Median wall | Median process-tree RSS | Median CPU | Median SQLite fraction | Cleanup |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Production Playwright, dynamic numeric-loopback page | 1 | 4 | 3.111s | 487.2MB | 3.218s | 0.009s | 0 failures |
-| Production Playwright, dynamic numeric-loopback page | 2 | 4 | 1.288s | 871.7MB | 2.754s | 0.014s | 0 failures |
+| Route-admitted Browser + synthetic official | 1 | 2 | 1.081s | 497.2MB | 0.847s | 0.3742% | 0 failures |
+| Route-admitted Browser + synthetic official | 2 | 2 | 0.603s | 482.9MB | 0.690s | 0.6193% | 0 failures |
 
-Two workers were 2.415 times faster on this fixture and produced the same stable Post IDs, zero
-duplicate observations within a snapshot, zero external requests, zero remaining leases, and no
-live pages, contexts, browsers, or worker threads. Peak process-tree RSS increased by 385MB. This
-supports an explicit two-worker option on the measured machine but not a higher default. Static
-local HTML is not evidence that live X should receive more concurrency.
+The two-worker median was 1.793 times faster. CPU did not grow, incremental median RSS was below the
+128MiB ceiling, SQLite callback time remained below 20% of wall time, backlog stayed at one, the
+stable state digest matched, and exact results, duplicate, lease, thread, Chromium-descendant,
+cleanup, and zero-egress gates passed. This retains the global maximum of two. It does not permit
+two Browser or two official jobs to run together and does not support a live-X speed claim.
+
+The earlier [`queue-performance-2026-08-19.json`](../benchmarks/queue-performance-2026-08-19.json)
+is preserved with its raw `3.111s`, `1.288s`, and 2.415x values. That direct-submit matrix injected
+one synthetic auth key per Browser job and bypassed production admission. It is isolated
+runtime/auth-key and cleanup evidence only; its former production interpretation was incorrect.
 
 Three consecutive 100-job lightweight drains used the real queue, leases, checkpoints, Post
 persistence, and terminal transitions. All 300 jobs succeeded exactly once in 1.667s. The maximum
@@ -67,16 +77,21 @@ persistence backlog was two, leases and workers returned to zero after every dra
 1,176 `queue_counts`/`list_jobs` calls while workers ran. The test also enforces global, source, and
 auth-state caps and checks lock, thread, and temporary-state cleanup.
 
-The browser matrix is opt-in so ordinary Python jobs do not need an installed Chromium:
+The mixed-provider matrix is opt-in so ordinary Python jobs do not need installed Chromium. CI
+asserts topology/correctness/cleanup only; timing and resource decision thresholds are a separate
+local opt-in:
 
 ```sh
 pytest tests/test_queue_performance.py -k repeated_hundred
 XWORKBENCH_RUN_BROWSER_MATRIX=1 pytest tests/test_queue_performance.py -k production_playwright
+XWORKBENCH_RUN_BROWSER_MATRIX=1 XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1 \
+  pytest tests/test_queue_performance.py -k production_playwright
 ```
 
-Both fixtures are synthetic and local. Browser navigation begins at the exact validated X plan
+All fixtures are synthetic and local. Browser navigation begins at the exact validated X plan
 destination, is intercepted before egress, redirected to a numeric-loopback server, and aborts all
-other requests. The test never contacts or load-tests X.
+other requests. The official transport returns in-memory sanitized JSON. The test never contacts or
+load-tests X.
 
 ## Borrowed concepts, not dependencies
 
@@ -93,5 +108,6 @@ out of scope.
 The queue remains inspectable, recoverable, and operational without Redis, Celery, Kafka, or a
 second crawler engine. SQLite serialization and per-capture browser startup cap throughput, but
 those costs are acceptable for small, explicitly approved local batches. Reconsider the ownership
-model only if production measurements show that two isolated runtimes cannot meet the bounded
-batch goal without exceeding the documented memory ceiling.
+model only if a production-reachable mixed workload misses the declared speed, CPU, RSS,
+persistence, backlog, correctness, cleanup, or zero-egress gates. Same-provider scaling would need
+a separately authorized identity model and is not implied by this decision.
