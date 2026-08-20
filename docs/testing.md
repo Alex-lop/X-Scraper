@@ -81,21 +81,33 @@ Injected signals prove pre-lease pause and five-second recovery without interrup
 The default runtime probe supports only coordinator-process RSS/CPU; unsupported browser counts and
 the non-applicable synchronous event-loop metric must remain explicit nulls, not green zeros.
 
-The measured production-Playwright concurrency matrix is deliberately opt-in because it starts
-real Chromium. It still intercepts the exact validated destination before egress, serves only a
-numeric-loopback fixture, and aborts every other request:
+The production-reachable concurrency matrix is deliberately opt-in because it starts real
+Chromium. Each of three one-worker and three two-worker repetitions uses saved sources, the real
+preview/confirm routes, SQLite admission, one production Playwright provider against a numeric
+loopback page, and one production official provider with an in-memory synthetic transport. Browser
+navigation is intercepted before egress and every unexpected destination aborts:
 
 ```bash
 XWORKBENCH_RUN_BROWSER_MATRIX=1 \
   pytest tests/test_queue_performance.py -k production_playwright
 ```
 
-On the recorded 2026-08-19 arm64 macOS machine, the local four-job fixture was 2.415 times faster
-with two workers than one, while peak process-tree RSS rose by about 385 MB. Correctness and cleanup
-passed in both cases; this supports default 1 and opt-in maximum 2, not higher live-X concurrency.
-See [ADR 0002](adr/0002-bounded-capture-queue.md) and the
-[sanitized benchmark](benchmarks/queue-performance-2026-08-19.json) for exact measurements and
-limits.
+CI asserts topology, exact results, stable state, leases, duplicate absence, backlog, zero egress,
+and cleanup, not timing. To apply the local decision thresholds explicitly, also set
+`XWORKBENCH_ASSERT_SCALE_THRESHOLDS=1`.
+
+On the recorded 2026-08-20 arm64 macOS machine, median wall time fell from `1.081s` to `0.603s`
+(`1.793x`) while median CPU fell, median incremental process-tree RSS was negative, median SQLite
+callback fraction was `0.6193%`, and backlog stayed at one. All correctness, cleanup, and zero-egress
+gates passed, so the supported maximum remains two **globally**. Production auth keys still
+serialize Browser+Browser and official+official; only a mixed Browser+official workload can occupy
+both workers. See [ADR 0002](adr/0002-bounded-capture-queue.md) and the
+[reachable artifact](benchmarks/reachable-mixed-provider-2026-08-20.json).
+
+The preserved [2026-08-19 artifact](benchmarks/queue-performance-2026-08-19.json) still records its
+raw 2.415x values, but that test directly supplied distinct synthetic Browser auth keys and bypassed
+production admission. It is isolated-runtime/auth-key evidence, not a Browser concurrency or
+production speed claim.
 
 CLI/configuration and local API boundaries:
 

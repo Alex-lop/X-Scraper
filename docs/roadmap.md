@@ -17,7 +17,8 @@ specific offline, local-browser, client, platform, or authorized live gate passe
   direct-SQLite MCP comparison without contacting X.
 - Atomic 2-25-item saved-source batch approval, priority/FIFO/source-fair scheduling, bounded
   progress, durable recovery, isolated cancellation, and measured one-/two-worker cleanup against
-  offline and local-Chromium fixtures.
+  offline and local-Chromium fixtures. Two is a global mixed-provider ceiling; same-provider jobs
+  remain serial.
 - Deterministic pre-lease pause/recovery from coordinator-process RSS/CPU, with unsupported browser
   child-process and event-loop signals exposed truthfully rather than fabricated.
 
@@ -63,7 +64,9 @@ positive and negative tests.
 
 The shipped queue decision and sanitized measurements are recorded in
 [ADR 0002](adr/0002-bounded-capture-queue.md) and the
-[2026-08-19 benchmark](benchmarks/queue-performance-2026-08-19.json).
+[production-reachable 2026-08-20 benchmark](benchmarks/reachable-mixed-provider-2026-08-20.json).
+The [2026-08-19 artifact](benchmarks/queue-performance-2026-08-19.json) is retained as historical
+isolated-runtime/auth-key evidence only.
 
 See [verification](verification.md) for the claim matrix rather than treating this roadmap as a
 statement that pending work exists.

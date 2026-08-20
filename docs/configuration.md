@@ -54,14 +54,16 @@ An equivalent minimal file is:
 ```
 
 `xworkbench setup` creates that file only when it is absent; it does not overwrite an existing
-configuration. With two workers, each worker receives its own provider registry. Scheduling still
-caps one active job per logical source and per auth state. The durable queue accepts either one
-approved capture or an atomically admitted UI batch of 2-25 saved sources; there is no public
-capture or batch CLI.
+configuration. With two workers, each worker receives its own provider registry. Public routes use
+one internal auth key per provider, so Browser+Browser and official+official remain serial even for
+different saved sources. Only a mixed Browser+official workload can occupy both workers. Scheduling
+also caps one active job per logical source. The durable queue accepts either one approved capture
+or an atomically admitted UI batch of 2-25 saved sources; there is no public capture or batch CLI.
 
 `config show` also reports fixed read-only boundaries: `per_source_concurrency: 1`,
 `per_auth_state_concurrency: 1`, internal `hard_worker_maximum: 4`, and `route_mode: direct`. The
-user-facing worker setting remains capped at 2. `route_mode` is not a proxy control.
+user-facing worker setting remains capped at 2 as a global mixed-provider ceiling. Auth identifiers
+are internal and cannot be supplied through the public routes. `route_mode` is not a proxy control.
 
 Before a new durable lease starts, the coordinator samples its own process RSS and CPU at most once
 per 250 ms. Crossing either configured high threshold pauses only new starts; active captures keep
@@ -73,7 +75,8 @@ The default macOS/Linux probe supports coordinator-process RSS and CPU only. It 
 Chromium child-process memory, browser/context/page counts, or an event loop; those metrics are
 truthfully `unsupported` or `not_applicable`. Queue metrics expose `resourcePaused`, reasons,
 limits, failures, and at most 10 recent samples. The separate browser benchmark measures the whole
-process tree; do not treat the coordinator RSS limit as a total browser-memory ceiling. On other
+process tree for one Browser plus one synthetic official job; do not treat the coordinator RSS
+limit as a total browser-memory ceiling. On other
 platforms the process signals remain unsupported and the fixed queue/concurrency caps still apply.
 
 ## File safety
