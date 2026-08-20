@@ -337,14 +337,14 @@ class JobService:
             raise
 
     def shutdown(self) -> None:
-        if self._shutdown:
-            return
         started = monotonic()
-        self._shutdown = True
-        self._stop_event.set()
-        with self._condition:
-            self._condition.notify_all()
-        deadline = monotonic() + 5
+        if not self._shutdown:
+            self._shutdown = True
+            self._stop_event.set()
+            with self._condition:
+                self._condition.notify_all()
+        # ponytail: covers one 30s official HTTP call; process isolation is the upgrade path.
+        deadline = monotonic() + max(5, self.lease_seconds + 5)
         for thread in self._threads:
             thread.join(timeout=max(0.0, deadline - monotonic()))
         alive = sum(thread.is_alive() for thread in self._threads)

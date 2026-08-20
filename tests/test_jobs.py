@@ -2,9 +2,11 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from urllib.error import URLError
 
 import pytest
 
+from xworkbench.config import Settings
 from xworkbench.errors import (
     CollectionCancelled,
     InvalidRequestError,
@@ -20,7 +22,7 @@ from xworkbench.playwright_browser import (
 )
 from xworkbench.providers import ProviderRegistry
 from xworkbench.storage import Storage
-from xworkbench.x_api import compile_request
+from xworkbench.x_api import XApiProvider, compile_request
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted", "partial"}
 
@@ -111,6 +113,51 @@ def test_rate_limit_is_terminal_and_preserves_page_without_automatic_retry(tmp_p
     assert job["error_retryable"] is False
     assert job["rate_limit_remaining"] == 0 and job["rate_limit_reset"] == 123
     assert job["collected_count"] == 1 and storage.count_job_posts(job_id) == 1
+
+
+def test_shutdown_interrupts_active_official_request_and_releases_worker_lock(tmp_path):
+    token_path = tmp_path / "auth" / "token"
+    token_path.parent.mkdir(mode=0o700)
+    token_path.write_text("fixture-token", encoding="utf-8")
+    token_path.chmod(0o600)
+    settings = Settings(tmp_path / "shutdown.db", token_path)
+    entered = threading.Event()
+    calls = 0
+
+    def opener(_request, timeout):
+        nonlocal calls
+        assert timeout > 0
+        calls += 1
+        entered.set()
+        threading.Event().wait(0.05)
+        raise URLError("fixture unavailable")
+
+    provider = XApiProvider(
+        settings,
+        opener=opener,
+        sleeper=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("shutdown must stop official retries")
+        ),
+    )
+    storage = Storage(settings.database_path)
+    storage.initialize()
+    request = CollectionRequest.from_dict(
+        {"sourceType": "search", "sourceValue": "fixture", "maxPosts": 10}
+    )
+    service = JobService(storage, provider, start_worker=False)
+    job_id = service.submit(request, compile_request(request))
+    service.start()
+    assert entered.wait(2)
+
+    service.shutdown()
+
+    job = storage.get_job(job_id)
+    assert calls == 1
+    assert job["status"] == job["error_code"] == "interrupted"
+    assert job["lease_owner"] is job["lease_expires_at"] is None
+    assert not any(thread.is_alive() for thread in service._threads)
+    assert not service._lock_path.exists()
+    assert service.metrics()["cleanupFailures"] == 0
 
 
 def test_provider_failure_preserves_completed_page(tmp_path):
@@ -447,9 +494,7 @@ class ResourceProbe:
             self.calls += 1
             high = self.high
         return {
-            "rssBytes": (256 if high else 64) * 1024 * 1024
-            if self.rss_supported
-            else None,
+            "rssBytes": (256 if high else 64) * 1024 * 1024 if self.rss_supported else None,
             "cpuPercent": 250.0 if high else 10.0,
             "eventLoopLagMs": 999.0,
             "chromiumProcessCount": 3,

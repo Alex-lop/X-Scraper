@@ -34,11 +34,25 @@ jobs:
       - run: node --test tests/test_analysis.mjs
       - run: xworkbench --help
       - run: python -m xworkbench --help
+      - name: Verify universal lock is reproducible with uv 0.11.29
+        if: matrix.python-version == '3.13'
+        run: |
+          python -m pip install uv==0.11.29
+          uv --version | grep '0.11.29'
+          cp requirements.lock "$RUNNER_TEMP/requirements.first"
+          uv pip compile pyproject.toml --all-extras --universal \
+            --python-version 3.11 --no-annotate -o requirements.lock
+          cmp "$RUNNER_TEMP/requirements.first" requirements.lock
+          uv pip compile pyproject.toml --all-extras --universal \
+            --python-version 3.11 --no-annotate -o requirements.lock
+          cmp "$RUNNER_TEMP/requirements.first" requirements.lock
       - run: python -m pip wheel . --no-deps --wheel-dir dist
       - name: Inspect packaged CLI and static assets
         run: |
           python - <<'PY'
           from pathlib import Path
+          from email.parser import BytesParser
+          from email.policy import default
           from zipfile import ZipFile
 
           wheels = list(Path("dist").glob("x_collection_workbench-*.whl"))
@@ -47,9 +61,11 @@ jobs:
               names = set(wheel.namelist())
               assert {
                   "xworkbench/cli.py",
+                  "xworkbench/local_client.py",
                   "xworkbench/mcp_server.py",
                   "xworkbench/playwright_browser.py",
                   "xworkbench/providers.py",
+                  "xworkbench/terminal.py",
                   "xworkbench/static/analysis.js",
                   "xworkbench/static/app.js",
                   "xworkbench/static/index.html",
@@ -60,7 +76,38 @@ jobs:
               scripts = wheel.read(entry_points).decode()
               assert "xworkbench = xworkbench.cli:main" in scripts
               assert "xscraper =" not in scripts
+              metadata_name = next(name for name in names if name.endswith("METADATA"))
+              metadata = BytesParser(policy=default).parsebytes(wheel.read(metadata_name))
+              assert "tui" in metadata.get_all("Provides-Extra", [])
+              textual = [
+                  requirement
+                  for requirement in metadata.get_all("Requires-Dist", [])
+                  if requirement.lower().startswith("textual")
+              ]
+              assert textual == ['textual<9,>=8.2.8; extra == "tui"']
           PY
+      - name: Smoke-test base wheel without Textual
+        if: matrix.python-version == '3.13'
+        run: |
+          base_venv="$RUNNER_TEMP/base-wheel-venv"
+          runtime_dir="$RUNNER_TEMP/base-wheel-runtime"
+          python -m venv "$base_venv"
+          "$base_venv/bin/pip" install dist/x_collection_workbench-*.whl
+          "$base_venv/bin/python" - <<'PY'
+          import importlib.util
+          assert importlib.util.find_spec("textual") is None
+          PY
+          "$base_venv/bin/xworkbench" --help >/dev/null
+          for command in tui monitor; do
+            status=0
+            XWORKBENCH_RUNTIME_DIR="$runtime_dir" \
+              "$base_venv/bin/xworkbench" "$command" >"$RUNNER_TEMP/$command.out" 2>&1 \
+              || status=$?
+            test "$status" -eq 2
+            grep -F 'install with: pip install -e ".[tui]"' "$RUNNER_TEMP/$command.out"
+            ! grep -F 'Traceback' "$RUNNER_TEMP/$command.out"
+          done
+          test ! -e "$runtime_dir"
 
   browser:
     needs: test

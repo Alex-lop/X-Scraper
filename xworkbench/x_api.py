@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
 from typing import Any
@@ -444,7 +445,11 @@ class XApiProvider:
         return supplied_plan
 
     def _request(
-        self, params: dict[str, str], *, endpoint: str = RECENT_ENDPOINT
+        self,
+        params: dict[str, str],
+        *,
+        endpoint: str = RECENT_ENDPOINT,
+        should_cancel: Callable[[], bool] = lambda: False,
     ) -> tuple[dict[str, Any], dict[str, int | None]]:
         token = self.settings.bearer_token()
         if not token:
@@ -454,6 +459,8 @@ class XApiProvider:
             headers={"Authorization": f"Bearer {token}", "User-Agent": "xworkbench/0.2"},
         )
         for attempt in range(MAX_RETRIES + 1):
+            if should_cancel():
+                raise CollectionCancelled("Collection cancelled by the user.")
             try:
                 with self._opener(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                     payload = json.loads(response.read().decode("utf-8"))
@@ -504,6 +511,8 @@ class XApiProvider:
             except (URLError, TimeoutError, json.JSONDecodeError) as exc:
                 if attempt >= MAX_RETRIES:
                     raise NetworkError("X API request failed after three retries.") from exc
+            if should_cancel():
+                raise CollectionCancelled("Collection cancelled by the user.")
             self._sleep(min(0.25 * (2**attempt), 1.0))
         raise NetworkError("X API request failed after three retries.")
 
@@ -576,7 +585,11 @@ class XApiProvider:
                 params["user.fields"] = execution_plan["userFields"]
             if current_token:
                 params["next_token"] = current_token
-            payload, rate = self._request(params, endpoint=execution_plan["endpoint"])
+            payload, rate = self._request(
+                params,
+                endpoint=execution_plan["endpoint"],
+                should_cancel=should_cancel,
+            )
             posts, next_token, page_warnings, resources = map_response(
                 payload,
                 fallback_username=(

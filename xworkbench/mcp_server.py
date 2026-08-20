@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 import re
@@ -10,10 +9,8 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .local_client import LocalJsonClient, loopback_base_url
 from .read_service import PAGE_LIMIT, ReadService
 from .storage import SCHEMA_FAMILY, SCHEMA_VERSION, Storage, _ClosingConnection
 
@@ -73,13 +70,6 @@ class _ReadOnlyStorage(Storage):
         return connection
 
 
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
-        return None
-
-
-_LOCAL_OPENER = build_opener(_NoRedirect).open
-
 SNAPSHOT_FIELDS = (
     "id",
     "provider",
@@ -137,65 +127,16 @@ POST_FIELDS = (
 )
 
 
-def _loopback_base_url(base_url: str) -> str:
-    try:
-        parsed = urlsplit(base_url)
-        hostname = parsed.hostname
-        port = parsed.port
-    except (TypeError, ValueError) as exc:
-        raise ValueError("MCP connects only to a loopback HTTP dashboard root.") from exc
-    loopback = hostname == "localhost"
-    if hostname and not loopback:
-        try:
-            loopback = ipaddress.ip_address(hostname).is_loopback
-        except ValueError:
-            loopback = False
-    if (
-        parsed.scheme != "http"
-        or not loopback
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-        or parsed.path not in {"", "/"}
-    ):
-        raise ValueError("MCP connects only to a loopback HTTP dashboard root.")
-    if hostname == "localhost":
-        return f"http://127.0.0.1{f':{port}' if port is not None else ''}"
-    return base_url.rstrip("/")
-
-
 class RestClient:
     def __init__(self, base_url: str, *, opener=None):
-        self.base_url = _loopback_base_url(base_url)
-        self._opener = opener or _LOCAL_OPENER
+        self._client = LocalJsonClient(base_url, opener=opener)
+        self.base_url = self._client.base_url
 
     def get(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
-        if not path.startswith("/api/") or "://" in path:
-            raise ValueError("MCP may call only fixed local API paths.")
-        target = self.base_url + path
-        if query:
-            target += "?" + urlencode(query)
-        request = Request(target, method="GET")
-        try:
-            with self._opener(request, timeout=10) as response:
-                final_url = getattr(response, "geturl", lambda: target)()
-                if final_url != target:
-                    raise RuntimeError("The local dashboard response redirected unexpectedly.")
-                payload = json.loads(response.read())
-        except HTTPError as exc:
-            try:
-                detail = json.loads(exc.read()).get("error", {}).get("message")
-            except (AttributeError, json.JSONDecodeError, OSError):
-                detail = None
-            raise RuntimeError(detail or f"Dashboard returned HTTP {exc.code}.") from exc
-        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                "The local dashboard is unavailable. Start it with: xworkbench serve"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError("The local dashboard returned an invalid response.")
-        return payload
+        return self._client.get(path, query)
+
+
+_loopback_base_url = loopback_base_url
 
 
 def _bounded_int(value: int, *, name: str, minimum: int, maximum: int) -> int:
