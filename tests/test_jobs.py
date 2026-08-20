@@ -164,17 +164,18 @@ def test_shutdown_interrupts_active_official_request_and_releases_worker_lock(tm
     assert service.metrics()["cleanupFailures"] == 0
 
 
-def test_shutdown_preserves_successful_official_page_then_interrupts(tmp_path):
+@pytest.mark.parametrize("action", ["shutdown", "cancel"])
+def test_successful_official_page_accounts_for_interruption(tmp_path, action):
     token_path = tmp_path / "auth" / "token"
     token_path.parent.mkdir(mode=0o700)
     token_path.write_text("fixture-token", encoding="utf-8")
     token_path.chmod(0o600)
-    settings = Settings(tmp_path / "shutdown-success.db", token_path)
+    settings = Settings(tmp_path / f"{action}-success.db", token_path)
     reading = threading.Event()
     release = threading.Event()
 
     class Response:
-        headers = {}
+        headers = {"x-rate-limit-remaining": "41", "x-rate-limit-reset": "123"}
 
         def __enter__(self):
             return self
@@ -206,21 +207,35 @@ def test_shutdown_preserves_successful_official_page_then_interrupts(tmp_path):
     service.start()
     assert reading.wait(2)
 
-    shutdown = threading.Thread(target=service.shutdown)
-    shutdown.start()
-    assert service._stop_event.wait(2)
-    release.set()
-    shutdown.join(timeout=5)
+    if action == "shutdown":
+        shutdown = threading.Thread(target=service.shutdown)
+        shutdown.start()
+        assert service._stop_event.wait(2)
+        release.set()
+        shutdown.join(timeout=5)
+        assert not shutdown.is_alive()
+    else:
+        assert service.cancel(job_id)
+        release.set()
+        service.shutdown()
 
     job = storage.get_job(job_id)
-    assert not shutdown.is_alive()
-    assert job["status"] == job["error_code"] == "interrupted"
-    assert job["collected_count"] == storage.count_job_posts(job_id) == 10
+    assert job["status"] == job["error_code"] == (
+        "interrupted" if action == "shutdown" else "cancelled"
+    )
+    assert job["collected_count"] == storage.count_job_posts(job_id) == (
+        10 if action == "shutdown" else 0
+    )
     assert job["checkpoint"]["metadata"]["resourcesReturned"] == {
         "posts": 10,
         "users": 0,
         "media": 0,
     }
+    assert job["rate_limit_remaining"] == 41
+    assert job["rate_limit_reset"] == 123
+    assert any("resource usage was recorded" in warning for warning in job["warnings"]) is (
+        action == "cancel"
+    )
     assert job["lease_owner"] is job["lease_expires_at"] is None
     assert not service._lock_path.exists()
 

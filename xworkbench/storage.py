@@ -2404,6 +2404,53 @@ class Storage:
             )
         return added
 
+    def record_cancelled_official_usage(self, job_id: str, metadata: dict[str, Any]) -> bool:
+        resources = metadata.get("resourcesReturned") or {}
+        warning = (
+            "An official response completed after cancellation; resource usage was "
+            "recorded but its Posts were not stored."
+        )
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT warnings_json FROM jobs WHERE id = ? "
+                "AND status = 'cancelled' AND cancel_requested = 1",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            warnings, _ = self._decode_json(row["warnings_json"], list)
+            changed = connection.execute(
+                """
+                UPDATE jobs SET post_resource_count = post_resource_count + ?,
+                    user_resource_count = user_resource_count + ?,
+                    media_resource_count = media_resource_count + ?, warnings_json = ?,
+                    rate_limit_remaining = COALESCE(?, rate_limit_remaining),
+                    rate_limit_reset = COALESCE(?, rate_limit_reset), updated_at = ?
+                WHERE id = ? AND status = 'cancelled' AND cancel_requested = 1
+                """,
+                (
+                    int(resources.get("posts") or 0),
+                    int(resources.get("users") or 0),
+                    int(resources.get("media") or 0),
+                    json.dumps(
+                        list(
+                            dict.fromkeys(
+                                [
+                                    *(item for item in warnings if isinstance(item, str)),
+                                    warning,
+                                ]
+                            )
+                        )
+                    ),
+                    metadata.get("rateLimitRemaining"),
+                    metadata.get("rateLimitReset"),
+                    utc_now(),
+                    job_id,
+                ),
+            ).rowcount
+        return bool(changed)
+
     def finish_job(
         self,
         job_id: str,

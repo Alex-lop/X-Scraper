@@ -1088,6 +1088,8 @@ class JobService:
                         activated = True
                     try:
                         added = self.storage.add_posts(job_id, posts, provider_state, metadata)
+                        if not added and metadata.get("resourcesReturned"):
+                            self.storage.record_cancelled_official_usage(job_id, metadata)
                         with self._condition:
                             self._emit_locked("persisted", job_id, count=added)
                         return added

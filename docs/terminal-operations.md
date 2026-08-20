@@ -54,7 +54,9 @@ automatically.
 Queue shows durable jobs, bounded progress events, depth/capacity, workers, active source/auth
 keys, wait p50/p95, throughput, persistence backlog, event gaps/drops, resource pauses, and cleanup
 failures. Coordinator RSS is labeled separately; Chromium process-tree RSS remains `unsupported`,
-never zero. The owner may explicitly cancel the selected job or the current-session batch.
+never zero. The owner may explicitly cancel the selected job or the current-session batch. If an
+official response finishes after explicit cancellation, its Posts remain unstored while resource
+and rate-limit accounting plus a warning are retained.
 
 Resume, delete, purge, search, export, Changes, advanced analysis, and MCP remain web/CLI-first in
 this release. The terminal does not render stored Post content, response bodies, credentials,
