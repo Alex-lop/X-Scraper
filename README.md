@@ -110,9 +110,12 @@ yet recorded an end-to-end Codex client session. Tool bounds and that distinctio
 Generated state stays under the ignored `var/` directory by default. Treat Bearer Tokens and
 Playwright storage state as secrets: never commit, paste, attach, or include them in diagnostics.
 
-## License and use boundary
+## License, use boundary, & note from developer (Alex-lop)
 
 The code is MIT licensed; MIT permits commercial use. The operational boundary below is a project
 safety rule and a summary of current platform terms, not a change to that license or legal advice.
 
-> Intended for bounded personal research and local experimentation on content you are authorized to access. [X's current Terms](https://x.com/en/tos) prohibit scraping without prior written permission, regardless of commercial intent. Do not use this project for evasion, fraud, abuse, private-data collection, or commercial-scale harvesting.
+So while of course scrapping X/Twitter for commercial gain (like for example a business gaining commercial profit using X's data) is unethical and I personally completely agree with that notion. However, I strongly do believe that independent developers should be able to study publicly available posts for personal projects, research, and experimentation especially as AI changes how we think about access to public data. This software isn't meant to defraud it's really just to experiment and have fun with.
+
+ [X's current Terms](https://x.com/en/tos) 
+ For more info you can look at the link above. Final note -- please, do not use this project for evasion, fraud, abuse, private-data collection, or commercial scale harvesting as that could possibly be illegal (just run it with your personal agents as you would like).
