@@ -561,10 +561,15 @@ class JobService:
                 job = self.storage.get_job(job_id)
             request = CollectionRequest.from_dict(job["request"]) if job else None
         except (CollectionError, KeyError, TypeError):
+            job = None
             request = None
         return (
-            source_fingerprint(request) if request else job_id,
-            request.provider.value if request else "unknown",
+            str(job.get("source_id") or source_fingerprint(request))
+            if job and request
+            else job_id,
+            str(job.get("auth_state_id") or f"provider:{request.provider.value}")
+            if job and request
+            else "provider:unknown",
         )
 
     def _enqueue_locked(
