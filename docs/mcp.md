@@ -17,9 +17,10 @@ xworkbench start
 xworkbench mcp --url http://127.0.0.1:5000
 ```
 
-That adapter accepts only a plain HTTP loopback root. Redirects, credentials in the URL,
-non-loopback hosts, and arbitrary API paths are rejected. The dashboard must remain running only
-for this legacy mode.
+That GET-only adapter uses the same bounded stdlib loopback client as the terminal monitor. It
+rejects redirects, environment proxies, URL credentials, non-loopback hosts, fragments, arbitrary
+API paths, oversized responses, and malformed JSON. The dashboard must remain running only for
+this legacy mode; MCP never inherits the terminal client's POST capability.
 
 ## Tools and resource
 

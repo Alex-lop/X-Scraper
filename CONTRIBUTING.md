@@ -18,7 +18,8 @@ xworkbench setup
 
 On Windows PowerShell use `.venv\Scripts\Activate.ps1`; the project does not yet claim a green
 Windows clean-install gate. Do not update the lock incidentally. If dependencies change, regenerate
-it with the documented uv version and explain the change.
+it with the exact uv 0.11.29 command in [Getting started](docs/getting-started.md) and explain the
+change.
 
 ## Before submitting
 
@@ -32,9 +33,9 @@ python -m xworkbench --help
 python -m pip wheel . --no-deps --wheel-dir dist
 ```
 
-Run the focused Chromium, MCP, storage/migration, CLI, and API-security gates from
-[testing](docs/testing.md) when those surfaces change. Tests must be deterministic and offline from
-X by default. Unexpected network access in a browser fixture should fail the test.
+Run the focused Chromium, terminal/local-client, MCP, storage/migration, CLI, and API-security gates
+from [testing](docs/testing.md) when those surfaces change. Tests must be deterministic and offline
+from X by default. Unexpected network access in a browser fixture should fail the test.
 
 ## Evidence and claim rules
 

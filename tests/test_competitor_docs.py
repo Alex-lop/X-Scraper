@@ -112,7 +112,8 @@ def test_comparison_mermaid_and_evidence_links_are_bounded_and_immutable():
 
 
 def test_markdown_relative_links_resolve():
-    for path in (ROOT / "README.md", ROOT / "docs" / "competitor-landscape.md"):
+    paths = [ROOT / "README.md", ROOT / "CONTRIBUTING.md", *(ROOT / "docs").rglob("*.md")]
+    for path in paths:
         text = path.read_text(encoding="utf-8")
         for target in re.findall(r"(?<!!)\[[^]]+]\(([^)]+)\)", text):
             if "://" in target or target.startswith("#"):

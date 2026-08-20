@@ -93,8 +93,9 @@ account.
 
 ## What is not configurable
 
-The dashboard and MCP bridge remain loopback-only. There is no proxy rotation, stealth or
-fingerprint control, challenge solver, unrelated-profile import, account pool, remote bind,
+The dashboard, terminal owner, terminal monitor, and MCP bridge remain loopback-only. The monitor
+does not read configuration, open SQLite, or create a worker. There is no proxy rotation, stealth
+or fingerprint control, challenge solver, unrelated-profile import, account pool, remote bind,
 scheduled retention, or scheduled collection setting. Retention runs only after an explicit
 confirmed local purge request. A configuration file cannot expand provider limits or bypass the
 preview and confirmation step.

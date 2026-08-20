@@ -60,7 +60,8 @@ and preview. Confirm only if **Source** is `https://x.com/home` and **Target** i
 maximum`; otherwise edit or stop.
 
 There is no standalone `xworkbench capture` or batch command; do not copy examples that imply one
-exists. The dashboard preview-and-confirm path is the maintained interface.
+exists. The dashboard and optional `xworkbench tui` use the same maintained preview-and-confirm
+routes. See [terminal operations](terminal-operations.md) for the keyboard-first subset.
 
 For a bounded batch, first save each Browser or official-API source through the single-capture
 form. Then, in **Capture several saved sources**:

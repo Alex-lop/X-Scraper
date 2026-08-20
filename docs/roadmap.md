@@ -21,6 +21,10 @@ specific offline, local-browser, client, platform, or authorized live gate passe
   remain serial.
 - Deterministic pre-lease pause/recovery from coordinator-process RSS/CPU, with unsupported browser
   child-process and event-loop signals exposed truthfully rather than fabricated.
+- Optional Textual owner operations for setup/capture/queue and an attachable read-only monitor,
+  covered at normal, wide, and narrow terminal sizes. Advanced analysis remains web-first.
+- Automated local-Chromium dashboard flow through preview, confirm, progress, cancellation,
+  filtering, and JSON export, with every non-loopback request rejected.
 
 None of those bullets is a live X, headed-authentication, Windows clean-install, or external-client
 claim.

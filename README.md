@@ -22,6 +22,7 @@ parser is proven against local Chromium fixtures, but no live X capture is owner
   provenance, partial results, and stop reasons in local SQLite.
 - Inspect, search, and export a saved snapshot without making another X request.
 - Let a local MCP client read terminal snapshots through bounded, read-only tools.
+- Operate setup, capture approval, and the durable queue from an optional local terminal UI.
 
 ## Try safely in 60 seconds
 
@@ -65,6 +66,9 @@ preview and confirm the unchanged server manifest. There is no capture or batch 
 The official X API provider is optional and separately requires a token, an exact preview, and
 paid-read confirmation. Its compiler and response mapper are proven only with synthetic data; see
 [Official X API](docs/official-x-api.md).
+
+For keyboard-first local operations, install `.[tui]` and run `xworkbench tui`. Attach a read-only
+second terminal with `xworkbench monitor`; see [Terminal operations](docs/terminal-operations.md).
 
 ## Connect one local MCP client
 
@@ -139,7 +143,7 @@ flowchart TB
 
 | Project | Product shape | X surfaces | Queue/resume | Storage/output | Operator UX | Current evidence | Candid verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| X-Scraper | Local Python evidence workbench | Browser Home/profile/Latest search; official profile/search | Durable bounded queue, leases, cancellation, restart recovery | SQLite snapshots, JSON/CSV, search/Changes, read-only MCP | Web, CLI, optional terminal UI | `PROJECT CI`; local fixtures only; live X is `LIVE NOT RUN` | `LIMITED`: strong offline approvals, queue, SQLite evidence, and MCP; live X, Windows, external MCP, dashboard E2E, and Browser process-tree governance remain unverified; Browser concurrency is 1 |
+| X-Scraper | Local Python evidence workbench | Browser Home/profile/Latest search; official profile/search | Durable bounded queue, leases, cancellation, restart recovery | SQLite snapshots, JSON/CSV, search/Changes, read-only MCP | Web, CLI, optional terminal UI | `SOURCE PRESENT`; local dashboard/TUI and Chromium gates pass; exact-head hosted CI is pending; live X is `LIVE NOT RUN` | `LIMITED`: strong offline approvals, queue, SQLite evidence, MCP, and local dashboard/TUI coverage; live X, Windows, external MCP, and Browser process-tree governance remain unverified; Browser concurrency is 1 |
 | [Tweepy](https://github.com/tweepy/tweepy) | Python official-API library | Broad documented REST and streaming clients | Caller-owned pagination/rate-limit handling | Returned Python models; caller-owned storage | Library | `REPO FACT`; `PROJECT CI`; live use here is `LIVE NOT RUN` | `OFFICIAL REFERENCE`; do not add it unless the existing transport reaches a measured limitation |
 | [node-twitter-api-v2](https://github.com/PLhery/node-twitter-api-v2) | TypeScript official-API client | v1.1/v2 REST, streaming, pagination | Client helpers; caller-owned durability | Returned objects/streams; caller-owned storage | Library | `REPO FACT`; `SOURCE PRESENT`; live use here is `LIVE NOT RUN` | `OFFICIAL REFERENCE`; useful design evidence, but wrong runtime for this Python product |
 | [twarc](https://github.com/DocNow/twarc) | Python collection CLI/library | Official API v2 archive/search and hydration workflows | Pagination and restart-oriented files | JSON Lines and plugins | CLI/library | `UPSTREAM-DOCUMENTED`; `CONTRADICTED` by upstream support notice | `HISTORICAL ONLY`; upstream says it is unsupported after quota changes |
@@ -164,6 +168,7 @@ scores or live-acceptance evidence.
 - [Official X API](docs/official-x-api.md)
 - [Storage and cache semantics](docs/storage-and-cache.md)
 - [MCP](docs/mcp.md)
+- [Terminal operations](docs/terminal-operations.md)
 - [Configuration](docs/configuration.md)
 - [Testing and evidence](docs/testing.md)
 - [Demo and recording storyboard](docs/demo.md)
@@ -171,7 +176,7 @@ scores or live-acceptance evidence.
 - [Roadmap](docs/roadmap.md)
 - [Competitor landscape](docs/competitor-landscape.md)
 - [Contributing](CONTRIBUTING.md)
-- [Verification record](docs/verification.md) and [architecture decision](docs/adr/0001-feed-to-context-providers.md)
+- [Verification record](docs/verification.md), [provider ADR](docs/adr/0001-feed-to-context-providers.md), and [queue ADR](docs/adr/0002-bounded-capture-queue.md)
 
 Generated state stays under the ignored `var/` directory by default. Treat Bearer Tokens and
 Playwright storage state as secrets: never commit, paste, attach, or include them in diagnostics.
