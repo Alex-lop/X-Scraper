@@ -52,5 +52,5 @@ truststore==0.10.4 ; sys_platform != 'emscripten'
 typing-extensions==4.16.0
 typing-inspection==0.4.4
 uc-micro-py==2.0.0
-uvicorn==0.52.3 ; sys_platform != 'emscripten'
+uvicorn==0.52.4 ; sys_platform != 'emscripten'
 werkzeug==3.1.8
